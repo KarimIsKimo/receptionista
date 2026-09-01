@@ -15,6 +15,10 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1360825553771801")
 ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
 # ---------------------------------------------------------
 
+# 1. Initialize the Gemini client ONCE globally so it stays open
+# Ensure GEMINI_API_KEY is set in your Render environment variables!
+client = genai.Client()
+
 # Track processed IDs so retries are ignored
 processed_message_ids = set()
 
@@ -88,8 +92,6 @@ def generate_ai_reply(sender_phone: str, user_message: str) -> str:
         القواعد والمعلومات الخاصة بالعيادة:
         {clinic_knowledge}
         """
-
-        client = genai.Client()
         
         # Check if this patient already has an active conversation going
         if sender_phone not in active_chats:
@@ -125,6 +127,8 @@ async def send_whatsapp_message(recipient_phone: str, text_content: str):
         "type": "text",
         "text": {"body": text_content},
     }
-    async with httpx.AsyncClient() as client:
-        res = await client.post(url, json=payload, headers=headers)
+    
+    # Using httpx.AsyncClient here for web requests (unrelated to the genai client)
+    async with httpx.AsyncClient() as http_client:
+        res = await http_client.post(url, json=payload, headers=headers)
         print(f"Meta Send Result -> Status: {res.status_code}")
