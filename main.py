@@ -1,6 +1,7 @@
 import os
 import traceback
 import httpx
+import datetime
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from google import genai
@@ -34,17 +35,33 @@ def load_clinic_rules() -> str:
         print(f"Could not load clinic_rules.txt: {e}")
         return "مواعيد العمل من السبت للخميس من 1 ظهراً لـ 10 مساءً."
 
-# --- NEW TOOL FUNCTION ---
-def book_appointment(patient_name: str, date: str, time: str) -> str:
+# --- UPDATED TOOL FUNCTION ---
+def book_appointment(patient_name: str, date: str, time: str, area: str) -> str:
     """
     Saves a clinic appointment. 
-    Use this tool ONLY when the patient has confirmed the date and time.
+    Use this tool ONLY when the patient has confirmed the date, time, AND the laser area.
+    IMPORTANT: The 'date' parameter MUST be formatted as YYYY-MM-DD.
     """
-    # For now, we will just print this to your Render server logs.
-    # In the next step, we will change this to write to a Google Sheet!
-    print(f"🟢 NEW BOOKING TRIGGERED: {patient_name} on {date} at {time}")
+    print(f"🟢 SENDING TO GOOGLE SHEETS: {patient_name} on {date} at {time} for {area}")
     
-    return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time}."
+    GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbwI302P_56AN4DB-kd7KLTzD31mxEFQEXzZVZA4UXw1LLlItLBfYvJCrw6XBbLt2_ctuw/exec"
+    
+    payload = {
+        "patient_name": patient_name,
+        "date": date,
+        "time": time,
+        "area": area
+    }
+    
+    try:
+        # We use httpx.Client() synchronously because this tool runs inside a sync function
+        with httpx.Client() as http_client:
+            response = http_client.post(GOOGLE_SHEET_URL, json=payload)
+            print(f"Google Sheets Response: {response.status_code}")
+    except Exception as e:
+        print(f"Failed to send to Google Sheets: {e}")
+    
+    return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time} لمنطقة {area}."
 # -------------------------
 
 @app.get("/webhook")
@@ -97,13 +114,19 @@ async def handle_ai_conversation(sender_phone: str, user_text: str):
 def generate_ai_reply(sender_phone: str, user_message: str) -> str:
     try:
         clinic_knowledge = load_clinic_rules()
+        today_date = datetime.date.today().strftime("%Y-%m-%d")
         
         system_instruction = f"""
         أنت موظف استقبال ذكي ومساعد افتراضي للعيادة.
+        تاريخ اليوم هو: {today_date}
         مهمتك الرد على استفسارات المرضى ومساعدتهم في الحجز.
 
         القواعد والمعلومات الخاصة بالعيادة:
         {clinic_knowledge}
+        
+        تعليمات هامة جداً قبل الحجز:
+        يجب أن تسألي المريضة عن المنطقة التي تريد عمل ليزر لها (مثل: الوجه، البكيني، الجسم كامل، إلخ) قبل تأكيد الحجز.
+        لا تقومي بتأكيد الحجز باستخدام الأداة إلا بعد معرفة كل التفاصيل: (الاسم، اليوم، الساعة، والمنطقة).
         """
         
         # Check if this patient already has an active conversation going
@@ -114,7 +137,7 @@ def generate_ai_reply(sender_phone: str, user_message: str) -> str:
                 config={
                     'system_instruction': system_instruction,
                     'temperature': 0.3,
-                    'tools': [book_appointment], # <--- TOOL ADDED HERE
+                    'tools': [book_appointment],
                 }
             )
         
