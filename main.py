@@ -59,7 +59,7 @@ async def receive_message(request: Request):
                     if msg_type == "text":
                         user_text = incoming_msg.get("text", {}).get("body", "").strip()
 
-                        # Generate AI response using Gemini instead of rigid keywords
+                        # Generate AI response using Gemini
                         ai_response = generate_ai_reply(user_text)
 
                         # Send the AI's reply back to WhatsApp
@@ -73,7 +73,7 @@ async def receive_message(request: Request):
 # AI Generation Function
 def generate_ai_reply(user_message: str) -> str:
     try:
-          response = ai_client.models.generate_content(
+        response = ai_client.models.generate_content(
             model='gemini-3.7-flash',
             contents=user_message,
             config={
