@@ -73,8 +73,8 @@ async def receive_message(request: Request):
 # AI Generation Function
 def generate_ai_reply(user_message: str) -> str:
     try:
-        response = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
+          response = ai_client.models.generate_content(
+            model='gemini-3.7-flash',
             contents=user_message,
             config={
                 'system_instruction': CLINIC_SYSTEM_PROMPT,
