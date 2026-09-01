@@ -54,16 +54,26 @@ def book_appointment(patient_name: str, date: str, time: str, area: str) -> str:
     }
     
     try:
-        # We use httpx.Client() synchronously because this tool runs inside a sync function
         with httpx.Client() as http_client:
             response = http_client.post(GOOGLE_SHEET_URL, json=payload)
+            
+            # Try to parse the response as JSON to check for conflicts
+            try:
+                result = response.json()
+                if result.get("status") == "error":
+                    # Tell the AI the slot is taken so it can ask the user for a new time
+                    return f"فشل الحجز: الموعد يوم {date} الساعة {time} محجوز مسبقاً. اطلب من المريض اختيار موعد آخر."
+            except ValueError:
+                # If Google Sheets doesn't return JSON, just print the status and continue
+                print(f"Google Sheets returned non-JSON response: {response.text}")
+                
             print(f"Google Sheets Response: {response.status_code}")
+            
     except Exception as e:
         print(f"Failed to send to Google Sheets: {e}")
+        return "حدث خطأ في النظام ولم يتم الحجز. يرجى المحاولة لاحقاً."
     
     return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time} لمنطقة {area}."
-# -------------------------
-
 @app.get("/webhook")
 def verify_webhook(request: Request):
     mode = request.query_params.get("hub.mode")
