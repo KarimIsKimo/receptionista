@@ -8,22 +8,24 @@ from google import genai
 app = FastAPI()
 
 # ---------------------------------------------------------
-# SECURITY BEST PRACTICE: Keep your access token out of the code.
-# You can set these in your Render Environment Variables.
+# SECURITY BEST PRACTICE: Keys loaded securely from Render Environment
 # ---------------------------------------------------------
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "Neckface@2003")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1360825553771801")
 ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
 # ---------------------------------------------------------
 
-CLINIC_SYSTEM_PROMPT = """
-You are a friendly, professional AI receptionist and medical assistant for a clinic. 
-Your job is to answer patient inquiries politely, provide general working hours (Saturday-Thursday, 9 AM to 9 PM), 
-and guide them on how to book appointments. Keep your responses concise and empathetic (maximum 2-3 sentences).
-"""
-
 # Track processed IDs so retries are ignored
 processed_message_ids = set()
+
+def load_clinic_rules() -> str:
+    """Reads clinic rules directly from clinic_rules.txt"""
+    try:
+        with open("clinic_rules.txt", "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        print(f"Could not load clinic_rules.txt: {e}")
+        return "مواعيد العمل من السبت للخميس من 9 صباحاً لـ 9 مساءً."
 
 @app.get("/webhook")
 def verify_webhook(request: Request):
@@ -73,20 +75,36 @@ async def handle_ai_conversation(sender_phone: str, user_text: str):
 
 def generate_ai_reply(user_message: str) -> str:
     try:
-        # Assumes your GEMINI_API_KEY is set in your Render environment variables
+        clinic_knowledge = load_clinic_rules()
+        
+        system_instruction = f"""
+        أنت موظف استقبال ذكي ومساعد افتراضي للعيادة.
+        مهمتك الرد على استفسارات المرضى ومساعدتهم في الحجز.
+
+        القواعد والمعلومات الخاصة بالعيادة:
+        {clinic_knowledge}
+
+        تعليمات الأسلوب واللهجة:
+        1. تحدث باللهجة المصرية العامية المهذبة والودودة (استخدم عبارات مثل: أهلاً بحضرتك، يا فندم، تمام، تحت أمرك).
+        2. التزم تماماً بالمعلومات الموجودة في القواعد ولا تختلق أسعار أو مواعيد غير موجودة.
+        3. اجعل الإجابات مختصرة ومفيدة (2 إلى 3 جمل كحد أقصى).
+        4. لا تقدم أي استشارات طبية تشخيصية أو ترشيحات أدوية.
+        """
+
+        # Ensure GEMINI_API_KEY is saved in your Render Environment Variables
         client = genai.Client()
         response = client.models.generate_content(
-            model='gemini-3.6-flash',
+            model='gemini-3.5-flash-lite', # Updated to the high-volume free model
             contents=user_message,
             config={
-                'system_instruction': CLINIC_SYSTEM_PROMPT,
+                'system_instruction': system_instruction,
                 'temperature': 0.3,
             }
         )
         return response.text
     except Exception as e:
         print(f"Gemini API Error: {e}")
-        return "Thank you for contacting our clinic. A representative will get back to you shortly."
+        return "أهلاً بحضرتك! شكراً لتواصلك مع العيادة، سيقوم أحد مسؤولي الاستقبال بالرد عليك في أقرب وقت."
 
 async def send_whatsapp_message(recipient_phone: str, text_content: str):
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
