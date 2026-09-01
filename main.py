@@ -53,10 +53,9 @@ async def receive_message(request: Request):
 
 def generate_ai_reply(user_message: str) -> str:
     try:
-        # Initialize client inside the function safely
         client = genai.Client()
         response = client.models.generate_content(
-            model='gemini-2.0-flash',
+            model='gemini-3.7-flash',
             contents=user_message,
             config={
                 'system_instruction': CLINIC_SYSTEM_PROMPT,
