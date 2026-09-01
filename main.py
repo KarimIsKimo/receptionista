@@ -36,44 +36,48 @@ def load_clinic_rules() -> str:
         return "مواعيد العمل من السبت للخميس من 1 ظهراً لـ 10 مساءً."
 
 # --- UPDATED TOOL FUNCTION ---
-def book_appointment(patient_name: str, date: str, time: str, area: str) -> str:
+def book_appointment(patient_name: str, phone_number: str, date: str, time: str, area: str) -> str:
     """
     Saves a clinic appointment. 
     Use this tool ONLY when the patient has confirmed the date, time, AND the laser area.
     IMPORTANT: The 'date' parameter MUST be formatted as YYYY-MM-DD.
     """
-    print(f"🟢 SENDING TO GOOGLE SHEETS: {patient_name} on {date} at {time} for {area}")
+    print(f"🟢 SENDING TO GOOGLE SHEETS: {patient_name} ({phone_number}) on {date} at {time} for {area}")
     
     GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbwI302P_56AN4DB-kd7KLTzD31mxEFQEXzZVZA4UXw1LLlItLBfYvJCrw6XBbLt2_ctuw/exec"
     
     payload = {
         "patient_name": patient_name,
+        "phone_number": phone_number,
         "date": date,
         "time": time,
         "area": area
     }
     
     try:
-        with httpx.Client() as http_client:
-            response = http_client.post(GOOGLE_SHEET_URL, json=payload)
+        # follow_redirects=True is required for Google Apps Script Web Apps
+        with httpx.Client(follow_redirects=True) as http_client:
+            response = http_client.post(GOOGLE_SHEET_URL, json=payload, timeout=10.0)
+            print(f"Google Sheets HTTP Status: {response.status_code}")
+            print(f"Google Sheets Raw Response: {response.text}")
             
-            # Try to parse the response as JSON to check for conflicts
+            # Parse the response to check if it was rejected due to double-booking
             try:
                 result = response.json()
                 if result.get("status") == "error":
-                    # Tell the AI the slot is taken so it can ask the user for a new time
-                    return f"فشل الحجز: الموعد يوم {date} الساعة {time} محجوز مسبقاً. اطلب من المريض اختيار موعد آخر."
+                    if "Slot already taken" in result.get("message", ""):
+                        return f"فشل الحجز: الموعد يوم {date} الساعة {time} محجوز مسبقاً. اعتذر للمريضة واطلب منها اختيار موعد آخر."
+                    return f"حدث خطأ أثناء حفظ الحجز: {result.get('message')}"
             except ValueError:
-                # If Google Sheets doesn't return JSON, just print the status and continue
                 print(f"Google Sheets returned non-JSON response: {response.text}")
                 
-            print(f"Google Sheets Response: {response.status_code}")
-            
     except Exception as e:
         print(f"Failed to send to Google Sheets: {e}")
-        return "حدث خطأ في النظام ولم يتم الحجز. يرجى المحاولة لاحقاً."
+        return "حدث خطأ في الاتصال بنظام الحجز، يرجى المحاولة لاحقاً."
     
     return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time} لمنطقة {area}."
+# -------------------------
+
 @app.get("/webhook")
 def verify_webhook(request: Request):
     mode = request.query_params.get("hub.mode")
@@ -129,6 +133,8 @@ def generate_ai_reply(sender_phone: str, user_message: str) -> str:
         system_instruction = f"""
         أنت موظف استقبال ذكي ومساعد افتراضي للعيادة.
         تاريخ اليوم هو: {today_date}
+        رقم هاتف المريضة الحالي هو: {sender_phone}
+
         مهمتك الرد على استفسارات المرضى ومساعدتهم في الحجز.
 
         القواعد والمعلومات الخاصة بالعيادة:
@@ -137,6 +143,7 @@ def generate_ai_reply(sender_phone: str, user_message: str) -> str:
         تعليمات هامة جداً قبل الحجز:
         يجب أن تسألي المريضة عن المنطقة التي تريد عمل ليزر لها (مثل: الوجه، البكيني، الجسم كامل، إلخ) قبل تأكيد الحجز.
         لا تقومي بتأكيد الحجز باستخدام الأداة إلا بعد معرفة كل التفاصيل: (الاسم، اليوم، الساعة، والمنطقة).
+        استخدمي رقم هاتف المريضة الحالي المرفق أعلاه عند استخدام أداة الحجز.
         """
         
         # Check if this patient already has an active conversation going
