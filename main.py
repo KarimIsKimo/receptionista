@@ -34,6 +34,19 @@ def load_clinic_rules() -> str:
         print(f"Could not load clinic_rules.txt: {e}")
         return "مواعيد العمل من السبت للخميس من 1 ظهراً لـ 10 مساءً."
 
+# --- NEW TOOL FUNCTION ---
+def book_appointment(patient_name: str, date: str, time: str) -> str:
+    """
+    Saves a clinic appointment. 
+    Use this tool ONLY when the patient has confirmed the date and time.
+    """
+    # For now, we will just print this to your Render server logs.
+    # In the next step, we will change this to write to a Google Sheet!
+    print(f"🟢 NEW BOOKING TRIGGERED: {patient_name} on {date} at {time}")
+    
+    return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time}."
+# -------------------------
+
 @app.get("/webhook")
 def verify_webhook(request: Request):
     mode = request.query_params.get("hub.mode")
@@ -76,17 +89,6 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     # Always return 200 OK immediately
     return Response(content="EVENT_RECEIVED", status_code=200)
 
-def book_appointment(patient_name: str, date: str, time: str) -> str:
-    """
-    Saves a clinic appointment. 
-    Use this tool ONLY when the patient has confirmed the date and time.
-    """
-    # For now, we will just print this to your Render server logs.
-    # In the next step, we will change this to write to a Google Sheet!
-    print(f"🟢 NEW BOOKING TRIGGERED: {patient_name} on {date} at {time}")
-    
-    return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time}."
-    
 async def handle_ai_conversation(sender_phone: str, user_text: str):
     # Pass the sender's phone number into the AI function so it knows who is talking
     ai_response = generate_ai_reply(sender_phone, user_text)
@@ -106,12 +108,13 @@ def generate_ai_reply(sender_phone: str, user_message: str) -> str:
         
         # Check if this patient already has an active conversation going
         if sender_phone not in active_chats:
-            # If not, create a new chat session with the clinic rules
+            # If not, create a new chat session with the clinic rules and tools
             active_chats[sender_phone] = client.chats.create(
                 model='gemini-3.5-flash-lite', 
                 config={
                     'system_instruction': system_instruction,
                     'temperature': 0.3,
+                    'tools': [book_appointment], # <--- TOOL ADDED HERE
                 }
             )
         
