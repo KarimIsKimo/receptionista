@@ -76,6 +76,17 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     # Always return 200 OK immediately
     return Response(content="EVENT_RECEIVED", status_code=200)
 
+def book_appointment(patient_name: str, date: str, time: str) -> str:
+    """
+    Saves a clinic appointment. 
+    Use this tool ONLY when the patient has confirmed the date and time.
+    """
+    # For now, we will just print this to your Render server logs.
+    # In the next step, we will change this to write to a Google Sheet!
+    print(f"🟢 NEW BOOKING TRIGGERED: {patient_name} on {date} at {time}")
+    
+    return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time}."
+    
 async def handle_ai_conversation(sender_phone: str, user_text: str):
     # Pass the sender's phone number into the AI function so it knows who is talking
     ai_response = generate_ai_reply(sender_phone, user_text)
