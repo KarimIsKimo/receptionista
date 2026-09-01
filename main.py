@@ -1,4 +1,5 @@
 import os
+import traceback
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import PlainTextResponse
@@ -28,10 +29,10 @@ def verify_webhook(request: Request):
 
 @app.post("/webhook")
 async def receive_message(request: Request):
-    body = await request.json()
-    print("Incoming webhook payload received")
-    
     try:
+        body = await request.json()
+        print("Incoming webhook payload received")
+        
         entries = body.get("entry", [])
         if entries:
             messages = entries[0].get("changes", [{}])[0].get("value", {}).get("messages", [])
@@ -48,24 +49,31 @@ async def receive_message(request: Request):
                     await send_whatsapp_message(sender_phone, ai_response)
     except Exception as e:
         print(f"Webhook processing error: {e}")
+        traceback.print_exc()
 
     return Response(content="EVENT_RECEIVED", status_code=200)
 
 def generate_ai_reply(user_message: str) -> str:
-    try:
-        client = genai.Client()
-        response = client.models.generate_content(
-            model='gemini-3.7-flash',
-            contents=user_message,
-            config={
-                'system_instruction': CLINIC_SYSTEM_PROMPT,
-                'temperature': 0.3,
-            }
-        )
-        return response.text
-    except Exception as e:
-        print(f"Gemini API Error: {e}")
-        return "Thank you for contacting our clinic. A representative will get back to you shortly."
+    models_to_try = ['gemini-3.7-flash', 'gemini-2.5-flash', 'gemini-1.5-flash']
+    
+    for model_name in models_to_try:
+        try:
+            client = genai.Client()
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_message,
+                config={
+                    'system_instruction': CLINIC_SYSTEM_PROMPT,
+                    'temperature': 0.3,
+                }
+            )
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            print(f"Model {model_name} failed: {e}")
+            continue
+            
+    return "Thank you for contacting our clinic. A representative will get back to you shortly."
 
 async def send_whatsapp_message(recipient_phone: str, text_content: str):
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
@@ -82,4 +90,4 @@ async def send_whatsapp_message(recipient_phone: str, text_content: str):
     }
     async with httpx.AsyncClient() as client:
         res = await client.post(url, json=payload, headers=headers)
-        print(f"Meta Send Result: {res.status_code} - {res.text}")
+        print(f"Meta Send Result -> Status: {res.status_code}, Body: {res.text}")
