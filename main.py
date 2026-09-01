@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request, Response
 app = FastAPI()
 
 # You can change this token to anything you want, just remember it for Step 4!
-VERIFY_TOKEN = "my_custom_secret_token" 
+VERIFY_TOKEN = "Neckface@2003" 
 
 @app.get("/webhook")
 def verify_webhook(request: Request):
