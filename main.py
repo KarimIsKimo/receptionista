@@ -7,9 +7,14 @@ from google import genai
 
 app = FastAPI()
 
-VERIFY_TOKEN = "Neckface@2003"
-PHONE_NUMBER_ID = "1360825553771801"
-ACCESS_TOKEN = "EAAZAnVi3cKTQBSXjsDyBzG4KDhV9pQATPG5hAYcIdb3ottZBdpQZBNyf71MavZCkytvi5KXX6CHdimYgX0yfE7RqoUXl0NIC83skQXDGRxZB7ffxZCXqC8DSZBNfw2LP4cBjvu4PRkPksRXgmFkXFSoFZCmuS5VZA1w8PJBv29y1yPOEjVVhB1QSYheooWTJ3fx49iwZDZD"
+# ---------------------------------------------------------
+# SECURITY BEST PRACTICE: Keep your access token out of the code.
+# You can set these in your Render Environment Variables.
+# ---------------------------------------------------------
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "Neckface@2003")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1360825553771801")
+ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
+# ---------------------------------------------------------
 
 CLINIC_SYSTEM_PROMPT = """
 You are a friendly, professional AI receptionist and medical assistant for a clinic. 
@@ -68,9 +73,10 @@ async def handle_ai_conversation(sender_phone: str, user_text: str):
 
 def generate_ai_reply(user_message: str) -> str:
     try:
+        # Assumes your GEMINI_API_KEY is set in your Render environment variables
         client = genai.Client()
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             contents=user_message,
             config={
                 'system_instruction': CLINIC_SYSTEM_PROMPT,
