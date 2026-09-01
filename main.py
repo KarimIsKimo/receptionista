@@ -54,26 +54,20 @@ async def receive_message(request: Request):
     return Response(content="EVENT_RECEIVED", status_code=200)
 
 def generate_ai_reply(user_message: str) -> str:
-    models_to_try = ['gemini-3.7-flash', 'gemini-2.5-flash', 'gemini-1.5-flash']
-    
-    for model_name in models_to_try:
-        try:
-            client = genai.Client()
-            response = client.models.generate_content(
-                model=model_name,
-                contents=user_message,
-                config={
-                    'system_instruction': CLINIC_SYSTEM_PROMPT,
-                    'temperature': 0.3,
-                }
-            )
-            if response and response.text:
-                return response.text
-        except Exception as e:
-            print(f"Model {model_name} failed: {e}")
-            continue
-            
-    return "Thank you for contacting our clinic. A representative will get back to you shortly."
+    try:
+        client = genai.Client()
+        response = client.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=user_message,
+            config={
+                'system_instruction': CLINIC_SYSTEM_PROMPT,
+                'temperature': 0.3,
+            }
+        )
+        return response.text
+    except Exception as e:
+        print(f"Gemini API Error: {e}")
+        return "Thank you for contacting our clinic. A representative will get back to you shortly."
 
 async def send_whatsapp_message(recipient_phone: str, text_content: str):
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
