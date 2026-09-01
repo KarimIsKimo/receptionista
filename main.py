@@ -18,6 +18,9 @@ ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
 # Track processed IDs so retries are ignored
 processed_message_ids = set()
 
+# Dictionary to store active chat sessions for each phone number
+active_chats = {}
+
 def load_clinic_rules() -> str:
     """Reads clinic rules directly from clinic_rules.txt"""
     try:
@@ -25,7 +28,7 @@ def load_clinic_rules() -> str:
             return f.read()
     except Exception as e:
         print(f"Could not load clinic_rules.txt: {e}")
-        return "مواعيد العمل من السبت للخميس من 9 صباحاً لـ 9 مساءً."
+        return "مواعيد العمل من السبت للخميس من 1 ظهراً لـ 10 مساءً."
 
 @app.get("/webhook")
 def verify_webhook(request: Request):
@@ -70,10 +73,11 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     return Response(content="EVENT_RECEIVED", status_code=200)
 
 async def handle_ai_conversation(sender_phone: str, user_text: str):
-    ai_response = generate_ai_reply(user_text)
+    # Pass the sender's phone number into the AI function so it knows who is talking
+    ai_response = generate_ai_reply(sender_phone, user_text)
     await send_whatsapp_message(sender_phone, ai_response)
 
-def generate_ai_reply(user_message: str) -> str:
+def generate_ai_reply(sender_phone: str, user_message: str) -> str:
     try:
         clinic_knowledge = load_clinic_rules()
         
@@ -83,28 +87,30 @@ def generate_ai_reply(user_message: str) -> str:
 
         القواعد والمعلومات الخاصة بالعيادة:
         {clinic_knowledge}
-
-        تعليمات الأسلوب واللهجة:
-        1. تحدث باللهجة المصرية العامية المهذبة والودودة (استخدم عبارات مثل: أهلاً بحضرتك، يا فندم، تمام، تحت أمرك).
-        2. التزم تماماً بالمعلومات الموجودة في القواعد ولا تختلق أسعار أو مواعيد غير موجودة.
-        3. اجعل الإجابات مختصرة ومفيدة (2 إلى 3 جمل كحد أقصى).
-        4. لا تقدم أي استشارات طبية تشخيصية أو ترشيحات أدوية.
         """
 
-        # Ensure GEMINI_API_KEY is saved in your Render Environment Variables
         client = genai.Client()
-        response = client.models.generate_content(
-            model='gemini-3.5-flash-lite', # Updated to the high-volume free model
-            contents=user_message,
-            config={
-                'system_instruction': system_instruction,
-                'temperature': 0.3,
-            }
-        )
+        
+        # Check if this patient already has an active conversation going
+        if sender_phone not in active_chats:
+            # If not, create a new chat session with the clinic rules
+            active_chats[sender_phone] = client.chats.create(
+                model='gemini-3.5-flash-lite', 
+                config={
+                    'system_instruction': system_instruction,
+                    'temperature': 0.3,
+                }
+            )
+        
+        # Send the user's message to their specific chat history
+        chat = active_chats[sender_phone]
+        response = chat.send_message(user_message)
+        
         return response.text
+        
     except Exception as e:
         print(f"Gemini API Error: {e}")
-        return "أهلاً بحضرتك! شكراً لتواصلك مع العيادة، سيقوم أحد مسؤولي الاستقبال بالرد عليك في أقرب وقت."
+        return "أهلاً بحضرتك يا فندم! شكراً لتواصلك مع العيادة، سيقوم أحد مسؤولي الاستقبال بالرد عليكي في أقرب وقت."
 
 async def send_whatsapp_message(recipient_phone: str, text_content: str):
     url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
