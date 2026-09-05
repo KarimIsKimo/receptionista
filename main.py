@@ -9,6 +9,11 @@ from google import genai
 
 app = FastAPI()
 
+# --- HOME ROUTE ---
+@app.get("/")
+def home():
+    return {"status": "Clinic AI Receptionist is running!"}
+
 # ---------------------------------------------------------
 # SECURITY BEST PRACTICE: Keys loaded securely from Render Environment
 # ---------------------------------------------------------
@@ -120,6 +125,12 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
             metadata = value.get("metadata", {})
             target_phone_id = metadata.get("phone_number_id", PHONE_NUMBER_ID)
             
+            # --- TOGGLE SWITCH FOR REAL CLINIC NUMBER ---
+            # If ENABLE_REAL_CLINIC is set to "false" in Render, ignore messages to the real clinic number ID
+            enable_real_clinic = os.getenv("ENABLE_REAL_CLINIC", "true").lower() == "true"
+            if target_phone_id == "979476801911389" and not enable_real_clinic:
+                return Response(content="REAL_NUMBER_PAUSED", status_code=200)
+            
             messages = value.get("messages", [])
             
             if messages:
@@ -200,7 +211,6 @@ def generate_ai_reply(sender_phone: str, user_message: str) -> str:
         return "أهلاً بحضرتك يا فندم! شكراً لتواصلك مع العيادة، سيقوم أحد مسؤولي الاستقبال بالرد عليكي في أقرب وقت."
 
 async def send_whatsapp_message(recipient_phone: str, text_content: str, phone_number_id: str):
-    # Uses whatever phone_number_id received the incoming message dynamically
     url = f"https://graph.facebook.com/v21.0/{phone_number_id}/messages"
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
