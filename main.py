@@ -13,7 +13,7 @@ app = FastAPI()
 # SECURITY BEST PRACTICE: Keys loaded securely from Render Environment
 # ---------------------------------------------------------
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "Neckface@2003")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1360825553771801")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1360825553771801") # Fallback ID
 ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
 GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbwI302P_56AN4DB-kd7KLTzD31mxEFQEXzZVZA4UXw1LLlItLBfYvJCrw6XBbLt2_ctuw/exec"
 # ---------------------------------------------------------
@@ -36,7 +36,7 @@ def load_clinic_rules() -> str:
         print(f"Could not load clinic_rules.txt: {e}")
         return "مواعيد العمل من السبت للخميس من 1 ظهراً لـ 10 مساءً."
 
-# --- NEW SCHEDULE CHECKER TOOL ---
+# --- SCHEDULE CHECKER TOOL ---
 def check_schedule(date: str) -> str:
     """
     Fetches the currently booked appointments for a specific date.
@@ -60,7 +60,7 @@ def check_schedule(date: str) -> str:
         print(f"Schedule Read Error: {e}")
         return "لا يمكن قراءة الجدول الآن."
 
-# --- UPDATED BOOKING TOOL ---
+# --- BOOKING TOOL ---
 def book_appointment(patient_name: str, phone_number: str, date: str, time: str, area: str) -> str:
     """
     Saves a clinic appointment. 
@@ -115,6 +115,11 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         entries = body.get("entry", [])
         if entries:
             value = entries[0].get("changes", [{}])[0].get("value", {})
+            
+            # --- DYNAMICALLY EXTRACT WHICH PHONE NUMBER RECEIVED THE MESSAGE ---
+            metadata = value.get("metadata", {})
+            target_phone_id = metadata.get("phone_number_id", PHONE_NUMBER_ID)
+            
             messages = value.get("messages", [])
             
             if messages:
@@ -130,8 +135,8 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                     sender_phone = incoming_msg.get("from")
                     user_text = incoming_msg.get("text", {}).get("body", "").strip()
                     
-                    # Process AI reply in the background so webhook responds instantly
-                    background_tasks.add_task(handle_ai_conversation, sender_phone, user_text)
+                    # Pass the dynamic target_phone_id into the background task
+                    background_tasks.add_task(handle_ai_conversation, sender_phone, user_text, target_phone_id)
 
     except Exception as e:
         print(f"Webhook processing error: {e}")
@@ -140,9 +145,9 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     # Always return 200 OK immediately
     return Response(content="EVENT_RECEIVED", status_code=200)
 
-async def handle_ai_conversation(sender_phone: str, user_text: str):
+async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number_id: str):
     ai_response = generate_ai_reply(sender_phone, user_text)
-    await send_whatsapp_message(sender_phone, ai_response)
+    await send_whatsapp_message(sender_phone, ai_response, phone_number_id)
 
 def generate_ai_reply(sender_phone: str, user_message: str) -> str:
     try:
@@ -194,8 +199,9 @@ def generate_ai_reply(sender_phone: str, user_message: str) -> str:
         print(f"Gemini API Error: {e}")
         return "أهلاً بحضرتك يا فندم! شكراً لتواصلك مع العيادة، سيقوم أحد مسؤولي الاستقبال بالرد عليكي في أقرب وقت."
 
-async def send_whatsapp_message(recipient_phone: str, text_content: str):
-    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
+async def send_whatsapp_message(recipient_phone: str, text_content: str, phone_number_id: str):
+    # Uses whatever phone_number_id received the incoming message dynamically
+    url = f"https://graph.facebook.com/v21.0/{phone_number_id}/messages"
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
         "Content-Type": "application/json",
@@ -210,4 +216,4 @@ async def send_whatsapp_message(recipient_phone: str, text_content: str):
     
     async with httpx.AsyncClient() as http_client:
         res = await http_client.post(url, json=payload, headers=headers)
-        print(f"Meta Send Result -> Status: {res.status_code}")
+        print(f"Meta Send Result ({phone_number_id}) -> Status: {res.status_code}")
