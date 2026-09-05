@@ -216,4 +216,4 @@ async def send_whatsapp_message(recipient_phone: str, text_content: str, phone_n
     
     async with httpx.AsyncClient() as http_client:
         res = await http_client.post(url, json=payload, headers=headers)
-        print(f"Meta Send Result ({phone_number_id}) -> Status: {res.status_code}")
+        print(f"Meta Send Result ({phone_number_id}) -> Status: {res.status_code} | Response: {res.text}")
