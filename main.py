@@ -38,6 +38,12 @@ BASE_URL = os.getenv("BASE_URL", "https://receptionista.onrender.com")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "jothen123")
 
+# Numbers the bot will completely ignore
+BLOCKED_NUMBERS = [
+    "01142286600",
+    "201142286600"
+]
+
 # ---------------------------------------------------------
 # CLINIC OFFERS & MEDIA CATALOG
 # ---------------------------------------------------------
@@ -389,7 +395,6 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 patientChats.forEach(c => {
                     const div = document.createElement('div');
                     div.className = `msg ${c.role}`;
-                    // Convert line breaks to HTML breaks
                     div.innerHTML = c.content.replace(/\\n/g, '<br>');
                     messagesDiv.appendChild(div);
                 });
@@ -447,8 +452,15 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                     return Response(content="DUPLICATE_IGNORED", status_code=200)
 
                 if incoming_msg.get("type") == "text":
-                    sender_phone = incoming_msg.get("from")
+                    sender_phone = incoming_msg.get("from", "").strip()
                     user_text = incoming_msg.get("text", {}).get("body", "").strip()
+
+                    # ---------------------------------------------------------
+                    # BLACKLIST CHECK: Ignore blocked phone numbers completely
+                    # ---------------------------------------------------------
+                    if sender_phone in BLOCKED_NUMBERS or sender_phone.endswith("1142286600"):
+                        print(f"🚫 Ignored blocked number: {sender_phone}")
+                        return Response(content="BLOCKED_NUMBER_IGNORED", status_code=200)
 
                     background_tasks.add_task(
                         handle_ai_conversation, sender_phone, user_text, target_phone_id
