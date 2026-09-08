@@ -117,6 +117,10 @@ def verify_webhook(request: Request):
 async def receive_message(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.json()
+        
+        # 👇 ADDED LOG TO SEE EXACTLY WHAT META SENDS
+        print(f"📥 RAW WEBHOOK PAYLOAD: {body}")
+        
         entries = body.get("entry", [])
         if entries:
             value = entries[0].get("changes", [{}])[0].get("value", {})
