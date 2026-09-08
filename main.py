@@ -142,28 +142,30 @@ def check_schedule(date: str) -> str:
     """Fetches booked appointments for a date (YYYY-MM-DD)."""
     try:
         with httpx.Client(follow_redirects=True) as http_client:
-            response = http_client.get(f"{GOOGLE_SHEET_URL}?date={date}", timeout=10.0)
+            response = http_client.get(f"{GOOGLE_SHEET_URL}?date={date}", timeout=15.0)
+            response.raise_for_status()
             result = response.json()
             if "booked" in result:
                 booked_list = result["booked"]
                 if not booked_list:
                     return f"يوم {date} متاح بالكامل، لا يوجد حجوزات."
                 return f"المواعيد المحجوزة مسبقاً يوم {date} هي: {', '.join(booked_list)}"
-            return "حدث خطأ أثناء قراءة الجدول."
+            return "حدث خطأ أثناء قراءة الجدول، يرجى المحاولة بعد قليل."
+    except httpx.TimeoutException:
+        return "النظام يستغرق وقتاً أطول من المعتاد، سأحاول التحقق مرة أخرى."
     except Exception as e:
-        return f"لا يمكن قراءة الجدول الآن: {e}"
+        print(f"Check Schedule Error: {e}")
+        return "لا يمكن قراءة الجدول الآن."
 
 def normalize_to_ampm(time_str: str) -> str:
     """Converts 24h or fuzzy time strings (e.g., '20:00', '8pm') to '8:00 PM'."""
     time_str = time_str.strip().upper()
     try:
-        # Try 24h format HH:MM
         t = datetime.datetime.strptime(time_str, "%H:%M")
         return t.strftime("%I:%M %p").lstrip("0")
     except ValueError:
         pass
     try:
-        # Try if already 12h format like 08:00 PM or 8:00 PM
         t = datetime.datetime.strptime(time_str, "%I:%M %p")
         return t.strftime("%I:%M %p").lstrip("0")
     except ValueError:
@@ -182,14 +184,18 @@ def book_appointment(patient_name: str, phone_number: str, date: str, time: str,
     }
     try:
         with httpx.Client(follow_redirects=True) as http_client:
-            response = http_client.post(GOOGLE_SHEET_URL, json=payload, timeout=10.0)
+            response = http_client.post(GOOGLE_SHEET_URL, json=payload, timeout=15.0)
+            response.raise_for_status()
             try:
                 result = response.json()
                 if result.get("status") == "error":
                     return f"فشل الحجز: {result.get('message')}"
             except ValueError:
                 pass
+    except httpx.TimeoutException:
+        return "جاري تأكيد الحجز، يرجى الانتظار قليلاً."
     except Exception as e:
+        print(f"Book Appointment Error: {e}")
         return f"خطأ في الاتصال بنظام الحجز: {e}"
     return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {standard_time} لمنطقة {area}."
 
@@ -339,13 +345,14 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         - المناطق الصغيرة: 15 دقيقة.
         - افحصي الحجوزات بأداة check_schedule قبل اقتراح أي موعد.
         - لا تؤكدي الحجز بأداة book_appointment إلا بعد الموافقة الصريحة للعميل على الاسم والتاريخ والوقت والمنطقة.
-        """
+        
         تعليمات فحص وحجز المواعيد لمنع التضارب:
         - كل المواعيد في الجدول مسجلة بصيغة (AM / PM) مثل: "8:00 PM".
         - استدعي أداة check_schedule قبل اقتراح أو تأكيد أي موعد.
         - إذا وجدت موعداً محجوزاً في نفس التوقيت (مثلاً 8:00 PM أو 20:00 متطابقان تماماً):
           * اقترحي موعداً بديلاً متاحاً (مثلاً 9:00 PM).
         - جلسة الجسم الكامل = 45 دقيقة، نصف الجسم = 30 دقيقة، المناطق الصغيرة = 15 دقيقة. لا تحجزي موعدين متعارضين في نفس الوقت نهائياً.
+        """
 
         past_contents = load_chat_history(sender_phone, limit=10)
 
