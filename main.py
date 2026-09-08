@@ -15,14 +15,13 @@ app = FastAPI()
 
 # ---------------------------------------------------------
 # MOUNT LOCAL IMAGES DIRECTORY
-# This makes the files in your GitHub 'images' folder public
 # ---------------------------------------------------------
 app.mount("/images", StaticFiles(directory="images"), name="images")
 
 # --- HOME ROUTE ---
 @app.get("/")
 def home():
-    return {"status": "Clinic AI Receptionist is running with Supabase Cloud DB & Local Images!"}
+    return {"status": "Clinic AI Receptionist is running with Supabase Cloud DB & Patient CRM!"}
 
 # ---------------------------------------------------------
 # CONFIGURATION & ENVIRONMENT VARIABLES
@@ -35,7 +34,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 BASE_URL = os.getenv("BASE_URL", "https://receptionista.onrender.com")
 
 # ---------------------------------------------------------
-# CLINIC OFFERS & MEDIA CATALOG (Mapped to your GitHub folder)
+# CLINIC OFFERS & MEDIA CATALOG
 # ---------------------------------------------------------
 OFFER_IMAGES = {
     "branches": {
@@ -116,6 +115,18 @@ def load_chat_history(phone_number: str, limit: int = 10):
         print(f"DB Load Chat Error: {e}")
     return history
 
+def load_patient_profile(phone_number: str) -> dict:
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("SELECT name, preferences FROM patients WHERE phone_number = %s", (phone_number,))
+                row = cursor.fetchone()
+                if row:
+                    return {"name": row.get("name") or "", "preferences": row.get("preferences") or ""}
+    except Exception as e:
+        print(f"DB Load Patient Error: {e}")
+    return {"name": "", "preferences": ""}
+
 def load_clinic_rules() -> str:
     try:
         with open("clinic_rules.txt", "r", encoding="utf-8") as f:
@@ -163,6 +174,32 @@ def book_appointment(patient_name: str, phone_number: str, date: str, time: str,
     except Exception as e:
         return f"خطأ في الاتصال بنظام الحجز: {e}"
     return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time} لمنطقة {area}."
+
+def update_patient_file(phone_number: str, name: str, preferences: str) -> str:
+    """
+    Saves or updates long-term patient records: their name, customary areas, and preferences/quirks.
+    Call this whenever the user shares their name, preferred areas, or medical/service quirks.
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO patients (phone_number, name, preferences)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (phone_number)
+                    DO UPDATE SET
+                        name = COALESCE(NULLIF(EXCLUDED.name, ''), patients.name),
+                        preferences = CASE 
+                            WHEN patients.preferences IS NULL OR patients.preferences = '' THEN EXCLUDED.preferences
+                            WHEN EXCLUDED.preferences IS NULL OR EXCLUDED.preferences = '' THEN patients.preferences
+                            ELSE patients.preferences || ' | ' || EXCLUDED.preferences
+                        END;
+                """, (phone_number, name.strip(), preferences.strip()))
+                conn.commit()
+        return "تم تحديث الملف الدائم للعميل بنجاح."
+    except Exception as e:
+        print(f"DB Update Patient Error: {e}")
+        return f"حدث خطأ أثناء حفظ الملف: {e}"
 
 # ---------------------------------------------------------
 # WEBHOOK ENDPOINTS
@@ -220,7 +257,7 @@ async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number
     # 1. Save inbound patient message to Supabase
     save_chat_turn(sender_phone, "user", user_text)
 
-    # 2. Generate response with conversation history from Supabase
+    # 2. Generate response with conversation history and patient profile
     ai_response, attached_image = generate_ai_reply(sender_phone, user_text)
 
     # 3. Send offer flyer image if requested
@@ -242,7 +279,12 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         clinic_knowledge = load_clinic_rules()
         today_date = datetime.datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y-%m-%d")
 
-        # 1. Build the image catalog text dynamically for the prompt
+        # Load long-term profile from Supabase
+        profile = load_patient_profile(sender_phone)
+        known_name = profile["name"] or "غير معروف بعد"
+        known_preferences = profile["preferences"] or "لا توجد تفضيلات مسجلة بعد"
+
+        # Build image catalog instructions
         image_instructions = ""
         for key, data in OFFER_IMAGES.items():
             image_instructions += f"- للسؤال عن ({key}): اطبعي هذا السطر بالضبط في بداية ردك:\nATTACH_IMAGE::{data['url']}::{data['caption']}\n"
@@ -250,32 +292,35 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         system_instruction = f"""
         أنتِ موظفة استقبال ذكية ومساعدة افتراضية لعيادة Jothen Clinic للتجميل والليزر.
         تاريخ اليوم: {today_date} بتوقيت القاهرة.
-        رقم العميل: {sender_phone}
+        رقم هاتف العميل: {sender_phone}
 
-        تعليمات هامة للتعرف على جنس العميل:
-        - استنتجي جنس العميل من اسمه (ذكر أم أنثى).
-        - إذا كان العميل ذكراً (مثل: كريم، أحمد، محمد)، تحدثي معه بصيغة المذكر، وإذا سأل عن العروض اعرضي عليه عروض الرجال ('men_offers').
-        - إذا كانت العميل أنثى، تحدثي معها بصيغة المؤنث.
-        - إذا لم يذكر العميل اسمه بعد، تحدثي بصيغة محايدة ولبقة واطلبي منه التعرف على اسمه.
+        الملف الدائم للعميل (ذاكرة العيادة):
+        - اسم العميل المسجل: {known_name}
+        - التفضيلات والملاحظات المحفوظة: {known_preferences}
+
+        تعليمات هامة للتعرف على جنس وهوية العميل:
+        - استنتجي جنس العميل من اسمه المسجل أو الاسم الجديد الذي يذكره.
+        - إذا كان العميل ذكراً (مثل: كريم، أحمد، محمد)، خاطبيه بالمذكر، وإذا طلب العروض اعرضي عروض الرجال ('men_offers').
+        - إذا كانت العميل أنثى، خاطبيها بالمؤنث.
+        - إذا لم يُذكر الاسم حتى الآن، تحدثي بلباقة واطلبي منه التعرف على اسمه.
+
+        تعليمات حفظ الملف الدائم (أداة update_patient_file):
+        - استخدمي أداة update_patient_file فور معرفتك لاسم العميل، أو المناطق التي يفضل عمل جلسات لها دائماً، أو أي ملاحظات هامة (مثل: بشرة حساسة، مواعيد مفضلة، تفضيل أخصائي معين).
+        - مرري رقم الهاتف: {sender_phone} عند استدعاء الأداة.
 
         معلومات العيادة:
         {clinic_knowledge}
 
         تعليمات إرسال الصور (هام جداً):
-        لإرسال صورة للعميل، **يجب** أن تطبعي الكود الخاص بها في السطر الأول من رسالتك.
-        الأكواد المتاحة:
+        لإرسال صورة للعميل، **يجب** أن تطبعي الكود الخاص بها في السطر الأول من رسالتك:
         {image_instructions}
-
-        مثال للرد الصحيح:
-        ATTACH_IMAGE::{BASE_URL}/images/women_packages.jpg::باقات الليزر
-        أهلاً بك يا فندم، هذه هي أفضل باقات وعروض الليزر المتوفرة لدينا...
 
         تعليمات الحجز:
         - جلسة الجسم الكامل: 45 دقيقة.
         - نصف الجسم: 30 دقيقة.
         - المناطق الصغيرة: 15 دقيقة.
         - افحصي الحجوزات بأداة check_schedule قبل اقتراح أي موعد.
-        - لا تؤكدي الحجز بأداة book_appointment إلا بعد الموافقة الصريحة للعميل.
+        - لا تؤكدي الحجز بأداة book_appointment إلا بعد الموافقة الصريحة للعميل على الاسم والتاريخ والوقت والمنطقة.
         """
 
         past_contents = load_chat_history(sender_phone, limit=10)
@@ -286,7 +331,7 @@ def generate_ai_reply(sender_phone: str, user_message: str):
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
-                tools=[check_schedule, book_appointment], 
+                tools=[check_schedule, book_appointment, update_patient_file], 
             )
         )
 
@@ -294,21 +339,16 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         response_text = response.text or ""
         print(f"🤖 AI RAW TEXT: {response_text}")
 
-        # 3. Smarter text parsing to extract the image
+        # Extract image if present
         attached_image = None
         if "ATTACH_IMAGE::" in response_text:
             parts = response_text.split("ATTACH_IMAGE::", 1)
-            
-            # Split the hidden code line from the rest of the natural conversation
             meta_and_text = parts[1].split("\n", 1)
-            
             image_meta = meta_and_text[0].split("::")
             attached_image = {
                 "url": image_meta[0].strip(),
                 "caption": image_meta[1].strip() if len(image_meta) > 1 else ""
             }
-            
-            # Keep only the human-friendly text to send via WhatsApp
             response_text = meta_and_text[1].strip() if len(meta_and_text) > 1 else "إليك التفاصيل:"
 
         return response_text, attached_image
