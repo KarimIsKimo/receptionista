@@ -7,15 +7,22 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 from fastapi.responses import PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from google import genai
 from google.genai import types
 
 app = FastAPI()
 
+# ---------------------------------------------------------
+# MOUNT LOCAL IMAGES DIRECTORY
+# This makes the files in your GitHub 'images' folder public
+# ---------------------------------------------------------
+app.mount("/images", StaticFiles(directory="images"), name="images")
+
 # --- HOME ROUTE ---
 @app.get("/")
 def home():
-    return {"status": "Clinic AI Receptionist is running with Supabase Cloud DB!"}
+    return {"status": "Clinic AI Receptionist is running with Supabase Cloud DB & Local Images!"}
 
 # ---------------------------------------------------------
 # CONFIGURATION & ENVIRONMENT VARIABLES
@@ -25,22 +32,31 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1360825553771801")
 ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
 GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbwI302P_56AN4DB-kd7KLTzD31mxEFQEXzZVZA4UXw1LLlItLBfYvJCrw6XBbLt2_ctuw/exec"
 DATABASE_URL = os.getenv("DATABASE_URL")
+BASE_URL = os.getenv("BASE_URL", "https://receptionista.onrender.com")
 
 # ---------------------------------------------------------
-# CLINIC OFFERS & MEDIA CATALOG
+# CLINIC OFFERS & MEDIA CATALOG (Mapped to your GitHub folder)
 # ---------------------------------------------------------
 OFFER_IMAGES = {
-    "laser_packages": {
-        "url": "https://images.unsplash.com/photo-1512290900672-1f55b6eb0a69?w=800",
-        "caption": "عروض باقات إزالة الشعر بالليزر المتوفرة حالياً بالعيادة ✨"
+    "branches": {
+        "url": f"{BASE_URL}/images/branches.jpg",
+        "caption": "فروع Jothen Clinic وأماكن تواجدنا 📍"
     },
-    "skin_care": {
-        "url": "https://images.unsplash.com/photo-1570172619644-dfd03ed5d881?w=800",
-        "caption": "عروض جلسات نضارة البشرة والتنظيف العميق 🌸"
+    "machines": {
+        "url": f"{BASE_URL}/images/machines.jpg",
+        "caption": "أحدث أجهزة إزالة الشعر بالليزر المتوفرة لدينا في العيادة ⚡"
     },
-    "general_prices": {
-        "url": "https://images.unsplash.com/photo-1516549655169-df83a0774514?w=800",
-        "caption": "قائمة أسعار خدمات وجلسات العيادة 📋"
+    "men_offers": {
+        "url": f"{BASE_URL}/images/men_offers.jpg",
+        "caption": "عروض وباقات ليزر إزالة الشعر المخصصة للرجال 🧔"
+    },
+    "women_areas": {
+        "url": f"{BASE_URL}/images/women_areas.jpg",
+        "caption": "أسعار وعروض المناطق المنفردة لليزر السيدات 🌸"
+    },
+    "women_packages": {
+        "url": f"{BASE_URL}/images/women_packages.jpg",
+        "caption": "باقات وعروض الليزر الكاملة للسيدات ✨"
     }
 }
 
@@ -150,14 +166,18 @@ def book_appointment(patient_name: str, phone_number: str, date: str, time: str,
 
 def send_offer_flyer(category: str) -> str:
     """
-    Use this tool whenever the patient asks for offers, discounts, packages, or prices.
-    Categories: 'laser_packages', 'skin_care', 'general_prices'.
+    Call this tool whenever the patient asks for:
+    - 'branches': Locations, branches, or addresses.
+    - 'machines': Types of laser devices, technologies, cooling systems.
+    - 'men_offers': Laser pricing and packages for men.
+    - 'women_areas': Pricing for individual areas for women (underarm, bikini, face, legs, etc.).
+    - 'women_packages': Full body packages or special offers for women.
     """
     category = category.lower().strip()
     if category in OFFER_IMAGES:
         data = OFFER_IMAGES[category]
         return f"ATTACH_IMAGE::{data['url']}::{data['caption']}"
-    return "ATTACH_IMAGE::" + OFFER_IMAGES["general_prices"]["url"] + "::" + OFFER_IMAGES["general_prices"]["caption"]
+    return f"ATTACH_IMAGE::{OFFER_IMAGES['women_packages']['url']}::{OFFER_IMAGES['women_packages']['caption']}"
 
 # ---------------------------------------------------------
 # WEBHOOK ENDPOINTS
@@ -238,16 +258,22 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         today_date = datetime.datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y-%m-%d")
 
         system_instruction = f"""
-        أنتِ موظفة استقبال ذكية ومساعدة افتراضية لعيادة التجميل والليزر.
+        أنتِ موظفة استقبال ذكية ومساعدة افتراضية لعيادة Jothen Clinic للتجميل والليزر.
         تاريخ اليوم: {today_date} بتوقيت القاهرة.
         رقم المريضة: {sender_phone}
 
         معلومات العيادة:
         {clinic_knowledge}
 
-        تعليمات هامة للتعامل مع العروض والصور:
-        - إذا سألت المريضة عن العروض أو الخصومات أو الباقات أو الأسعار، استخدمي أداة (send_offer_flyer) مع تحديد التصنيف المناسب ('laser_packages', 'skin_care', 'general_prices').
-        - بعد استدعاء أداة العرض، اكتبي للمريضة رداً لطيفاً يوضح العرض المرفق بالصورة ويشجعها على الحجز.
+        تعليمات إرسال الصور والفلايرات:
+        لديكِ أداة (send_offer_flyer) لإرسال الصور التوضيحية عند السؤال:
+        - إذا سأل العميل عن الفروع أو العناوين: استخدمي 'branches'.
+        - إذا سأل عن نوع الجهاز أو التبريد أو الأجهزة المتوفرة: استخدمي 'machines'.
+        - إذا كان العميل رجلاً أو يسأل عن ليزر الرجال: استخدمي 'men_offers'.
+        - إذا سألت المريضة عن أسعار مناطق محددة (بيكيني، وجه، أندر آرم، إلخ): استخدمي 'women_areas'.
+        - إذا سألت المريضة عن باقات كاملة، عروض الصيف، أو الجسم كامل: استخدمي 'women_packages'.
+
+        بعد استدعاء أداة الصورة، اكتبي رداً لطيفاً ومختصراً يرحب بالعميل ويجيب على سؤاله بناءً على محتوى العرض.
 
         تعليمات الحجز:
         - جلسة الجسم الكامل: 45 دقيقة.
