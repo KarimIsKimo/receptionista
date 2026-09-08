@@ -3,37 +3,104 @@ import traceback
 import httpx
 import datetime
 from zoneinfo import ZoneInfo
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 from fastapi.responses import PlainTextResponse
 from google import genai
+from google.genai import types
 
 app = FastAPI()
 
 # --- HOME ROUTE ---
 @app.get("/")
 def home():
-    return {"status": "Clinic AI Receptionist is running!"}
+    return {"status": "Clinic AI Receptionist is running with Supabase Cloud DB!"}
 
 # ---------------------------------------------------------
-# SECURITY BEST PRACTICE: Keys loaded securely from Render Environment
+# CONFIGURATION & ENVIRONMENT VARIABLES
 # ---------------------------------------------------------
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "Neckface@2003")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1360825553771801") # Fallback ID
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "1360825553771801")
 ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
 GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbwI302P_56AN4DB-kd7KLTzD31mxEFQEXzZVZA4UXw1LLlItLBfYvJCrw6XBbLt2_ctuw/exec"
-# ---------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# 1. Initialize the Gemini client ONCE globally so it stays open
+# ---------------------------------------------------------
+# CLINIC OFFERS & MEDIA CATALOG
+# ---------------------------------------------------------
+OFFER_IMAGES = {
+    "laser_packages": {
+        "url": "https://images.unsplash.com/photo-1512290900672-1f55b6eb0a69?w=800",
+        "caption": "عروض باقات إزالة الشعر بالليزر المتوفرة حالياً بالعيادة ✨"
+    },
+    "skin_care": {
+        "url": "https://images.unsplash.com/photo-1570172619644-dfd03ed5d881?w=800",
+        "caption": "عروض جلسات نضارة البشرة والتنظيف العميق 🌸"
+    },
+    "general_prices": {
+        "url": "https://images.unsplash.com/photo-1516549655169-df83a0774514?w=800",
+        "caption": "قائمة أسعار خدمات وجلسات العيادة 📋"
+    }
+}
+
 client = genai.Client()
 
-# Track processed IDs so retries are ignored
-processed_message_ids = set()
+# ---------------------------------------------------------
+# SUPABASE POSTGRESQL DATABASE HELPERS
+# ---------------------------------------------------------
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-# Dictionary to store active chat sessions for each phone number
-active_chats = {}
+def is_duplicate_message(message_id: str) -> bool:
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1 FROM processed_messages WHERE message_id = %s", (message_id,))
+                if cursor.fetchone():
+                    return True
+                cursor.execute("INSERT INTO processed_messages (message_id) VALUES (%s) ON CONFLICT DO NOTHING", (message_id,))
+                conn.commit()
+                return False
+    except Exception as e:
+        print(f"DB Deduplication Error: {e}")
+        return False
+
+def save_chat_turn(phone_number: str, role: str, content: str):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO chat_history (phone_number, role, content) VALUES (%s, %s, %s)",
+                    (phone_number, role, content)
+                )
+                conn.commit()
+    except Exception as e:
+        print(f"DB Save Chat Error: {e}")
+
+def load_chat_history(phone_number: str, limit: int = 10):
+    history = []
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""
+                    SELECT role, content FROM chat_history 
+                    WHERE phone_number = %s 
+                    ORDER BY id DESC LIMIT %s
+                """, (phone_number, limit))
+                rows = cursor.fetchall()
+                
+        for row in reversed(rows):
+            gemini_role = "user" if row["role"] == "user" else "model"
+            history.append(types.Content(
+                role=gemini_role,
+                parts=[types.Part.from_text(text=row["content"])]
+            ))
+    except Exception as e:
+        print(f"DB Load Chat Error: {e}")
+    return history
 
 def load_clinic_rules() -> str:
-    """Reads clinic rules directly from clinic_rules.txt"""
     try:
         with open("clinic_rules.txt", "r", encoding="utf-8") as f:
             return f.read()
@@ -41,20 +108,15 @@ def load_clinic_rules() -> str:
         print(f"Could not load clinic_rules.txt: {e}")
         return "مواعيد العمل من السبت للخميس من 1 ظهراً لـ 10 مساءً."
 
-# --- SCHEDULE CHECKER TOOL ---
+# ---------------------------------------------------------
+# TOOLS FOR GEMINI
+# ---------------------------------------------------------
 def check_schedule(date: str) -> str:
-    """
-    Fetches the currently booked appointments for a specific date.
-    ALWAYS use this tool BEFORE confirming a time with the patient to check for overlaps.
-    'date' MUST be formatted as YYYY-MM-DD.
-    """
-    print(f"🔍 AI IS CHECKING SCHEDULE FOR: {date}")
-    
+    """Fetches booked appointments for a date (YYYY-MM-DD)."""
     try:
         with httpx.Client(follow_redirects=True) as http_client:
             response = http_client.get(f"{GOOGLE_SHEET_URL}?date={date}", timeout=10.0)
             result = response.json()
-            
             if "booked" in result:
                 booked_list = result["booked"]
                 if not booked_list:
@@ -62,18 +124,10 @@ def check_schedule(date: str) -> str:
                 return f"المواعيد المحجوزة مسبقاً يوم {date} هي: {', '.join(booked_list)}"
             return "حدث خطأ أثناء قراءة الجدول."
     except Exception as e:
-        print(f"Schedule Read Error: {e}")
-        return "لا يمكن قراءة الجدول الآن."
+        return f"لا يمكن قراءة الجدول الآن: {e}"
 
-# --- BOOKING TOOL ---
 def book_appointment(patient_name: str, phone_number: str, date: str, time: str, area: str) -> str:
-    """
-    Saves a clinic appointment. 
-    Use this tool ONLY when the patient has confirmed the date, time, AND the laser area.
-    IMPORTANT: The 'date' parameter MUST be formatted as YYYY-MM-DD.
-    """
-    print(f"🟢 SENDING TO GOOGLE SHEETS: {patient_name} ({phone_number}) on {date} at {time} for {area}")
-    
+    """Saves a clinic appointment when patient details and slot are confirmed."""
     payload = {
         "patient_name": patient_name,
         "phone_number": phone_number,
@@ -81,28 +135,33 @@ def book_appointment(patient_name: str, phone_number: str, date: str, time: str,
         "time": time,
         "area": area
     }
-    
     try:
         with httpx.Client(follow_redirects=True) as http_client:
             response = http_client.post(GOOGLE_SHEET_URL, json=payload, timeout=10.0)
-            print(f"Google Sheets HTTP Status: {response.status_code}")
-            
             try:
                 result = response.json()
                 if result.get("status") == "error":
-                    if "Slot already taken" in result.get("message", ""):
-                        return f"فشل الحجز: الموعد يوم {date} الساعة {time} محجوز مسبقاً. اعتذر للمريضة واطلب منها اختيار موعد آخر."
-                    return f"حدث خطأ أثناء حفظ الحجز: {result.get('message')}"
+                    return f"فشل الحجز: {result.get('message')}"
             except ValueError:
-                print(f"Google Sheets returned non-JSON response: {response.text}")
-                
+                pass
     except Exception as e:
-        print(f"Failed to send to Google Sheets: {e}")
-        return "حدث خطأ في الاتصال بنظام الحجز، يرجى المحاولة لاحقاً."
-    
+        return f"خطأ في الاتصال بنظام الحجز: {e}"
     return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time} لمنطقة {area}."
-# -------------------------
 
+def send_offer_flyer(category: str) -> str:
+    """
+    Use this tool whenever the patient asks for offers, discounts, packages, or prices.
+    Categories: 'laser_packages', 'skin_care', 'general_prices'.
+    """
+    category = category.lower().strip()
+    if category in OFFER_IMAGES:
+        data = OFFER_IMAGES[category]
+        return f"ATTACH_IMAGE::{data['url']}::{data['caption']}"
+    return "ATTACH_IMAGE::" + OFFER_IMAGES["general_prices"]["url"] + "::" + OFFER_IMAGES["general_prices"]["caption"]
+
+# ---------------------------------------------------------
+# WEBHOOK ENDPOINTS
+# ---------------------------------------------------------
 @app.get("/webhook")
 def verify_webhook(request: Request):
     mode = request.query_params.get("hub.mode")
@@ -117,103 +176,121 @@ def verify_webhook(request: Request):
 async def receive_message(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.json()
-        
-        # 👇 ADDED LOG TO SEE EXACTLY WHAT META SENDS
         print(f"📥 RAW WEBHOOK PAYLOAD: {body}")
-        
+
         entries = body.get("entry", [])
         if entries:
             value = entries[0].get("changes", [{}])[0].get("value", {})
-            
-            # --- DYNAMICALLY EXTRACT WHICH PHONE NUMBER RECEIVED THE MESSAGE ---
             metadata = value.get("metadata", {})
             target_phone_id = metadata.get("phone_number_id", PHONE_NUMBER_ID)
-            
-            # --- TOGGLE SWITCH FOR REAL CLINIC NUMBER ---
-            # If ENABLE_REAL_CLINIC is set to "false" in Render, ignore messages to the real clinic number ID
+
             enable_real_clinic = os.getenv("ENABLE_REAL_CLINIC", "true").lower() == "true"
             if target_phone_id == "979476801911389" and not enable_real_clinic:
                 return Response(content="REAL_NUMBER_PAUSED", status_code=200)
-            
+
             messages = value.get("messages", [])
-            
             if messages:
                 incoming_msg = messages[0]
                 message_id = incoming_msg.get("id")
 
-                # Deduplication: Ignore if we already processed this message
-                if message_id in processed_message_ids:
+                # Deduplication via Supabase PostgreSQL
+                if is_duplicate_message(message_id):
                     return Response(content="DUPLICATE_IGNORED", status_code=200)
 
                 if incoming_msg.get("type") == "text":
-                    processed_message_ids.add(message_id)
                     sender_phone = incoming_msg.get("from")
                     user_text = incoming_msg.get("text", {}).get("body", "").strip()
-                    
-                    # Pass the dynamic target_phone_id into the background task
-                    background_tasks.add_task(handle_ai_conversation, sender_phone, user_text, target_phone_id)
+
+                    background_tasks.add_task(
+                        handle_ai_conversation, sender_phone, user_text, target_phone_id
+                    )
 
     except Exception as e:
         print(f"Webhook processing error: {e}")
         traceback.print_exc()
 
-    # Always return 200 OK immediately
     return Response(content="EVENT_RECEIVED", status_code=200)
 
 async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number_id: str):
-    ai_response = generate_ai_reply(sender_phone, user_text)
-    await send_whatsapp_message(sender_phone, ai_response, phone_number_id)
+    # 1. Save inbound patient message to Supabase
+    save_chat_turn(sender_phone, "user", user_text)
 
-def generate_ai_reply(sender_phone: str, user_message: str) -> str:
+    # 2. Generate response with conversation history from Supabase
+    ai_response, attached_image = generate_ai_reply(sender_phone, user_text)
+
+    # 3. Send offer flyer image if requested
+    if attached_image:
+        await send_whatsapp_image(
+            recipient_phone=sender_phone,
+            image_url=attached_image["url"],
+            caption=attached_image["caption"],
+            phone_number_id=phone_number_id
+        )
+
+    # 4. Send text response and save to Supabase
+    if ai_response:
+        await send_whatsapp_message(sender_phone, ai_response, phone_number_id)
+        save_chat_turn(sender_phone, "model", ai_response)
+
+def generate_ai_reply(sender_phone: str, user_message: str):
     try:
         clinic_knowledge = load_clinic_rules()
         today_date = datetime.datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y-%m-%d")
-        
+
         system_instruction = f"""
-        أنت موظف استقبال ذكي ومساعد افتراضي للعيادة.
-        تاريخ اليوم هو: {today_date} (بتوقيت القاهرة)
-        رقم هاتف المريضة الحالي هو: {sender_phone}
+        أنتِ موظفة استقبال ذكية ومساعدة افتراضية لعيادة التجميل والليزر.
+        تاريخ اليوم: {today_date} بتوقيت القاهرة.
+        رقم المريضة: {sender_phone}
 
-        مهمتك الرد على استفسارات المرضى ومساعدتهم في الحجز.
-
-        القواعد والمعلومات الخاصة بالعيادة:
+        معلومات العيادة:
         {clinic_knowledge}
-        
-        تعليمات هامة جداً قبل الحجز وحساب وقت الجلسات لمنع التداخل:
-        - جلسة الجسم الكامل (Full Body) تستغرق 45 دقيقة.
-        - جلسة نصف الجسم (Half Body) تستغرق 30 دقيقة.
-        - جلسة المناطق الصغيرة (مثل الوجه أو البكيني) تستغرق 15 دقيقة.
 
-        خطوات الحجز الإلزامية:
-        1. اسألي المريضة عن المنطقة التي تريد عمل ليزر لها (مثل: الوجه، البكيني، الجسم كامل، إلخ) قبل تأكيد الحجز.
-        2. استخدمي أداة (check_schedule) لمعرفة الحجوزات الموجودة في اليوم المطلوب.
-        3. احسبي الوقت بناءً على الحجوزات الموجودة. (مثلاً: إذا كان هناك حجز "جسم كامل" الساعة 2:00، فهذا يعني أن الطبيب مشغول حتى 2:45، ولا يمكنك حجز مريضة أخرى في هذا الوقت).
-        4. اقترحي موعداً متاحاً للمريضة بناءً على الحسابات.
-        5. لا تقومي بتأكيد الحجز باستخدام أداة (book_appointment) إلا بعد موافقة المريضة النهائية ومعرفة كل التفاصيل: (الاسم، اليوم، الساعة، والمنطقة).
-        6. استخدمي رقم هاتف المريضة الحالي المرفق أعلاه عند استخدام أداة الحجز.
+        تعليمات هامة للتعامل مع العروض والصور:
+        - إذا سألت المريضة عن العروض أو الخصومات أو الباقات أو الأسعار، استخدمي أداة (send_offer_flyer) مع تحديد التصنيف المناسب ('laser_packages', 'skin_care', 'general_prices').
+        - بعد استدعاء أداة العرض، اكتبي للمريضة رداً لطيفاً يوضح العرض المرفق بالصورة ويشجعها على الحجز.
+
+        تعليمات الحجز:
+        - جلسة الجسم الكامل: 45 دقيقة.
+        - نصف الجسم: 30 دقيقة.
+        - المناطق الصغيرة: 15 دقيقة.
+        - افحصي الحجوزات بأداة check_schedule قبل اقتراح أي موعد.
+        - لا تؤكدي الحجز بأداة book_appointment إلا بعد الموافقة الصريحة للمريضة على الاسم، التاريخ، الساعة، والمنطقة.
         """
-        
-        # Check if this patient already has an active conversation going
-        if sender_phone not in active_chats:
-            active_chats[sender_phone] = client.chats.create(
-                model='gemini-3.5-flash-lite', 
-                config={
-                    'system_instruction': system_instruction,
-                    'temperature': 0.2, # Lowered to keep math/logic stable
-                    'tools': [check_schedule, book_appointment],
-                }
+
+        past_contents = load_chat_history(sender_phone, limit=10)
+
+        chat = client.chats.create(
+            model='gemini-2.5-flash',
+            history=past_contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2,
+                tools=[check_schedule, book_appointment, send_offer_flyer],
             )
-        
-        # Send the user's message to their specific chat history
-        chat = active_chats[sender_phone]
+        )
+
         response = chat.send_message(user_message)
-        
-        return response.text
-        
+        response_text = response.text or ""
+
+        attached_image = None
+        if "ATTACH_IMAGE::" in response_text:
+            parts = response_text.split("ATTACH_IMAGE::")
+            response_text = parts[0].strip()
+            image_meta = parts[1].split("::")
+            attached_image = {
+                "url": image_meta[0].strip(),
+                "caption": image_meta[1].strip() if len(image_meta) > 1 else ""
+            }
+
+        return response_text, attached_image
+
     except Exception as e:
         print(f"Gemini API Error: {e}")
-        return "أهلاً بحضرتك يا فندم! شكراً لتواصلك مع العيادة، سيقوم أحد مسؤولي الاستقبال بالرد عليكي في أقرب وقت."
+        return "أهلاً بحضرتك يا فندم! شكراً لتواصلك مع العيادة، سيقوم أحد مسؤولي الاستقبال بالرد عليكي في أقرب وقت.", None
 
+# ---------------------------------------------------------
+# OUTBOUND MESSAGING
+# ---------------------------------------------------------
 async def send_whatsapp_message(recipient_phone: str, text_content: str, phone_number_id: str):
     url = f"https://graph.facebook.com/v21.0/{phone_number_id}/messages"
     headers = {
@@ -227,7 +304,26 @@ async def send_whatsapp_message(recipient_phone: str, text_content: str, phone_n
         "type": "text",
         "text": {"body": text_content},
     }
-    
     async with httpx.AsyncClient() as http_client:
         res = await http_client.post(url, json=payload, headers=headers)
-        print(f"Meta Send Result ({phone_number_id}) -> Status: {res.status_code} | Response: {res.text}")
+        print(f"Meta Send Text ({phone_number_id}) -> Status: {res.status_code}")
+
+async def send_whatsapp_image(recipient_phone: str, image_url: str, caption: str, phone_number_id: str):
+    url = f"https://graph.facebook.com/v21.0/{phone_number_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient_phone,
+        "type": "image",
+        "image": {
+            "link": image_url,
+            "caption": caption
+        }
+    }
+    async with httpx.AsyncClient() as http_client:
+        res = await http_client.post(url, json=payload, headers=headers)
+        print(f"Meta Send Image ({phone_number_id}) -> Status: {res.status_code}")
