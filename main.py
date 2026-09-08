@@ -153,13 +153,31 @@ def check_schedule(date: str) -> str:
     except Exception as e:
         return f"لا يمكن قراءة الجدول الآن: {e}"
 
+def normalize_to_ampm(time_str: str) -> str:
+    """Converts 24h or fuzzy time strings (e.g., '20:00', '8pm') to '8:00 PM'."""
+    time_str = time_str.strip().upper()
+    try:
+        # Try 24h format HH:MM
+        t = datetime.datetime.strptime(time_str, "%H:%M")
+        return t.strftime("%I:%M %p").lstrip("0")
+    except ValueError:
+        pass
+    try:
+        # Try if already 12h format like 08:00 PM or 8:00 PM
+        t = datetime.datetime.strptime(time_str, "%I:%M %p")
+        return t.strftime("%I:%M %p").lstrip("0")
+    except ValueError:
+        pass
+    return time_str
+
 def book_appointment(patient_name: str, phone_number: str, date: str, time: str, area: str) -> str:
     """Saves a clinic appointment when patient details and slot are confirmed."""
+    standard_time = normalize_to_ampm(time)
     payload = {
         "patient_name": patient_name,
         "phone_number": phone_number,
         "date": date,
-        "time": time,
+        "time": standard_time,
         "area": area
     }
     try:
@@ -173,7 +191,7 @@ def book_appointment(patient_name: str, phone_number: str, date: str, time: str,
                 pass
     except Exception as e:
         return f"خطأ في الاتصال بنظام الحجز: {e}"
-    return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time} لمنطقة {area}."
+    return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {standard_time} لمنطقة {area}."
 
 def update_patient_file(phone_number: str, name: str, preferences: str) -> str:
     """
