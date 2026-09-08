@@ -2,12 +2,14 @@ import os
 import traceback
 import httpx
 import datetime
+import secrets
 from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, Request, Response, BackgroundTasks
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request, Response, BackgroundTasks, Depends, HTTPException, status
+from fastapi.responses import PlainTextResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from google import genai
 from google.genai import types
 
@@ -32,6 +34,9 @@ ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "YOUR_ACCESS_TOKEN_HERE")
 GOOGLE_SHEET_URL = "https://script.google.com/macros/s/AKfycbwI302P_56AN4DB-kd7KLTzD31mxEFQEXzZVZA4UXw1LLlItLBfYvJCrw6XBbLt2_ctuw/exec"
 DATABASE_URL = os.getenv("DATABASE_URL")
 BASE_URL = os.getenv("BASE_URL", "https://receptionista.onrender.com")
+
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "jothen123")
 
 # ---------------------------------------------------------
 # CLINIC OFFERS & MEDIA CATALOG
@@ -224,6 +229,184 @@ def update_patient_file(phone_number: str, name: str, preferences: str) -> str:
     except Exception as e:
         print(f"DB Update Patient Error: {e}")
         return f"حدث خطأ أثناء حفظ الملف: {e}"
+
+# ---------------------------------------------------------
+# PRIVATE ADMIN DASHBOARD (WEB)
+# ---------------------------------------------------------
+security = HTTPBasic()
+
+def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
+    correct_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+@app.get("/admin/api/data")
+def get_admin_data(admin: str = Depends(verify_admin)):
+    patients = []
+    chats = []
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("SELECT * FROM patients ORDER BY name")
+                patients = cursor.fetchall()
+                
+                cursor.execute("SELECT phone_number, role, content FROM chat_history ORDER BY id ASC")
+                chats = cursor.fetchall()
+    except Exception as e:
+        print(f"Admin API DB Error: {e}")
+        
+    return {"patients": patients, "chats": chats}
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard(admin: str = Depends(verify_admin)):
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="ar" dir="rtl">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>لوحة تحكم Jothen Clinic</title>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e5ddd5; margin: 0; display: flex; height: 100vh; }
+            .sidebar { width: 350px; background: #ffffff; border-left: 1px solid #ddd; display: flex; flex-direction: column; }
+            .sidebar-header { background: #f0f2f5; padding: 20px; font-weight: bold; font-size: 18px; border-bottom: 1px solid #ddd; }
+            .patient-list { overflow-y: auto; flex-grow: 1; }
+            .patient-card { padding: 15px; border-bottom: 1px solid #f2f2f2; cursor: pointer; display: flex; flex-direction: column; }
+            .patient-card:hover { background: #f5f6f6; }
+            .p-name { font-weight: bold; color: #111b21; font-size: 16px; margin-bottom: 5px; }
+            .p-phone { color: #667781; font-size: 13px; margin-bottom: 5px; direction: ltr; text-align: right; }
+            .p-prefs { color: #008069; font-size: 12px; }
+            
+            .chat-area { flex-grow: 1; display: flex; flex-direction: column; background: #efeae2; }
+            .chat-header { background: #f0f2f5; padding: 15px 20px; font-size: 18px; border-bottom: 1px solid #ddd; display: flex; align-items: center; }
+            .messages { flex-grow: 1; padding: 30px 50px; overflow-y: auto; display: flex; flex-direction: column; }
+            
+            .msg { max-width: 65%; padding: 10px 15px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; line-height: 1.5; position: relative; box-shadow: 0 1px 1px rgba(0,0,0,0.1); }
+            .msg.user { background: #ffffff; align-self: flex-start; border-top-right-radius: 0; }
+            .msg.model { background: #d9fdd3; align-self: flex-end; border-top-left-radius: 0; }
+            
+            .empty-state { margin: auto; text-align: center; color: #888; font-size: 18px; }
+        </style>
+    </head>
+    <body>
+        <div class="sidebar">
+            <div class="sidebar-header">ملفات المرضى 📁</div>
+            <div class="patient-list" id="patient-list">
+                <div style="padding: 20px; text-align: center; color: #888;">جاري تحميل البيانات...</div>
+            </div>
+        </div>
+        
+        <div class="chat-area">
+            <div class="chat-header" id="chat-header">
+                <strong style="color: #54656f;">اختر مريضاً من القائمة الجانبية لعرض المحادثة</strong>
+            </div>
+            <div class="messages" id="messages">
+                <div class="empty-state">المحادثات الحية ستظهر هنا...</div>
+            </div>
+        </div>
+
+        <script>
+            let allChats = [];
+            let currentPhone = null;
+            let autoScroll = true;
+
+            const messagesDiv = document.getElementById('messages');
+            
+            // Detect if user scrolls up to stop auto-scrolling
+            messagesDiv.addEventListener('scroll', () => {
+                const isAtBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + 50;
+                autoScroll = isAtBottom;
+            });
+
+            async function loadData() {
+                try {
+                    const res = await fetch('/admin/api/data');
+                    const data = await res.json();
+                    allChats = data.chats;
+                    
+                    const pList = document.getElementById('patient-list');
+                    pList.innerHTML = '';
+                    
+                    if (data.patients.length === 0) {
+                        pList.innerHTML = '<div style="padding: 20px; text-align: center; color: #888;">لا يوجد مرضى مسجلين بعد.</div>';
+                    }
+
+                    data.patients.forEach(p => {
+                        const div = document.createElement('div');
+                        div.className = 'patient-card';
+                        
+                        const name = p.name || 'مريض غير معروف';
+                        const prefs = p.preferences ? p.preferences.replace(/ \| /g, ' • ') : 'لا توجد ملاحظات مسجلة';
+                        
+                        div.innerHTML = `
+                            <div class="p-name">${name}</div>
+                            <div class="p-phone">${p.phone_number}</div>
+                            <div class="p-prefs">${prefs}</div>
+                        `;
+                        div.onclick = () => showChat(p.phone_number, name);
+                        
+                        // Highlight active chat
+                        if (currentPhone === p.phone_number) {
+                            div.style.background = '#ebebeb';
+                        }
+                        
+                        pList.appendChild(div);
+                    });
+                    
+                    // Refresh active chat window if one is open
+                    if (currentPhone) {
+                        renderActiveChat();
+                    }
+                } catch (err) {
+                    console.error("Failed to load dashboard data", err);
+                }
+            }
+
+            function showChat(phone, name) {
+                currentPhone = phone;
+                document.getElementById('chat-header').innerHTML = `<strong>${name}</strong>&nbsp; &nbsp; <span style="font-size: 14px; color: #667781;" dir="ltr">${phone}</span>`;
+                autoScroll = true; // Force scroll to bottom on new selection
+                renderActiveChat();
+            }
+            
+            function renderActiveChat() {
+                if (!currentPhone) return;
+                
+                messagesDiv.innerHTML = '';
+                const patientChats = allChats.filter(c => c.phone_number === currentPhone);
+                
+                if (patientChats.length === 0) {
+                    messagesDiv.innerHTML = '<div class="empty-state">لا توجد رسائل سابقة.</div>';
+                    return;
+                }
+
+                patientChats.forEach(c => {
+                    const div = document.createElement('div');
+                    div.className = `msg ${c.role}`;
+                    // Convert line breaks to HTML breaks
+                    div.innerHTML = c.content.replace(/\\n/g, '<br>');
+                    messagesDiv.appendChild(div);
+                });
+                
+                if (autoScroll) {
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                }
+            }
+
+            // Fetch immediately, then every 5 seconds
+            loadData();
+            setInterval(loadData, 5000);
+        </script>
+    </body>
+    </html>
+    """
+    return html_content
 
 # ---------------------------------------------------------
 # WEBHOOK ENDPOINTS
