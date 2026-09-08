@@ -286,7 +286,7 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         past_contents = load_chat_history(sender_phone, limit=10)
 
         chat = client.chats.create(
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             history=past_contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
