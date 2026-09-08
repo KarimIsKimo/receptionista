@@ -164,21 +164,6 @@ def book_appointment(patient_name: str, phone_number: str, date: str, time: str,
         return f"خطأ في الاتصال بنظام الحجز: {e}"
     return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {time} لمنطقة {area}."
 
-def send_offer_flyer(category: str) -> str:
-    """
-    Call this tool whenever the patient asks for:
-    - 'branches': Locations, branches, or addresses.
-    - 'machines': Types of laser devices, technologies, cooling systems.
-    - 'men_offers': Laser pricing and packages for men.
-    - 'women_areas': Pricing for individual areas for women (underarm, bikini, face, legs, etc.).
-    - 'women_packages': Full body packages or special offers for women.
-    """
-    category = category.lower().strip()
-    if category in OFFER_IMAGES:
-        data = OFFER_IMAGES[category]
-        return f"ATTACH_IMAGE::{data['url']}::{data['caption']}"
-    return f"ATTACH_IMAGE::{OFFER_IMAGES['women_packages']['url']}::{OFFER_IMAGES['women_packages']['caption']}"
-
 # ---------------------------------------------------------
 # WEBHOOK ENDPOINTS
 # ---------------------------------------------------------
@@ -257,6 +242,11 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         clinic_knowledge = load_clinic_rules()
         today_date = datetime.datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y-%m-%d")
 
+        # 1. Build the image catalog text dynamically for the prompt
+        image_instructions = ""
+        for key, data in OFFER_IMAGES.items():
+            image_instructions += f"- للسؤال عن ({key}): اطبعي هذا السطر بالضبط في بداية ردك:\nATTACH_IMAGE::{data['url']}::{data['caption']}\n"
+
         system_instruction = f"""
         أنتِ موظفة استقبال ذكية ومساعدة افتراضية لعيادة Jothen Clinic للتجميل والليزر.
         تاريخ اليوم: {today_date} بتوقيت القاهرة.
@@ -265,22 +255,21 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         معلومات العيادة:
         {clinic_knowledge}
 
-        تعليمات إرسال الصور والفلايرات:
-        لديكِ أداة (send_offer_flyer) لإرسال الصور التوضيحية عند السؤال:
-        - إذا سأل العميل عن الفروع أو العناوين: استخدمي 'branches'.
-        - إذا سأل عن نوع الجهاز أو التبريد أو الأجهزة المتوفرة: استخدمي 'machines'.
-        - إذا كان العميل رجلاً أو يسأل عن ليزر الرجال: استخدمي 'men_offers'.
-        - إذا سألت المريضة عن أسعار مناطق محددة (بيكيني، وجه، أندر آرم، إلخ): استخدمي 'women_areas'.
-        - إذا سألت المريضة عن باقات كاملة، عروض الصيف، أو الجسم كامل: استخدمي 'women_packages'.
+        تعليمات إرسال الصور (هام جداً):
+        لإرسال صورة للمريضة، **يجب** أن تطبعي الكود الخاص بها في السطر الأول من رسالتك.
+        الأكواد المتاحة:
+        {image_instructions}
 
-        بعد استدعاء أداة الصورة، اكتبي رداً لطيفاً ومختصراً يرحب بالعميل ويجيب على سؤاله بناءً على محتوى العرض.
+        مثال للرد الصحيح:
+        ATTACH_IMAGE::{BASE_URL}/images/women_packages.jpg::باقات الليزر
+        أهلاً بك يا فندم، هذه هي أفضل باقات وعروض الليزر المتوفرة لدينا...
 
         تعليمات الحجز:
         - جلسة الجسم الكامل: 45 دقيقة.
         - نصف الجسم: 30 دقيقة.
         - المناطق الصغيرة: 15 دقيقة.
         - افحصي الحجوزات بأداة check_schedule قبل اقتراح أي موعد.
-        - لا تؤكدي الحجز بأداة book_appointment إلا بعد الموافقة الصريحة للمريضة على الاسم، التاريخ، الساعة، والمنطقة.
+        - لا تؤكدي الحجز بأداة book_appointment إلا بعد الموافقة الصريحة للمريضة.
         """
 
         past_contents = load_chat_history(sender_phone, limit=10)
@@ -291,22 +280,30 @@ def generate_ai_reply(sender_phone: str, user_message: str):
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
-                tools=[check_schedule, book_appointment, send_offer_flyer],
+                tools=[check_schedule, book_appointment], 
             )
         )
 
         response = chat.send_message(user_message)
         response_text = response.text or ""
+        print(f"🤖 AI RAW TEXT: {response_text}")
 
+        # 3. Smarter text parsing to extract the image
         attached_image = None
         if "ATTACH_IMAGE::" in response_text:
-            parts = response_text.split("ATTACH_IMAGE::")
-            response_text = parts[0].strip()
-            image_meta = parts[1].split("::")
+            parts = response_text.split("ATTACH_IMAGE::", 1)
+            
+            # Split the hidden code line from the rest of the natural conversation
+            meta_and_text = parts[1].split("\n", 1)
+            
+            image_meta = meta_and_text[0].split("::")
             attached_image = {
                 "url": image_meta[0].strip(),
                 "caption": image_meta[1].strip() if len(image_meta) > 1 else ""
             }
+            
+            # Keep only the human-friendly text to send via WhatsApp
+            response_text = meta_and_text[1].strip() if len(meta_and_text) > 1 else "إليك التفاصيل:"
 
         return response_text, attached_image
 
