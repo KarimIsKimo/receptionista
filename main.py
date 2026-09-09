@@ -455,9 +455,7 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                     sender_phone = incoming_msg.get("from", "").strip()
                     user_text = incoming_msg.get("text", {}).get("body", "").strip()
 
-                    # ---------------------------------------------------------
-                    # BLACKLIST CHECK: Ignore blocked phone numbers completely
-                    # ---------------------------------------------------------
+                    # BLACKLIST CHECK
                     if sender_phone in BLOCKED_NUMBERS or sender_phone.endswith("1142286600"):
                         print(f"🚫 Ignored blocked number: {sender_phone}")
                         return Response(content="BLOCKED_NUMBER_IGNORED", status_code=200)
@@ -476,17 +474,18 @@ async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number
     # 1. Save inbound patient message to Supabase
     save_chat_turn(sender_phone, "user", user_text)
 
-    # 2. Generate response with conversation history and patient profile
-    ai_response, attached_image = generate_ai_reply(sender_phone, user_text)
+    # 2. Generate response with conversation history, patient profile, and extract requested media
+    ai_response, attached_images = generate_ai_reply(sender_phone, user_text)
 
-    # 3. Send offer flyer image if requested
-    if attached_image:
-        await send_whatsapp_image(
-            recipient_phone=sender_phone,
-            image_url=attached_image["url"],
-            caption=attached_image["caption"],
-            phone_number_id=phone_number_id
-        )
+    # 3. Send offer flyer images if requested (Handles 1 or Multiple)
+    if attached_images:
+        for img in attached_images:
+            await send_whatsapp_image(
+                recipient_phone=sender_phone,
+                image_url=img["url"],
+                caption=img["caption"],
+                phone_number_id=phone_number_id
+            )
 
     # 4. Send text response and save to Supabase
     if ai_response:
@@ -503,10 +502,28 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         known_name = profile["name"] or "غير معروف بعد"
         known_preferences = profile["preferences"] or "لا توجد تفضيلات مسجلة بعد"
 
-        # Build image catalog instructions
-        image_instructions = ""
-        for key, data in OFFER_IMAGES.items():
-            image_instructions += f"- للسؤال عن ({key}): اطبعي هذا السطر بالضبط في بداية ردك:\nATTACH_IMAGE::{data['url']}::{data['caption']}\n"
+        # This local list will capture whichever images the AI decides to send during this interaction
+        queued_images = []
+
+        def send_clinic_media(media_types: list[str]) -> str:
+            """
+            Sends one or more clinic flyer images to the patient over WhatsApp.
+            Allowed values in the list:
+            - 'branches': فروع وأماكن العيادة
+            - 'machines': أجهزة الليزر
+            - 'men_offers': عروض وباقات الرجال
+            - 'women_areas': أسعار المناطق المنفردة للسيدات
+            - 'women_packages': باقات وعروض السيدات الكاملة
+            """
+            valid = []
+            for m in media_types:
+                if m in OFFER_IMAGES:
+                    queued_images.append(OFFER_IMAGES[m])
+                    valid.append(m)
+            
+            if valid:
+                return f"Images queued successfully: {', '.join(valid)}. Inform the patient that you just sent them."
+            return "Error: Unknown media types requested."
 
         system_instruction = f"""
         أنتِ موظفة استقبال ذكية ومساعدة افتراضية لعيادة Jothen Clinic للتجميل والليزر.
@@ -531,8 +548,9 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         {clinic_knowledge}
 
         تعليمات إرسال الصور (هام جداً):
-        لإرسال صورة للعميل، **يجب** أن تطبعي الكود الخاص بها في السطر الأول من رسالتك:
-        {image_instructions}
+        - لا تقومي أبداً بطباعة روابط أو أسماء ملفات في نص رسالتك.
+        - إذا طلب العميل رؤية الأسعار، الباقات، الأجهزة، أو الفروع، يجب عليكِ استدعاء أداة `send_clinic_media` وتمرير قائمة بأنواع الصور المطلوبة (مثلاً: ['machines'] أو ['women_packages', 'machines']).
+        - بعد استدعاء الأداة، أخبري العميل بلباقة أنك قمتِ بإرسال الصور المطلوبة.
 
         تعليمات الحجز:
         - جلسة الجسم الكامل: 45 دقيقة.
@@ -557,7 +575,7 @@ def generate_ai_reply(sender_phone: str, user_message: str):
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
-                tools=[check_schedule, book_appointment, update_patient_file], 
+                tools=[check_schedule, book_appointment, update_patient_file, send_clinic_media], 
             )
         )
 
@@ -565,23 +583,11 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         response_text = response.text or ""
         print(f"🤖 AI RAW TEXT: {response_text}")
 
-        # Extract image if present
-        attached_image = None
-        if "ATTACH_IMAGE::" in response_text:
-            parts = response_text.split("ATTACH_IMAGE::", 1)
-            meta_and_text = parts[1].split("\n", 1)
-            image_meta = meta_and_text[0].split("::")
-            attached_image = {
-                "url": image_meta[0].strip(),
-                "caption": image_meta[1].strip() if len(image_meta) > 1 else ""
-            }
-            response_text = meta_and_text[1].strip() if len(meta_and_text) > 1 else "إليك التفاصيل:"
-
-        return response_text, attached_image
+        return response_text, queued_images
 
     except Exception as e:
         print(f"Gemini API Error: {e}")
-        return "أهلاً بحضرتك يا فندم! شكراً لتواصلك مع العيادة، سيقوم أحد مسؤولي الاستقبال بالرد عليكي في أقرب وقت.", None
+        return "أهلاً بحضرتك يا فندم! شكراً لتواصلك مع العيادة، سيقوم أحد مسؤولي الاستقبال بالرد عليكي في أقرب وقت.", []
 
 # ---------------------------------------------------------
 # OUTBOUND MESSAGING
