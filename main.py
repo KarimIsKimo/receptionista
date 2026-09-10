@@ -96,10 +96,17 @@ def save_chat_turn(phone_number: str, role: str, content: str):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    "INSERT INTO chat_history (phone_number, role, content) VALUES (%s, %s, %s)",
-                    (phone_number, role, content)
-                )
+                try:
+                    cursor.execute(
+                        "INSERT INTO chat_history (phone_number, role, content, created_at) VALUES (%s, %s, %s, NOW())",
+                        (phone_number, role, content)
+                    )
+                except Exception:
+                    conn.rollback()
+                    cursor.execute(
+                        "INSERT INTO chat_history (phone_number, role, content) VALUES (%s, %s, %s)",
+                        (phone_number, role, content)
+                    )
                 conn.commit()
     except Exception as e:
         print(f"DB Save Chat Error: {e}")
@@ -259,11 +266,45 @@ def get_admin_data(admin: str = Depends(verify_admin)):
     try:
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute("SELECT * FROM patients ORDER BY name")
-                patients = cursor.fetchall()
-                
-                cursor.execute("SELECT phone_number, role, content FROM chat_history ORDER BY id ASC")
-                chats = cursor.fetchall()
+                # Fetch all chat messages with timestamps
+                try:
+                    cursor.execute("""
+                        SELECT id, phone_number, role, content, 
+                               COALESCE(created_at, NOW()) AS created_at 
+                        FROM chat_history 
+                        ORDER BY id ASC
+                    """)
+                    chats = cursor.fetchall()
+                except Exception:
+                    conn.rollback()
+                    cursor.execute("SELECT id, phone_number, role, content FROM chat_history ORDER BY id ASC")
+                    chats = cursor.fetchall()
+
+                # Fetch patients ordered by the timestamp of their latest message
+                try:
+                    cursor.execute("""
+                        SELECT 
+                            active.phone_number, 
+                            COALESCE(p.name, '') AS name, 
+                            COALESCE(p.preferences, '') AS preferences,
+                            MAX(c.created_at) AS last_msg_time,
+                            MAX(c.id) AS last_msg_id
+                        FROM (
+                            SELECT DISTINCT phone_number FROM chat_history
+                            UNION
+                            SELECT phone_number FROM patients
+                        ) active
+                        LEFT JOIN patients p ON active.phone_number = p.phone_number
+                        LEFT JOIN chat_history c ON active.phone_number = c.phone_number
+                        GROUP BY active.phone_number, p.name, p.preferences
+                        ORDER BY last_msg_time DESC NULLS LAST, last_msg_id DESC NULLS LAST
+                    """)
+                    patients = cursor.fetchall()
+                except Exception:
+                    conn.rollback()
+                    cursor.execute("SELECT * FROM patients ORDER BY name")
+                    patients = cursor.fetchall()
+
     except Exception as e:
         print(f"Admin API DB Error: {e}")
         
@@ -279,30 +320,46 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>لوحة تحكم Jothen Clinic</title>
         <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e5ddd5; margin: 0; display: flex; height: 100vh; }
-            .sidebar { width: 350px; background: #ffffff; border-left: 1px solid #ddd; display: flex; flex-direction: column; }
-            .sidebar-header { background: #f0f2f5; padding: 20px; font-weight: bold; font-size: 18px; border-bottom: 1px solid #ddd; }
+            * { box-sizing: border-box; }
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e5ddd5; margin: 0; display: flex; height: 100vh; overflow: hidden; }
+            
+            .sidebar { width: 380px; min-width: 340px; background: #ffffff; border-left: 1px solid #d1d7db; display: flex; flex-direction: column; height: 100%; }
+            .sidebar-header { background: #f0f2f5; padding: 16px 20px; font-weight: bold; font-size: 17px; border-bottom: 1px solid #d1d7db; color: #111b21; }
             .patient-list { overflow-y: auto; flex-grow: 1; }
-            .patient-card { padding: 15px; border-bottom: 1px solid #f2f2f2; cursor: pointer; display: flex; flex-direction: column; }
+            
+            .patient-card { padding: 12px 16px; border-bottom: 1px solid #f0f2f5; cursor: pointer; display: flex; flex-direction: column; gap: 4px; transition: background 0.15s ease; }
             .patient-card:hover { background: #f5f6f6; }
-            .p-name { font-weight: bold; color: #111b21; font-size: 16px; margin-bottom: 5px; }
-            .p-phone { color: #667781; font-size: 13px; margin-bottom: 5px; direction: ltr; text-align: right; }
-            .p-prefs { color: #008069; font-size: 12px; }
+            .patient-card.active { background: #ebebeb; }
             
-            .chat-area { flex-grow: 1; display: flex; flex-direction: column; background: #efeae2; }
-            .chat-header { background: #f0f2f5; padding: 15px 20px; font-size: 18px; border-bottom: 1px solid #ddd; display: flex; align-items: center; }
-            .messages { flex-grow: 1; padding: 30px 50px; overflow-y: auto; display: flex; flex-direction: column; }
+            .p-header-row { display: flex; justify-content: space-between; align-items: baseline; }
+            .p-name { font-weight: 600; color: #111b21; font-size: 15px; }
+            .p-time { font-size: 11px; color: #667781; direction: ltr; }
             
-            .msg { max-width: 65%; padding: 10px 15px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; line-height: 1.5; position: relative; box-shadow: 0 1px 1px rgba(0,0,0,0.1); }
+            .p-last-msg { font-size: 13px; color: #667781; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 320px; }
+            .p-phone { color: #8696a0; font-size: 12px; direction: ltr; text-align: right; }
+            .p-prefs { color: #008069; font-size: 11px; line-height: 1.3; }
+            
+            .chat-area { flex-grow: 1; display: flex; flex-direction: column; background: #efeae2; height: 100%; }
+            .chat-header { background: #f0f2f5; padding: 12px 20px; font-size: 16px; border-bottom: 1px solid #d1d7db; display: flex; justify-content: space-between; align-items: center; min-height: 55px; }
+            .chat-header-info { display: flex; align-items: baseline; gap: 12px; }
+            .order-toggle-btn { background: #ffffff; border: 1px solid #d1d7db; border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer; color: #54656f; transition: all 0.2s; }
+            .order-toggle-btn:hover { background: #f0f2f5; color: #111b21; }
+            
+            .messages { flex-grow: 1; padding: 24px 36px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+            
+            .msg { max-width: 65%; padding: 8px 14px 6px 14px; border-radius: 8px; font-size: 14px; line-height: 1.45; position: relative; box-shadow: 0 1px 1px rgba(0,0,0,0.08); word-break: break-word; }
             .msg.user { background: #ffffff; align-self: flex-start; border-top-right-radius: 0; }
             .msg.model { background: #d9fdd3; align-self: flex-end; border-top-left-radius: 0; }
             
-            .empty-state { margin: auto; text-align: center; color: #888; font-size: 18px; }
+            .msg-text { margin-bottom: 3px; }
+            .msg-meta { font-size: 10.5px; color: #667781; text-align: left; direction: ltr; margin-top: 3px; }
+            
+            .empty-state { margin: auto; text-align: center; color: #8696a0; font-size: 16px; }
         </style>
     </head>
     <body>
         <div class="sidebar">
-            <div class="sidebar-header">ملفات المرضى 📁</div>
+            <div class="sidebar-header">المحادثات وملفات المرضى 📁</div>
             <div class="patient-list" id="patient-list">
                 <div style="padding: 20px; text-align: center; color: #888;">جاري تحميل البيانات...</div>
             </div>
@@ -310,7 +367,12 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
         
         <div class="chat-area">
             <div class="chat-header" id="chat-header">
-                <strong style="color: #54656f;">اختر مريضاً من القائمة الجانبية لعرض المحادثة</strong>
+                <div class="chat-header-info" id="chat-header-info">
+                    <strong style="color: #54656f;">اختر محادثة من القائمة لعرض الرسائل</strong>
+                </div>
+                <button class="order-toggle-btn" id="order-toggle-btn" onclick="toggleOrder()" style="display: none;">
+                    ⬇️ الأحدث بالأسفل
+                </button>
             </div>
             <div class="messages" id="messages">
                 <div class="empty-state">المحادثات الحية ستظهر هنا...</div>
@@ -319,53 +381,86 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
 
         <script>
             let allChats = [];
+            let allPatients = [];
             let currentPhone = null;
             let autoScroll = true;
+            let newestAtTop = false; // default standard WhatsApp view (newest at bottom)
 
             const messagesDiv = document.getElementById('messages');
             
-            // Detect if user scrolls up to stop auto-scrolling
             messagesDiv.addEventListener('scroll', () => {
-                const isAtBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + 50;
-                autoScroll = isAtBottom;
+                if (!newestAtTop) {
+                    const isAtBottom = messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + 60;
+                    autoScroll = isAtBottom;
+                }
             });
+
+            function formatTime(isoString) {
+                if (!isoString) return '';
+                const d = new Date(isoString);
+                if (isNaN(d.getTime())) return '';
+                
+                const now = new Date();
+                const isToday = d.toDateString() === now.toDateString();
+                
+                let hours = d.getHours();
+                const minutes = d.getMinutes().toString().padStart(2, '0');
+                const ampm = hours >= 12 ? 'م' : 'ص';
+                hours = hours % 12 || 12;
+                const timeStr = `${hours}:${minutes} ${ampm}`;
+                
+                if (isToday) return timeStr;
+                return `${d.getMonth() + 1}/${d.getDate()} ${timeStr}`;
+            }
+
+            function toggleOrder() {
+                newestAtTop = !newestAtTop;
+                const btn = document.getElementById('order-toggle-btn');
+                btn.innerHTML = newestAtTop ? '⬆️ الأحدث بالأعلى' : '⬇️ الأحدث بالأسفل';
+                renderActiveChat();
+            }
 
             async function loadData() {
                 try {
                     const res = await fetch('/admin/api/data');
                     const data = await res.json();
-                    allChats = data.chats;
+                    allChats = data.chats || [];
+                    allPatients = data.patients || [];
                     
                     const pList = document.getElementById('patient-list');
                     pList.innerHTML = '';
                     
-                    if (data.patients.length === 0) {
+                    if (allPatients.length === 0) {
                         pList.innerHTML = '<div style="padding: 20px; text-align: center; color: #888;">لا يوجد مرضى مسجلين بعد.</div>';
+                        return;
                     }
 
-                    data.patients.forEach(p => {
+                    allPatients.forEach(p => {
                         const div = document.createElement('div');
-                        div.className = 'patient-card';
+                        div.className = 'patient-card' + (currentPhone === p.phone_number ? ' active' : '');
                         
-                        const name = p.name || 'مريض غير معروف';
-                        const prefs = p.preferences ? p.preferences.replace(/ \| /g, ' • ') : 'لا توجد ملاحظات مسجلة';
+                        const name = p.name || 'مريض جديد';
+                        const timeText = formatTime(p.last_msg_time);
+                        
+                        // Find the latest message content for this specific patient
+                        const patientMsgs = allChats.filter(c => c.phone_number === p.phone_number);
+                        const lastMsg = patientMsgs.length > 0 ? patientMsgs[patientMsgs.length - 1].content : '';
+                        const lastMsgSnippet = lastMsg ? (lastMsg.length > 40 ? lastMsg.substring(0, 40) + '...' : lastMsg) : 'لا توجد رسائل سابقة';
+                        const prefs = p.preferences ? p.preferences.replace(/ \| /g, ' • ') : '';
                         
                         div.innerHTML = `
-                            <div class="p-name">${name}</div>
+                            <div class="p-header-row">
+                                <span class="p-name">${name}</span>
+                                <span class="p-time">${timeText}</span>
+                            </div>
+                            <div class="p-last-msg">${lastMsgSnippet}</div>
                             <div class="p-phone">${p.phone_number}</div>
-                            <div class="p-prefs">${prefs}</div>
+                            ${prefs ? `<div class="p-prefs">📌 ${prefs}</div>` : ''}
                         `;
                         div.onclick = () => showChat(p.phone_number, name);
-                        
-                        // Highlight active chat
-                        if (currentPhone === p.phone_number) {
-                            div.style.background = '#ebebeb';
-                        }
-                        
                         pList.appendChild(div);
                     });
                     
-                    // Refresh active chat window if one is open
                     if (currentPhone) {
                         renderActiveChat();
                     }
@@ -376,35 +471,64 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
 
             function showChat(phone, name) {
                 currentPhone = phone;
-                document.getElementById('chat-header').innerHTML = `<strong>${name}</strong>&nbsp; &nbsp; <span style="font-size: 14px; color: #667781;" dir="ltr">${phone}</span>`;
-                autoScroll = true; // Force scroll to bottom on new selection
+                document.getElementById('chat-header-info').innerHTML = `
+                    <strong>${name}</strong>
+                    <span style="font-size: 13px; color: #667781;" dir="ltr">${phone}</span>
+                `;
+                document.getElementById('order-toggle-btn').style.display = 'block';
+                autoScroll = true;
                 renderActiveChat();
+                
+                // Update active highlight in sidebar
+                const cards = document.querySelectorAll('.patient-card');
+                allPatients.forEach((p, idx) => {
+                    if (cards[idx]) {
+                        if (p.phone_number === phone) {
+                            cards[idx].classList.add('active');
+                        } else {
+                            cards[idx].classList.remove('active');
+                        }
+                    }
+                });
             }
             
             function renderActiveChat() {
                 if (!currentPhone) return;
                 
                 messagesDiv.innerHTML = '';
-                const patientChats = allChats.filter(c => c.phone_number === currentPhone);
+                let patientChats = allChats.filter(c => c.phone_number === currentPhone);
                 
                 if (patientChats.length === 0) {
-                    messagesDiv.innerHTML = '<div class="empty-state">لا توجد رسائل سابقة.</div>';
+                    messagesDiv.innerHTML = '<div class="empty-state">لا توجد رسائل مسجلة لهذا الرقم.</div>';
                     return;
+                }
+
+                if (newestAtTop) {
+                    patientChats = [...patientChats].reverse();
                 }
 
                 patientChats.forEach(c => {
                     const div = document.createElement('div');
                     div.className = `msg ${c.role}`;
-                    div.innerHTML = c.content.replace(/\\n/g, '<br>');
+                    
+                    const text = c.content.replace(/\\n/g, '<br>');
+                    const time = formatTime(c.created_at);
+                    
+                    div.innerHTML = `
+                        <div class="msg-text">${text}</div>
+                        ${time ? `<div class="msg-meta">${time}</div>` : ''}
+                    `;
                     messagesDiv.appendChild(div);
                 });
                 
-                if (autoScroll) {
+                if (!newestAtTop && autoScroll) {
                     messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                } else if (newestAtTop) {
+                    messagesDiv.scrollTop = 0;
                 }
             }
 
-            // Fetch immediately, then every 5 seconds
+            // Fetch on load and refresh every 5 seconds
             loadData();
             setInterval(loadData, 5000);
         </script>
@@ -451,9 +575,16 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 if is_duplicate_message(message_id):
                     return Response(content="DUPLICATE_IGNORED", status_code=200)
 
-                if incoming_msg.get("type") == "text":
+                msg_type = incoming_msg.get("type")
+                if msg_type in ["text", "image"]:
                     sender_phone = incoming_msg.get("from", "").strip()
-                    user_text = incoming_msg.get("text", {}).get("body", "").strip()
+                    
+                    if msg_type == "text":
+                        user_text = incoming_msg.get("text", {}).get("body", "").strip()
+                    elif msg_type == "image":
+                        user_text = incoming_msg.get("image", {}).get("caption", "").strip()
+                        if not user_text:
+                            user_text = "[قام المريض بإرسال صورة]"
 
                     # BLACKLIST CHECK
                     if sender_phone in BLOCKED_NUMBERS or sender_phone.endswith("1142286600"):
@@ -502,7 +633,7 @@ def generate_ai_reply(sender_phone: str, user_message: str):
         known_name = profile["name"] or "غير معروف بعد"
         known_preferences = profile["preferences"] or "لا توجد تفضيلات مسجلة بعد"
 
-        # This local list will capture whichever images the AI decides to send during this interaction
+        # Local list to capture media requests via tool call
         queued_images = []
 
         def send_clinic_media(media_types: list[str]) -> str:
