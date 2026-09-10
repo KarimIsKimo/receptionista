@@ -3,6 +3,7 @@ import traceback
 import httpx
 import datetime
 import secrets
+import asyncio
 from zoneinfo import ZoneInfo
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -49,6 +50,7 @@ OFFER_IMAGES = {
 }
 
 client = genai.Client()
+user_locks = {}
 
 # ---------------------------------------------------------
 # DB HELPERS
@@ -460,20 +462,24 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
     return Response(content="EVENT_RECEIVED", status_code=200)
 
 async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number_id: str):
-    save_chat_turn(sender_phone, "user", user_text)
+    if sender_phone not in user_locks:
+        user_locks[sender_phone] = asyncio.Lock()
     
-    profile = load_patient_profile(sender_phone)
-    if profile.get("is_paused"):
-        print(f"🛑 Chat with {sender_phone} is paused. Human takes over.")
-        return # Skip AI processing, human will answer on WhatsApp
+    async with user_locks[sender_phone]:
+        save_chat_turn(sender_phone, "user", user_text)
+        
+        profile = load_patient_profile(sender_phone)
+        if profile.get("is_paused"):
+            print(f"🛑 Chat with {sender_phone} is paused. Human takes over.")
+            return
 
-    ai_response, attached_images = generate_ai_reply(sender_phone, user_text, profile)
+        ai_response, attached_images = generate_ai_reply(sender_phone, user_text, profile)
 
-    if attached_images:
-        for img in attached_images: await send_whatsapp_image(sender_phone, img["url"], img["caption"], phone_number_id)
-    if ai_response:
-        await send_whatsapp_message(sender_phone, ai_response, phone_number_id)
-        save_chat_turn(sender_phone, "model", ai_response)
+        if attached_images:
+            for img in attached_images: await send_whatsapp_image(sender_phone, img["url"], img["caption"], phone_number_id)
+        if ai_response:
+            await send_whatsapp_message(sender_phone, ai_response, phone_number_id)
+            save_chat_turn(sender_phone, "model", ai_response)
 
 def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
     try:
