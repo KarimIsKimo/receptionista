@@ -582,7 +582,7 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
         """
 
         chat = client.chats.create(
-            model='gemini-2.5-flash',
+            model='gemini-3.6-flash',
             history=load_chat_history(sender_phone, limit=10),
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
