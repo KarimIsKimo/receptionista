@@ -531,7 +531,7 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
             history=load_chat_history(sender_phone, limit=10),
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                temperature=0.3,
+                temperature=0.2,
                 tools=[check_schedule, check_patient_appointments, cancel_appointment, book_appointment, update_patient_file, send_clinic_media], 
             )
         )
