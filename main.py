@@ -41,6 +41,9 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "jothen123")
 
 BLOCKED_NUMBERS = ["01142286600", "201142286600"]
 
+# ⚠️ CHANGE THIS to the Manager/Doctor's phone number to receive alerts (Format: CountryCode + Number)
+STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201022227818")
+
 OFFER_IMAGES = {
     "branches": {"url": f"{BASE_URL}/images/branches.jpg", "caption": "فروعنا وأماكن تواجدنا 📍"},
     "machines": {"url": f"{BASE_URL}/images/machines.jpg", "caption": "أحدث أجهزة إزالة الشعر بالليزر المتوفرة لدينا ⚡"},
@@ -132,24 +135,8 @@ def update_patient_file(phone_number: str, name: str, preferences: str) -> str:
         return f"حدث خطأ أثناء حفظ الملف: {e}"
 
 # ---------------------------------------------------------
-# GEMINI TOOLS (HANDOFF & APPOINTMENTS)
+# GEMINI TOOLS (APPOINTMENTS)
 # ---------------------------------------------------------
-def request_human_handoff(phone_number: str) -> str:
-    """Pauses the AI bot and transfers the conversation to human clinic staff. Call this immediately if the patient asks any question you do not know, asks for medical advice, requests other services (botox, filler, dermatology), or expresses frustration."""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    INSERT INTO patients (phone_number, is_paused)
-                    VALUES (%s, TRUE)
-                    ON CONFLICT (phone_number)
-                    DO UPDATE SET is_paused = TRUE
-                """, (phone_number,))
-                conn.commit()
-        return "تم إيقاف البوت بنجاح. أبلغي العميل بلباقة أن موظف الاستقبال البشري سيتابع معه للرد على سؤاله فوراً."
-    except Exception as e:
-        return f"فشل التحويل: {e}"
-
 def normalize_to_ampm(time_str: str) -> str:
     time_str = time_str.strip().upper()
     try:
@@ -494,7 +481,7 @@ async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number
         
         profile = load_patient_profile(sender_phone)
         if profile.get("is_paused"):
-            print(f"🛑 Chat with {sender_phone} is paused. Human takes over.")
+            print(f"🛑 Chat with {sender_phone} is manually paused by admin. Human takes over.")
             return
 
         ai_response, attached_images = generate_ai_reply(sender_phone, user_text, profile)
@@ -508,12 +495,34 @@ async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number
 def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
     try:
         queued_images = []
+        
         def send_clinic_media(media_types: list[str]) -> str:
             """Sends one or more clinic media cards: 'branches', 'machines', 'men_offers', 'women_areas', 'women_packages'."""
             valid = [m for m in media_types if m in OFFER_IMAGES]
             for m in valid: queued_images.append(OFFER_IMAGES[m])
             if valid: return f"Images queued: {', '.join(valid)}. Inform patient."
             return "Error: Unknown media."
+
+        def notify_staff(issue_summary: str) -> str:
+            """Sends an alert to clinic management regarding a patient's medical question, complaint, or unlisted price request, WITHOUT pausing the bot."""
+            try:
+                alert_body = f"🚨 *تنبيه استفسار يحتاج متابعة*\n\n📱 *رقم المريض:* {sender_phone}\n📝 *المشكلة:* {issue_summary}\n\n_البوت مستمر في الرد ولم يتوقف._"
+                with httpx.Client() as c:
+                    c.post(
+                        f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages",
+                        headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+                        json={
+                            "messaging_product": "whatsapp",
+                            "to": STAFF_NOTIFICATION_PHONE,
+                            "type": "text",
+                            "text": {"body": alert_body}
+                        },
+                        timeout=10.0
+                    )
+                return "تم الإرسال للإدارة بنجاح. أخبري المريض بلطف واستمري في المحادثة."
+            except Exception as e:
+                print(f"Failed to notify staff: {e}")
+                return "تم تسجيل الطلب."
 
         now_cairo = datetime.datetime.now(ZoneInfo("Africa/Cairo"))
         arabic_days = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
@@ -531,10 +540,11 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
         <hard_constraints>
         1. IF user asks about location -> REPLY EXACTLY: "عيادة 104، 8 ش الدكتور حسن الشريف، مدينة نصر" AND trigger send_clinic_media(['branches']). NEVER mention other locations.
         2. IF user asks for phone number -> NEVER ask. You already know it is {sender_phone}.
-        3. IF user asks about Medical Advice, Doctors, Botox, Filler, or Dermatology -> TRIGGER request_human_handoff(phone_number) IMMEDIATELY.
-        4. IF user asks for a price NOT listed in <knowledge_base> -> TRIGGER request_human_handoff(phone_number) IMMEDIATELY.
+        3. IF user asks about Medical Advice, Doctors, Botox, Filler, Dermatology, or has a complaint -> TRIGGER notify_staff(issue_summary) IMMEDIATELY. DO NOT stop talking. Politely tell the patient: "سجلت استفسار حضرتك وهخلّي الإدارة/الدكتورة تراجع تفاصيل سؤالك وترد عليك في أقرب وقت يا فندم 🌸. أقدر أساعدك في حجز ليزر؟" and CONTINUE the conversation.
+        4. IF user asks for a price NOT listed in <knowledge_base> -> TRIGGER notify_staff(issue_summary="استفسار عن سعر غير مسجل"). Tell them you are checking the latest pricing update with management and continue helping them.
         5. IF user asks to book on Friday -> REJECT. Friday is a holiday.
         6. IF user asks to book outside 12:00 PM to 10:00 PM -> REJECT. Request a valid time.
+        7. IF the user's message is ambiguous, confusing, or contains typos (e.g., "back 5") -> Politely ask the user to clarify what they mean.
         </hard_constraints>
 
         <knowledge_base>
@@ -583,7 +593,7 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
                     book_appointment,
                     update_patient_file,
                     send_clinic_media,
-                    request_human_handoff
+                    notify_staff
                 ],
             )
         )
