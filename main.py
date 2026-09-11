@@ -42,7 +42,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "jothen123")
 BLOCKED_NUMBERS = ["01142286600", "201142286600"]
 
 # ⚠️ CHANGE THIS to the Manager/Doctor's phone number to receive alerts (Format: CountryCode + Number)
-STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201022227818")
+STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201026438897")
 
 OFFER_IMAGES = {
     "branches": {"url": f"{BASE_URL}/images/branches.jpg", "caption": "فروعنا وأماكن تواجدنا 📍"},
@@ -540,14 +540,25 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
         <hard_constraints>
         1. IF user asks about location -> REPLY EXACTLY: "عيادة 104، 8 ش الدكتور حسن الشريف، مدينة نصر" AND trigger send_clinic_media(['branches']). NEVER mention other locations.
         2. IF user asks for phone number -> NEVER ask. You already know it is {sender_phone}.
-        3. IF user asks about Medical Advice, Doctors, Botox, Filler, Dermatology, or has a complaint -> TRIGGER notify_staff(issue_summary) IMMEDIATELY. DO NOT stop talking. Politely tell the patient: "سجلت استفسار حضرتك وهخلّي الإدارة/الدكتورة تراجع تفاصيل سؤالك وترد عليك في أقرب وقت يا فندم 🌸. أقدر أساعدك في حجز ليزر؟" and CONTINUE the conversation.
-        4. IF user asks for a price NOT listed in <knowledge_base> -> TRIGGER notify_staff(issue_summary="استفسار عن سعر غير مسجل"). Tell them you are checking the latest pricing update with management and continue helping them.
-        5. IF user asks to book on Friday -> REJECT. Friday is a holiday.
-        6. IF user asks to book outside 12:00 PM to 10:00 PM -> REJECT. Request a valid time.
-        7. IF the user's message is ambiguous, confusing, or contains typos (e.g., "back 5") -> Politely ask the user to clarify what they mean.
+        3. IF user asks routine laser prep or general FAQ questions (e.g., shaving/شيفنج, numbing cream, sun exposure, number of sessions, gaps between sessions, post-care creams, pain) -> ANSWER directly using <laser_faqs_and_prep>.
+        4. IF user asks complex Medical Advice (burns, pregnancy, specific medications), Doctors, Botox, Filler, Dermatology, or has a complaint -> TRIGGER notify_staff(issue_summary) IMMEDIATELY. DO NOT stop talking. Politely tell the patient: "سجلت استفسار حضرتك وهخلّي الإدارة/الدكتورة تراجع تفاصيل سؤالك وترد عليك في أقرب وقت يا فندم 🌸. أقدر أساعدك في حجز ليزر؟" and CONTINUE the conversation.
+        5. IF user asks for a price NOT listed in <knowledge_base> -> TRIGGER notify_staff(issue_summary="استفسار عن سعر غير مسجل"). Tell them you are checking the latest pricing update with management and continue helping them.
+        6. IF user asks to book on Friday -> REJECT. Friday is a holiday.
+        7. IF user asks to book outside 12:00 PM to 10:00 PM -> REJECT. Request a valid time.
+        8. IF the user's message is ambiguous, confusing, or contains typos (e.g., "back 5") -> Politely ask the user to clarify what they mean.
         </hard_constraints>
 
         <knowledge_base>
+        <laser_faqs_and_prep>
+        - الشيفنج (Shaving): نعم يا فندم، لازم يتم إزالة الشعر بالشفرة (الشيفنج) في نفس يوم الجلسة أو قبلها بيوم، وممنوع تماماً استخدام السويت أو الشمع أو الفتلة.
+        - المخدر (Numbing Cream): متاح استخدام كريم مخدر قبل الجلسة بنصف أو ساعة للمناطق الحساسة.
+        - الشمس (Sun Exposure): يفضل عدم التعرض المباشر للشمس أو عمل تان (Tan) قبل وبعد الجلسة بأسبوعين.
+        - عدد الجلسات (Number of Sessions): في المتوسط بنحتاج من 6 لـ 8 جلسات، لكن العدد النهائي بيختلف من شخص للتاني حسب طبيعة الجسم وسمك الشعر.
+        - الفرق بين الجلسات (Time Between Sessions): الجلسات بتكون كل 3 لـ 4 أسابيع للوجه، وكل 4 لـ 6 أسابيع لباقي مناطق الجسم.
+        - العناية بعد الجلسة (Post-Care): بننصح باستخدام كريم مرطب طبي ومضاد حيوي بعد الجلسة مباشرة لتجنب أي التهاب، وممنوع تماماً استخدام أي عطور، مزيلات عرق، أو مقشرات على المنطقة لمدة 48 ساعة.
+        - الألم والتبريد (Pain / Cooling): أجهزتنا مزودة بأقوى نظام تبريد مزدوج بيخلي الجلسة مريحة جداً وبدون ألم، مجرد لسعة خفيفة جداً ومحتملة.
+        </laser_faqs_and_prep>
+
         <prices_women>
         - باقات النبضات: 1000 نبضة (800ج)، 2000 نبضة (1500ج)، 3000 نبضة (2000ج)، 5000 نبضة (3000ج)، 7000 نبضة (3500ج)، 10000 نبضة (5000ج).
         - عرض: 4 جلسات أندر آرم أو بيكيني بخصم 10%.
