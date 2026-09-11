@@ -24,7 +24,7 @@ app.mount("/images", StaticFiles(directory="images"), name="images")
 
 @app.get("/")
 def home():
-    return {"status": "Clinic AI Receptionist v2.0 - Human Handoff Active!"}
+    return {"status": "Jothen Clinic Nasr City AI Receptionist - Active"}
 
 # ---------------------------------------------------------
 # CONFIGURATION
@@ -132,8 +132,24 @@ def update_patient_file(phone_number: str, name: str, preferences: str) -> str:
         return f"حدث خطأ أثناء حفظ الملف: {e}"
 
 # ---------------------------------------------------------
-# GEMINI TOOLS (APPOINTMENTS)
+# GEMINI TOOLS (HANDOFF & APPOINTMENTS)
 # ---------------------------------------------------------
+def request_human_handoff(phone_number: str) -> str:
+    """Pauses the AI bot and transfers the conversation to human clinic staff. Call this immediately if the patient asks any question you do not know, asks for medical advice, requests other services (botox, filler, dermatology), or expresses frustration."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO patients (phone_number, is_paused)
+                    VALUES (%s, TRUE)
+                    ON CONFLICT (phone_number)
+                    DO UPDATE SET is_paused = TRUE
+                """, (phone_number,))
+                conn.commit()
+        return "تم إيقاف البوت بنجاح. أبلغي العميل بلباقة أن موظف الاستقبال البشري سيتابع معه للرد على سؤاله فوراً."
+    except Exception as e:
+        return f"فشل التحويل: {e}"
+
 def normalize_to_ampm(time_str: str) -> str:
     time_str = time_str.strip().upper()
     try:
@@ -153,7 +169,7 @@ def check_schedule(date: str) -> str:
             res = http_client.get(f"{GOOGLE_SHEET_URL}?date={date}", timeout=15.0).json()
             if "booked" in res and not res["booked"]: return f"يوم {date} متاح بالكامل."
             if "booked" in res: return f"المواعيد المحجوزة مسبقاً يوم {date} هي: {', '.join(res['booked'])}"
-            return "حدث خطأ."
+            return "حدث خطأ في قراءة الجدول."
     except Exception: return "لا يمكن قراءة الجدول الآن."
 
 def check_patient_appointments(phone_number: str) -> str:
@@ -176,14 +192,23 @@ def cancel_appointment(phone_number: str, date: str) -> str:
     except Exception: return "فشل الاتصال بنظام الإلغاء."
 
 def book_appointment(patient_name: str, phone_number: str, date: str, time: str, area: str) -> str:
-    """Saves a clinic appointment."""
+    """Saves a clinic appointment for the Nasr City branch."""
     standard_time = normalize_to_ampm(time)
     try:
         with httpx.Client(follow_redirects=True) as http_client:
-            res = http_client.post(GOOGLE_SHEET_URL, json={"action": "book", "patient_name": patient_name, "phone_number": phone_number, "date": date, "time": standard_time, "area": area}, timeout=15.0).json()
+            payload = {
+                "action": "book",
+                "patient_name": patient_name,
+                "phone_number": phone_number,
+                "branch": "مدينة نصر",
+                "date": date,
+                "time": standard_time,
+                "area": area
+            }
+            res = http_client.post(GOOGLE_SHEET_URL, json=payload, timeout=15.0).json()
             if res.get("status") == "error": return f"فشل الحجز: {res.get('message')}"
     except Exception as e: return f"خطأ في الاتصال بنظام الحجز: {e}"
-    return f"تم تسجيل الحجز بنجاح باسم {patient_name} يوم {date} الساعة {standard_time} لمنطقة {area}."
+    return f"تم تسجيل الحجز بنجاح باسم {patient_name} بفرع مدينة نصر يوم {date} الساعة {standard_time} لمنطقة {area}."
 
 # ---------------------------------------------------------
 # ADMIN DASHBOARD API
@@ -252,7 +277,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>لوحة تحكم Jothen Clinic</title>
+        <title>لوحة تحكم عيادة جوثن - مدينة نصر</title>
         <style>
             * { box-sizing: border-box; }
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e5ddd5; margin: 0; display: flex; height: 100vh; overflow: hidden; }
@@ -443,8 +468,6 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         if entries:
             value = entries[0].get("changes", [{}])[0].get("value", {})
             target_phone_id = value.get("metadata", {}).get("phone_number_id", PHONE_NUMBER_ID)
-            if target_phone_id == "979476801911389" and os.getenv("ENABLE_REAL_CLINIC", "true").lower() != "true":
-                return Response(content="REAL_NUMBER_PAUSED", status_code=200)
 
             messages = value.get("messages", [])
             if messages:
@@ -458,7 +481,8 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                     if sender_phone in BLOCKED_NUMBERS or sender_phone.endswith("1142286600"): return Response(content="BLOCKED", status_code=200)
                     
                     background_tasks.add_task(handle_ai_conversation, sender_phone, user_text, target_phone_id)
-    except Exception as e: print(e)
+    except Exception as e: 
+        print(f"Webhook error: {e}")
     return Response(content="EVENT_RECEIVED", status_code=200)
 
 async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number_id: str):
@@ -485,6 +509,7 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
     try:
         queued_images = []
         def send_clinic_media(media_types: list[str]) -> str:
+            """Sends one or more clinic media cards: 'branches', 'machines', 'men_offers', 'women_areas', 'women_packages'."""
             valid = [m for m in media_types if m in OFFER_IMAGES]
             for m in valid: queued_images.append(OFFER_IMAGES[m])
             if valid: return f"Images queued: {', '.join(valid)}. Inform patient."
@@ -496,55 +521,104 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
         today_date = f"{now_cairo.strftime('%Y-%m-%d')} (اليوم هو: {today_day_name})"
 
         system_instruction = f"""
-        أنتِ موظفة استقبال ذكية ومحترفة ولطيفة جداً بعيادة Jothen Clinic للتجميل. اسمك "نور".
-        تاريخ اليوم: {today_date} بتوقيت القاهرة.
-        العميل: {profile['name'] or 'عميل جديد'} | الملاحظات: {profile['preferences'] or 'لا يوجد'}
-        رقم هاتف العميل الحالي: {sender_phone}
+        أنتِ موظفة استقبال ذكية ومحترفة ولطيفة جداً بعيادات "جوثن" (Jothen Clinics) - فرع مدينة نصر حصراً. اسمك "نور".
 
-        طريقة الكلام (هام جداً):
-        - تحدثي بأسلوب مصري راقي، استخدمي كلمات مثل: "يا فندم"، "تحت أمرك"، "من عيني"، "أهلاً بحضرتك".
-        - كوني دافئة ومرحبة، ولا تبدي كإنسان آلي. استخدمي إيموجيز لطيفة (🌸، ✨، 💖).
+        === ⏰ معلومات التوقيت والعميل ===
+        - تاريخ اليوم: {today_date} بتوقيت القاهرة.
+        - العميل: {profile['name'] or 'عميل جديد'} | الملاحظات: {profile['preferences'] or 'لا يوجد'}
+        - رقم هاتف العميل الحالي: {sender_phone}
 
-        مواعيد العمل (قواعد صارمة جداً):
-        - أيام العمل من السبت إلى الخميس.
-        - يوم الجمعة أجازة رسمية والعيادة مغلقة. يمنع منعاً باتاً حجز أي موعد يوم الجمعة!
-        - إذا طلب العميل الحجز يوم الجمعة (أو قال "بكرة" وكان بكرة الجمعة)، اعتذري بلباقة شديدة واشرحي أن الجمعة أجازة واقترحي السبت أو الخميس.
+        === 📍 الفرع والعنوان (قاعدة صارمة - لا يوجد فروع أخرى لهذا البوت) ===
+        - هذا الرقم مخصص **فقط** لفرع مدينة نصر.
+        - عنوان العيادة الحصري والوحيد: **عيادة 104، 8 ش الدكتور حسن الشريف، مدينة نصر**.
+        - هاتف الفرع: 01022227818.
+        - يمنع منعاً باتاً ذكر أو تخمين أي عنوان أو شارع آخر (مثل سيتي ستارز أو غيره). هذا هو العنوان الحقيقي الوحيد.
+        - لا تسألي العميل أبداً عن الفرع الذي يريده؛ لأن جميع الحجوزات هنا تسجل تلقائياً بفرع مدينة نصر.
 
-        تعليمات الحجز (قواعد صارمة):
-        - يمنع منعاً باتاً سؤال العميل عن رقم هاتفه. أنتِ تعرفين رقمه بالفعل ({sender_phone}).
-        - عند استخدام أداة book_appointment، استخدمي دائماً الرقم {sender_phone} تلقائياً ولا تطلبي من العميل تأكيده.
-        - جلسة الجسم 45 دقيقة، نصف الجسم 30، المناطق الصغيرة 15. تأكدي بأداة `check_schedule` قبل تأكيد الحجز.
-        - لا تحجزي موعدين متعارضين. المواعيد بصيغة AM/PM.
-        - احفظي تفضيلات العميل بأداة `update_patient_file`.
+        === 📅 مواعيد العمل ===
+        - من السبت إلى الخميس: من الساعة 12:00 ظهراً حتى 10:00 مساءً.
+        - يوم الجمعة: إجازة رسمية، العيادة مغلقة تماماً ويمنع حجز أي موعد فيه.
 
-        تعديل أو إلغاء المواعيد (Rescheduling & Canceling):
-        - إذا طلب العميل تعديل أو إلغاء موعده، **أولاً** استخدمي أداة `check_patient_appointments` لتعرفي متى كان موعده بالضبط.
-        - إذا أراد الإلغاء تماماً، استخدمي أداة `cancel_appointment` مع تمرير رقمه ({sender_phone}).
-        - إذا أراد تغيير الموعد (تأجيل/تقديم)، استخدمي أداة `cancel_appointment` لإلغاء الموعد القديم، ثم `check_schedule` للتأكد من الموعد الجديد، ثم `book_appointment` لحجز الجديد.
+        === 💰 قائمة الأسعار الرسمية (Knowledge Base) ===
+        جاوبي على استفسارات الأسعار بدقة وباختصار من هذه القائمة فقط:
+        - باقات ليزر السيدات (استدعي أداة send_clinic_media بخيار 'women_packages'):
+          1000 نبضة: 800 ج | 2000 نبضة: 1500 ج | 3000 نبضة: 2000 ج | 5000 نبضة: 3000 ج | 7000 نبضة: 3500 ج | 10000 نبضة: 5000 ج
+        
+        - مناطق السيدات (استدعي أداة send_clinic_media بخيار 'women_areas'):
+          عرض خاص: 4 جلسات أندر آرم أو بيكيني بخصم 10%.
+          أندر آرم: 150 ج | بيكيني + لاين: 300 ج | بيكيني + أندر آرم + لاين: 350 ج
+          شنب: 100 ج | وجه: 250 ج | وجه + ذقن: 350 ج | وجه + رقبة: 450 ج
+          جسم كامل: 2500 ج | جسم كامل (بدون بطن وظهر): 2000 ج | نصف جسم: 1250 ج
+          نصف ذراع: 600 ج | ذراع كامل: 800 ج | نصف رجل سفلية: 800 ج | نصف رجل علوية: 1000 ج | رجل كاملة: 1500 ج
+        
+        - عروض الرجال (استدعي أداة send_clinic_media بخيار 'men_offers'):
+          تحديد ذقن: 300 ج | ذقن ورقبة: 500 ج | ذقن ورقبة وفك: 750 ج | وجه كامل: 500 ج | وجه ورقبة: 750 ج | أذن: 250 ج
+          أندر آرم: 400 ج | بوكسر: 500 ج | بوكسر ولاين: 650 ج | بوكسر وأندر آرم: 750 ج | بوكسر وأندر آرم وذقن: 1000 ج
+          عصعص: 750 ج | كتف أو صدر أو ظهر: 1000 ج | جسم كامل: 4000 ج (مخفض من 5000)
+        
+        - أجهزة الليزر والتبريد (استدعي أداة send_clinic_media بخيار 'machines'): أحدث أجهزة الليزر والتبريد المزدوج لراحة تامة بدون ألم.
 
-        إرسال الصور:
-        - استخدمي أداة `send_clinic_media` بقائمة الصور المطلوبة: ['machines', 'women_packages', 'women_areas', 'men_offers', 'branches']. لا تكتبي الروابط أبداً.
+        === 🤖 قواعد الحجز الفعلي ===
+        1. رقم العميل معروف تلقائياً وهو ({sender_phone}). يمنع سؤاله عن رقمه.
+        2. لعمل الحجز، اطلبي فقط: (الاسم إن لم يكن معروفاً، اليوم والوقت المناسب، والمنطقة المراد عمل الليزر لها).
+        3. تأكدي أن الوقت بين 12:00 ظهراً و 10:00 مساءً، واليوم ليس الجمعة.
+        4. افحصي إتاحة الميعاد بأداة `check_schedule`.
+        5. عند تأكيد الحجز، استدعي فوراً أداة `book_appointment` ببيانات: (patient_name, phone_number, date, time, area).
+        6. للإلغاء أو التعديل: استخدمي `check_patient_appointments` ثم `cancel_appointment` ثم أعيدي الحجز إذا طلب موعداً جديداً.
+
+        === 🚨 التحويل البشري الإلزامي (Human Handoff Rules - صارم جداً) ===
+        ممنوع منعاً باتاً تأليف أي معلومة أو الرد على أمر لستِ متأكدة منه بنسبة 100%. استدعي فوراً أداة `request_human_handoff` في الحالات التالية:
+        1. أي سؤال عن أسعار، خدمات، أو خصومات غير مذكورة نصاً في القائمة أعلاه.
+        2. أي استفسارات طبية (مثل: حساسية، حروق سابقة، حمل، موانع ليزر، أدوية).
+        3. أي طلب لخدمات غير الليزر (مثل: كشف جلدية، دكتور، بوتوكس، فيلر، تنظيف بشرة).
+        4. أي شكوى من مريض، أو إذا أبدى انزعاجه أو طلب التحدث مع إنسان حقيقي.
+        5. أسئلة الوظائف أو الـ CV.
+        *عند استدعاء request_human_handoff، قولي للمريض بلباقة شديدة:* "ثواني يا فندم، هحول لحضرتك موظف الاستقبال المختص حالاً للرد على استفسارك ومساعدتك بكل التفاصيل 🌸".
+
+        === 🧠 أسلوب الحديث ===
+        - عامية مصرية لطيفة، مهذبة وراقية ("يا فندم"، "تحت أمرك"، "من عيني").
+        - لا تكرري التحية في كل رسالة.
+        - استخدمي إيموجيز لطيفة (🌸، ✨، 💖).
         """
 
         chat = client.chats.create(
-            model='gemini-3.6-flash',
+            model='gemini-2.5-flash',
             history=load_chat_history(sender_phone, limit=10),
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                temperature=0.2,
-                tools=[check_schedule, check_patient_appointments, cancel_appointment, book_appointment, update_patient_file, send_clinic_media], 
+                temperature=0.1,
+                tools=[
+                    check_schedule,
+                    check_patient_appointments,
+                    cancel_appointment,
+                    book_appointment,
+                    update_patient_file,
+                    send_clinic_media,
+                    request_human_handoff
+                ],
             )
         )
         return chat.send_message(user_message).text or "", queued_images
-    except Exception as e: print(e); return "أهلاً يا فندم! ثواني وهكون مع حضرتك.", []
+    except Exception as e:
+        print(f"Gemini API Error: {e}")
+        traceback.print_exc()
+        return "أهلاً بحضرتك يا فندم! ثواني وهكون مع حضرتك.", []
 
 # ---------------------------------------------------------
 # OUTBOUND META MESSAGING
 # ---------------------------------------------------------
 async def send_whatsapp_message(to: str, text: str, phone_id: str):
     async with httpx.AsyncClient() as c:
-        await c.post(f"https://graph.facebook.com/v21.0/{phone_id}/messages", headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}})
+        await c.post(
+            f"https://graph.facebook.com/v21.0/{phone_id}/messages",
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+            json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
+        )
 
 async def send_whatsapp_image(to: str, url: str, caption: str, phone_id: str):
     async with httpx.AsyncClient() as c:
-        await c.post(f"https://graph.facebook.com/v21.0/{phone_id}/messages", headers={"Authorization": f"Bearer {ACCESS_TOKEN}"}, json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": url, "caption": caption}})
+        await c.post(
+            f"https://graph.facebook.com/v21.0/{phone_id}/messages",
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+            json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": url, "caption": caption}}
+        )
