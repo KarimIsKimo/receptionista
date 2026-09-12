@@ -955,14 +955,21 @@ def verify_webhook(request: Request):
 async def receive_message(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.json()
+        
+        # 1. Print all incoming webhooks to Render logs for debugging
+        print(f"📥 RAW WEBHOOK EVENT: {body}")
+
         entries = body.get("entry", [])
         if entries:
             for entry in entries:
                 for change in entry.get("changes", []):
+                    field = change.get("field", "")
                     value = change.get("value", {})
                     target_phone_id = value.get("metadata", {}).get("phone_number_id", PHONE_NUMBER_ID)
 
-                    # 1. INCOMING MESSAGES FROM PATIENT
+                    # ---------------------------------------------------------
+                    # A. INCOMING PATIENT MESSAGES
+                    # ---------------------------------------------------------
                     messages = value.get("messages", [])
                     if messages:
                         incoming_msg = messages[0]
@@ -982,14 +989,31 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                             
                             background_tasks.add_task(handle_ai_conversation, sender_phone, user_text, target_phone_id)
 
-                    # 2. RECEPTIONIST MESSAGES FROM PHONE (smb_message_echoes)
-                    echoes = value.get("smb_message_echoes") or value.get("message_echoes")
+                    # ---------------------------------------------------------
+                    # B. RECEPTIONIST MESSAGES FROM PHONE (smb_message_echoes)
+                    # ---------------------------------------------------------
+                    echoes = value.get("smb_message_echoes") or value.get("message_echoes") or (messages if field == "smb_message_echoes" else None)
                     if echoes and isinstance(echoes, list):
                         echo = echoes[0]
                         if not is_duplicate_message(echo.get("id")):
-                            customer_phone = echo.get("to", "").strip()
+                            # Meta places the recipient's number in recipient_id, contacts, or to
+                            customer_phone = (
+                                value.get("recipient_id")
+                                or (value.get("contacts", [{}])[0].get("wa_id") if value.get("contacts") else None)
+                                or echo.get("to")
+                                or ""
+                            ).strip()
+
                             echo_type = echo.get("type")
-                            text_body = echo.get("text", {}).get("body", "").strip() if echo_type == "text" else f"[{echo_type}]"
+                            text_body = ""
+                            if echo_type == "text":
+                                text_body = echo.get("text", {}).get("body", "").strip()
+                            elif echo_type == "image":
+                                text_body = echo.get("image", {}).get("caption", "[أرسلت موظفة الاستقبال صورة]").strip()
+                            else:
+                                text_body = f"[رسالة من العيادة: {echo_type}]"
+
+                            print(f"🔍 ECHO DETECTED -> Customer: '{customer_phone}' | Body: '{text_body}'")
 
                             if customer_phone and text_body:
                                 # Save her message as 'model' so Gemini sees it in context
@@ -1006,12 +1030,12 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                                                 DO UPDATE SET is_paused = TRUE
                                             """, (customer_phone,))
                                             conn.commit()
-                                    print(f"⏸️ Receptionist sent a message to {customer_phone}. Synced to Gemini context & bot paused.")
+                                    print(f"⏸️ Receptionist sent a message to {customer_phone}. AI context updated and bot paused.")
                                 except Exception as e:
                                     print(f"Database error on echo: {e}")
 
     except Exception as e: 
-        print(f"Webhook error: {e}")
+        print(f"Webhook processing error: {e}")
     return Response(content="EVENT_RECEIVED", status_code=200)
 
 async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number_id: str):
