@@ -40,7 +40,7 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "jothen123")
 
 BLOCKED_NUMBERS = ["01142286600", "201142286600"]
-STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201022227818")
+STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201026438897")
 
 OFFER_IMAGES = {
     "branches": {"url": f"{BASE_URL}/images/branches.jpg", "caption": "فروعنا وأماكن تواجدنا 📍"},
@@ -54,7 +54,7 @@ client = genai.Client()
 user_locks = {}
 
 # ---------------------------------------------------------
-# DB HELPERS & LIVE SETTINGS
+# DB HELPERS & LIVE SETTINGS (Supabase)
 # ---------------------------------------------------------
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -70,10 +70,10 @@ DEFAULT_SYSTEM_INSTRUCTION = """<role_definition>
 3. IF user asks routine laser prep or general FAQ questions (e.g., shaving/شيفنج, numbing cream, sun exposure, sessions, gaps, post-care, pain, cooling) -> ANSWER directly using <laser_faqs_and_prep>.
 4. IF user asks complex Medical Advice not in FAQs (e.g., burns, pregnancy, medications), Doctors, Botox, Filler, Dermatology, or has a complaint -> TRIGGER notify_staff(issue_summary) IMMEDIATELY in the background.
     - CRITICAL: DO NOT tell the patient that management or a doctor will contact them.
-    - INSTEAD, apologize politely that your role is limited to laser bookings. (e.g., "عذراً يا فندم، أنا مسؤولة بس عن حجوزات ومواعيد الليزر ومقدرش أفيد حضرتك طبياً في النقطة دي، أقدر أساعدك في حجز موعد؟").
+    - INSTEAD, apologize politely that your role is limited to laser bookings.
 5. IF user asks for a price NOT listed in <knowledge_base> -> TRIGGER notify_staff(issue_summary="استفسار عن سعر غير مسجل") in the background. 
     - CRITICAL: DO NOT say you are checking with management.
-    - INSTEAD, state politely that you only have standard packages available. (e.g., "عذراً يا فندم، دي كل باقات وعروض الليزر المتاحة عندي حالياً، تحبي أساعدك في حجز أي باقة منهم؟").
+    - INSTEAD, state politely that you only have standard packages available.
 6. IF user asks to book on Friday -> REJECT. Friday is a holiday.
 7. IF user asks to book outside 12:00 PM to 10:00 PM -> REJECT. Request a valid time.
 8. IF the user's message is ambiguous or contains typos (e.g., "back 5") -> Politely ask them to clarify what they mean.
@@ -223,7 +223,7 @@ def update_patient_file(phone_number: str, name: str, preferences: str) -> str:
     except Exception as e: return f"حدث خطأ أثناء حفظ الملف: {e}"
 
 # ---------------------------------------------------------
-# GEMINI TOOLS (APPOINTMENTS)
+# GOOGLE SHEETS TOOLS (APPOINTMENTS)
 # ---------------------------------------------------------
 def normalize_to_ampm(time_str: str) -> str:
     time_str = time_str.strip().upper()
@@ -277,12 +277,10 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, headers={"WWW-Authenticate": "Basic"})
     return credentials.username
 
-class PauseRequest(BaseModel):
-    phone_number: str
-    is_paused: bool
-
-class SettingsUpdate(BaseModel):
-    instruction: str
+class PauseRequest(BaseModel): phone_number: str; is_paused: bool
+class SettingsUpdate(BaseModel): instruction: str
+class BookReq(BaseModel): patient_name: str; phone_number: str; date: str; time: str; area: str
+class CancelReq(BaseModel): phone_number: str; date: str
 
 @app.post("/admin/api/toggle_pause")
 def toggle_pause(req: PauseRequest, admin: str = Depends(verify_admin)):
@@ -300,9 +298,28 @@ def get_settings(admin: str = Depends(verify_admin)):
 
 @app.post("/admin/api/settings")
 def update_settings(data: SettingsUpdate, admin: str = Depends(verify_admin)):
-    success = save_live_instructions(data.instruction)
-    if not success: raise HTTPException(status_code=500, detail="Failed to save settings")
+    if not save_live_instructions(data.instruction): raise HTTPException(status_code=500, detail="Failed to save settings")
     return {"status": "success"}
+
+# ---- NEW ENDPOINTS FOR SCHEDULE TAB ----
+@app.get("/admin/api/schedule")
+def api_get_schedule(date: str, admin: str = Depends(verify_admin)):
+    try:
+        with httpx.Client(follow_redirects=True) as http_client:
+            res = http_client.get(f"{GOOGLE_SHEET_URL}?date={date}", timeout=15.0).json()
+            return res
+    except Exception as e: return {"error": str(e)}
+
+@app.post("/admin/api/book")
+def api_admin_book(req: BookReq, admin: str = Depends(verify_admin)):
+    res = book_appointment(req.patient_name, req.phone_number, req.date, req.time, req.area)
+    return {"status": res}
+
+@app.post("/admin/api/cancel")
+def api_admin_cancel(req: CancelReq, admin: str = Depends(verify_admin)):
+    res = cancel_appointment(req.phone_number, req.date)
+    return {"status": res}
+# ----------------------------------------
 
 @app.get("/admin/api/data")
 def get_admin_data(admin: str = Depends(verify_admin)):
@@ -313,11 +330,7 @@ def get_admin_data(admin: str = Depends(verify_admin)):
                 try:
                     cursor.execute("SELECT id, phone_number, role, content, COALESCE(created_at, NOW()) AS created_at FROM chat_history ORDER BY id ASC")
                     chats = cursor.fetchall()
-                except Exception:
-                    conn.rollback()
-                    cursor.execute("SELECT id, phone_number, role, content FROM chat_history ORDER BY id ASC")
-                    chats = cursor.fetchall()
-
+                except Exception: pass
                 try:
                     cursor.execute("""
                         SELECT active.phone_number, COALESCE(p.name, '') AS name, COALESCE(p.preferences, '') AS preferences, 
@@ -329,10 +342,7 @@ def get_admin_data(admin: str = Depends(verify_admin)):
                         ORDER BY last_msg_time DESC NULLS LAST, last_msg_id DESC NULLS LAST
                     """)
                     patients = cursor.fetchall()
-                except Exception:
-                    conn.rollback()
-                    cursor.execute("SELECT * FROM patients ORDER BY name")
-                    patients = cursor.fetchall()
+                except Exception: pass
     except Exception as e: print(f"Admin API DB Error: {e}")
     return {"patients": patients, "chats": chats}
 
@@ -347,9 +357,19 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
         <title>لوحة تحكم عيادة جوثن - مدينة نصر</title>
         <style>
             * { box-sizing: border-box; }
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e5ddd5; margin: 0; display: flex; height: 100vh; overflow: hidden; }
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e5ddd5; margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+            
+            /* TOP NAVIGATION */
+            .top-nav { height: 60px; background: #ffffff; border-bottom: 1px solid #d1d7db; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); z-index: 10; }
+            .tabs-container { display: flex; gap: 15px; height: 100%; }
+            .nav-tab { background: transparent; border: none; font-size: 15px; font-weight: bold; color: #54656f; cursor: pointer; padding: 0 15px; border-bottom: 3px solid transparent; transition: all 0.2s; }
+            .nav-tab:hover { color: #008069; }
+            .nav-tab.active { color: #008069; border-bottom: 3px solid #008069; }
+            
+            /* CHATS VIEW */
+            #view-chats { display: flex; height: calc(100vh - 60px); width: 100%; }
             .sidebar { width: 380px; min-width: 340px; background: #ffffff; border-left: 1px solid #d1d7db; display: flex; flex-direction: column; height: 100%; }
-            .sidebar-header { background: #f0f2f5; padding: 16px 20px; font-weight: bold; font-size: 17px; border-bottom: 1px solid #d1d7db; color: #111b21; display:flex; justify-content:space-between; align-items:center; }
+            .sidebar-header { background: #f0f2f5; padding: 16px 20px; font-weight: bold; font-size: 16px; border-bottom: 1px solid #d1d7db; color: #111b21; }
             .patient-list { overflow-y: auto; flex-grow: 1; }
             .patient-card { padding: 12px 16px; border-bottom: 1px solid #f0f2f5; cursor: pointer; display: flex; flex-direction: column; gap: 4px; transition: background 0.15s ease; }
             .patient-card:hover { background: #f5f6f6; }
@@ -368,7 +388,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             .controls { display: flex; gap: 10px; }
             .btn { background: #ffffff; border: 1px solid #d1d7db; border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer; font-weight: 600; transition: all 0.2s; }
             .btn:hover { background: #f0f2f5; }
-            .btn-settings { background: #e3f2fd; color: #1565c0; border-color: #bbdefb; padding: 6px 10px; font-size: 12px; }
+            .btn-settings { background: #e3f2fd; color: #1565c0; border-color: #bbdefb; padding: 6px 15px; font-size: 13px; border-radius: 20px; }
             .btn-settings:hover { background: #bbdefb; }
             .btn-pause { background: #ffcdd2; color: #b71c1c; border-color: #ef9a9a; }
             .btn-pause:hover { background: #ef9a9a; }
@@ -379,33 +399,110 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             .msg.user { background: #ffffff; align-self: flex-start; border-top-right-radius: 0; }
             .msg.model { background: #d9fdd3; align-self: flex-end; border-top-left-radius: 0; }
             .msg-meta { font-size: 10.5px; color: #667781; text-align: left; direction: ltr; margin-top: 3px; }
+            
+            /* SCHEDULE VIEW */
+            #view-schedule { display: none; height: calc(100vh - 60px); width: 100%; background: #efeae2; padding: 30px 20px; overflow-y: auto; flex-direction: column; align-items: center; }
+            .schedule-container { background: #fff; border-radius: 12px; padding: 24px; width: 100%; max-width: 800px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+            .schedule-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 2px solid #f0f2f5; }
+            .schedule-header h2 { margin: 0; color: #111b21; font-size: 20px; }
+            .date-picker { padding: 10px 15px; border: 1px solid #d1d7db; border-radius: 8px; font-size: 15px; font-family: inherit; outline: none; color: #111b21; cursor: pointer; }
+            .slot-row { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-radius: 8px; border: 1px solid #d1d7db; margin-bottom: 10px; transition: transform 0.1s; }
+            .slot-row:hover { transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
+            .slot-time { font-weight: bold; font-family: monospace; font-size: 16px; direction: ltr; }
+            
+            /* MODALS */
+            .modal-overlay { display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.5); z-index:9999; justify-content:center; align-items:center; }
+            .modal-content { background:#fff; border-radius:12px; padding:24px; box-shadow:0 4px 20px rgba(0,0,0,0.2); }
+            .form-group { margin-bottom: 15px; display: flex; flex-direction: column; gap: 5px; }
+            .form-group label { font-size: 13px; font-weight: bold; color: #54656f; }
+            .form-group input, .form-group select { padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; font-family: inherit; }
             .empty-state { margin: auto; text-align: center; color: #8696a0; font-size: 16px; }
         </style>
     </head>
     <body>
-        <div class="sidebar">
-            <div class="sidebar-header">
-                <span>المحادثات وملفات المرضى 📁</span>
-                <button class="btn btn-settings" onclick="openSettingsModal()">⚙️ الإعدادات</button>
+        <!-- Top Navigation -->
+        <div class="top-nav">
+            <div class="tabs-container">
+                <button class="nav-tab active" id="tab-btn-chats" onclick="switchView('chats')">💬 المحادثات</button>
+                <button class="nav-tab" id="tab-btn-schedule" onclick="switchView('schedule')">📅 جدول جوجل شيت</button>
             </div>
-            <div class="patient-list" id="patient-list"></div>
+            <button class="btn btn-settings" onclick="openSettingsModal()">⚙️ إعدادات البوت والأسعار</button>
         </div>
-        <div class="chat-area">
-            <div class="chat-header" id="chat-header">
-                <div class="chat-header-info" id="chat-header-info">
-                    <strong style="color: #54656f;">اختر محادثة</strong>
+
+        <!-- 1. CHATS VIEW -->
+        <div id="view-chats">
+            <div class="sidebar">
+                <div class="sidebar-header">ملفات المرضى 📁</div>
+                <div class="patient-list" id="patient-list"></div>
+            </div>
+            <div class="chat-area">
+                <div class="chat-header" id="chat-header">
+                    <div class="chat-header-info" id="chat-header-info">
+                        <strong style="color: #54656f;">اختر محادثة</strong>
+                    </div>
+                    <div class="controls" id="chat-controls" style="display:none;">
+                        <button class="btn" id="order-toggle-btn" onclick="toggleOrder()">⬇️ الأحدث بالأسفل</button>
+                        <button class="btn" id="pause-btn" onclick="togglePause()"></button>
+                    </div>
                 </div>
-                <div class="controls" id="chat-controls" style="display:none;">
-                    <button class="btn" id="order-toggle-btn" onclick="toggleOrder()">⬇️ الأحدث بالأسفل</button>
-                    <button class="btn" id="pause-btn" onclick="togglePause()"></button>
+                <div class="messages" id="messages"><div class="empty-state">المحادثات الحية ستظهر هنا...</div></div>
+            </div>
+        </div>
+
+        <!-- 2. SCHEDULE VIEW -->
+        <div id="view-schedule">
+            <div class="schedule-container">
+                <div class="schedule-header">
+                    <h2>حجوزات العيادة 📅</h2>
+                    <input type="date" id="schedule-date-picker" class="date-picker" onchange="loadSchedule()">
+                </div>
+                <div id="schedule-slots">
+                    <!-- Populated by JS -->
                 </div>
             </div>
-            <div class="messages" id="messages"><div class="empty-state">المحادثات الحية ستظهر هنا...</div></div>
         </div>
         
-        <!-- Settings Modal Popup -->
-        <div id="settings-modal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.5); z-index:9999; justify-content:center; align-items:center;">
-            <div style="background:#fff; width:800px; max-width:90%; height:85vh; border-radius:12px; display:flex; flex-direction:column; padding:20px; box-shadow:0 4px 15px rgba(0,0,0,0.2);">
+        <!-- Booking Form Modal -->
+        <div id="booking-modal" class="modal-overlay">
+            <div class="modal-content" style="width: 400px; max-width: 90%;">
+                <h3 style="margin-top:0;">إضافة حجز جديد</h3>
+                <div class="form-group">
+                    <label>تاريخ وتوقت الحجز</label>
+                    <div style="display:flex; gap:10px;">
+                        <input type="text" id="book-date" disabled style="background:#f0f2f5; flex:1; direction:ltr;">
+                        <input type="text" id="book-time" disabled style="background:#f0f2f5; flex:1; direction:ltr;">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>اسم المريض</label>
+                    <input type="text" id="book-name" placeholder="مثال: أحمد كريم">
+                </div>
+                <div class="form-group">
+                    <label>رقم الهاتف (WhatsApp)</label>
+                    <input type="text" id="book-phone" placeholder="مثال: 201012345678" style="direction:ltr; text-align:left;">
+                </div>
+                <div class="form-group">
+                    <label>المنطقة المراد عملها</label>
+                    <select id="book-area">
+                        <option value="جسم كامل">جسم كامل</option>
+                        <option value="نصف جسم">نصف جسم</option>
+                        <option value="أندر آرم">أندر آرم</option>
+                        <option value="بكيني">بكيني</option>
+                        <option value="وجه">وجه</option>
+                        <option value="تحديد ذقن">تحديد ذقن</option>
+                        <option value="أخرى">أخرى (مخصصة)</option>
+                    </select>
+                </div>
+                <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px;">
+                    <button class="btn" onclick="closeBookingModal()">إلغاء</button>
+                    <button class="btn" id="submit-booking-btn" style="background:#008069; color:#fff;" onclick="submitBooking()">تأكيد الحجز</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Settings Form Modal -->
+        <div id="settings-modal" class="modal-overlay">
+            <div class="modal-content" style="width:800px; max-width:90%; height:85vh; display:flex; flex-direction:column;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                     <h3 style="margin:0;">⚙️ تعديل تعليمات البوت والأسعار</h3>
                     <button onclick="closeSettingsModal()" style="border:none; background:transparent; font-size:22px; cursor:pointer; color:#666;">✖</button>
@@ -423,6 +520,121 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             let allChats = [], allPatients = [], currentPhone = null, autoScroll = true, newestAtTop = false, currentIsPaused = false;
             const messagesDiv = document.getElementById('messages');
             
+            // View Switching Logic
+            function switchView(viewName) {
+                document.getElementById('view-chats').style.display = viewName === 'chats' ? 'flex' : 'none';
+                document.getElementById('view-schedule').style.display = viewName === 'schedule' ? 'flex' : 'none';
+                
+                document.getElementById('tab-btn-chats').className = viewName === 'chats' ? 'nav-tab active' : 'nav-tab';
+                document.getElementById('tab-btn-schedule').className = viewName === 'schedule' ? 'nav-tab active' : 'nav-tab';
+                
+                if (viewName === 'schedule') {
+                    const dp = document.getElementById('schedule-date-picker');
+                    if (!dp.value) dp.valueAsDate = new Date();
+                    loadSchedule();
+                }
+            }
+
+            // ==========================================
+            // SCHEDULE & GOOGLE SHEETS LOGIC
+            // ==========================================
+            const CLINIC_TIMES = ["12:00 PM", "12:30 PM", "01:00 PM", "01:30 PM", "02:00 PM", "02:30 PM", "03:00 PM", "03:30 PM", "04:00 PM", "04:30 PM", "05:00 PM", "05:30 PM", "06:00 PM", "06:30 PM", "07:00 PM", "07:30 PM", "08:00 PM", "08:30 PM", "09:00 PM", "09:30 PM", "10:00 PM"];
+
+            async function loadSchedule() {
+                const date = document.getElementById('schedule-date-picker').value;
+                const slotsDiv = document.getElementById('schedule-slots');
+                slotsDiv.innerHTML = '<div class="empty-state">⏳ جاري قراءة الحجوزات من جوجل شيت...</div>';
+                
+                try {
+                    const res = await fetch(`/admin/api/schedule?date=${date}`);
+                    const data = await res.json();
+                    
+                    let bookedTimes = [];
+                    if (data.booked) {
+                        // Normalize times returned from Google Sheet to match our array
+                        bookedTimes = data.booked.map(t => t.trim().toUpperCase());
+                    }
+
+                    slotsDiv.innerHTML = '';
+                    CLINIC_TIMES.forEach(t => {
+                        const isBooked = bookedTimes.includes(t);
+                        const slotDiv = document.createElement('div');
+                        slotDiv.className = 'slot-row';
+                        slotDiv.style.background = isBooked ? '#fff1f0' : '#f6ffed';
+                        slotDiv.style.borderColor = isBooked ? '#ffa39e' : '#b7eb8f';
+                        
+                        slotDiv.innerHTML = `
+                            <div class="slot-time" style="color: ${isBooked ? '#cf1322' : '#389e0d'};">${t}</div>
+                            <div>
+                                ${isBooked ? 
+                                  `<span style="color:#cf1322; font-weight:bold; margin-left:15px; font-size:14px;">🔴 محجوزة</span>
+                                   <button onclick="promptCancel('${date}', '${t}')" style="background:#ff4d4f; color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-weight:bold;">إلغاء الحجز</button>` : 
+                                  `<span style="color:#389e0d; font-weight:bold; margin-left:15px; font-size:14px;">🟢 متاحة</span>
+                                   <button onclick="openBookingModal('${date}', '${t}')" style="background:#52c41a; color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-weight:bold;">+ حجز موعد</button>`
+                                }
+                            </div>
+                        `;
+                        slotsDiv.appendChild(slotDiv);
+                    });
+                } catch (e) {
+                    slotsDiv.innerHTML = '<div class="empty-state" style="color:#cf1322;">❌ حدث خطأ في الاتصال بجوجل شيت. يرجى المحاولة لاحقاً.</div>';
+                }
+            }
+
+            async function promptCancel(date, time) {
+                const phone = prompt(`أنت على وشك إلغاء حجز الساعة ${time} يوم ${date}.\n\nالرجاء إدخال رقم هاتف المريض لتأكيد الإلغاء (يجب أن يتطابق مع الرقم في الشيت):`);
+                if (!phone) return;
+                
+                const res = await fetch('/admin/api/cancel', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({phone_number: phone, date: date})
+                });
+                const data = await res.json();
+                alert(data.status);
+                loadSchedule();
+            }
+
+            function openBookingModal(date, time) {
+                document.getElementById('book-date').value = date;
+                document.getElementById('book-time').value = time;
+                document.getElementById('book-name').value = '';
+                document.getElementById('book-phone').value = '';
+                document.getElementById('booking-modal').style.display = 'flex';
+            }
+            
+            function closeBookingModal() {
+                document.getElementById('booking-modal').style.display = 'none';
+            }
+
+            async function submitBooking() {
+                const name = document.getElementById('book-name').value;
+                const phone = document.getElementById('book-phone').value;
+                const area = document.getElementById('book-area').value;
+                const date = document.getElementById('book-date').value;
+                const time = document.getElementById('book-time').value;
+
+                if(!name || !phone) return alert('الرجاء إدخال اسم المريض ورقم الهاتف');
+
+                const btn = document.getElementById('submit-booking-btn');
+                btn.innerText = 'جاري الحفظ في جوجل شيت...';
+
+                const res = await fetch('/admin/api/book', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ patient_name: name, phone_number: phone, date: date, time: time, area: area })
+                });
+                const data = await res.json();
+                alert(data.status);
+                
+                closeBookingModal();
+                btn.innerText = 'تأكيد الحجز';
+                loadSchedule(); // Refresh the list instantly
+            }
+
+            // ==========================================
+            // CHATS & SETTINGS LOGIC
+            // ==========================================
             messagesDiv.addEventListener('scroll', () => {
                 if (!newestAtTop) autoScroll = (messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + 60);
             });
@@ -467,7 +679,6 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 }
             }
             
-            // Settings Modal Functions
             async function openSettingsModal() {
                 const res = await fetch('/admin/api/settings');
                 const data = await res.json();
@@ -489,10 +700,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                     body: JSON.stringify({instruction: val})
                 });
                 btn.innerText = '💾 تم الحفظ بنجاح!';
-                setTimeout(() => {
-                    btn.innerText = '💾 حفظ التعديلات فوراً';
-                    closeSettingsModal();
-                }, 1200);
+                setTimeout(() => { btn.innerText = '💾 حفظ التعديلات فوراً'; closeSettingsModal(); }, 1200);
             }
 
             async function loadData() {
@@ -654,10 +862,8 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
         today_day_name = arabic_days[now_cairo.weekday()]
         today_date = f"{now_cairo.strftime('%Y-%m-%d')} (اليوم هو: {today_day_name})"
 
-        # Fetch the live, editable instructions from the database
         base_instruction = get_live_instructions()
 
-        # Combine live instructions with the current patient's context
         system_instruction = f"""
         {base_instruction}
 
