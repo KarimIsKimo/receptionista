@@ -40,7 +40,7 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "jothen123")
 
 BLOCKED_NUMBERS = ["01142286600", "201142286600"]
-STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201022227818")
+STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201026438897")
 
 OFFER_IMAGES = {
     "branches": {"url": f"{BASE_URL}/images/branches.jpg", "caption": "فروعنا وأماكن تواجدنا 📍"},
@@ -943,20 +943,42 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
         return "أهلاً بحضرتك يا فندم! ثواني وهكون مع حضرتك.", []
 
 # ---------------------------------------------------------
-# OUTBOUND META MESSAGING
+# OUTBOUND META MESSAGING (WITH TIMEOUTS & RETRIES)
 # ---------------------------------------------------------
+HTTP_TIMEOUT = httpx.Timeout(timeout=30.0, connect=15.0)
+
 async def send_whatsapp_message(to: str, text: str, phone_id: str):
-    async with httpx.AsyncClient() as c:
-        await c.post(
-            f"https://graph.facebook.com/v21.0/{phone_id}/messages",
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-            json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
-        )
+    url = f"https://graph.facebook.com/v21.0/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
+
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
+                res = await c.post(url, headers=headers, json=payload)
+                if res.status_code == 200:
+                    return True
+                print(f"⚠️ Meta API responded with status {res.status_code}: {res.text}")
+        except Exception as e:
+            print(f"⚠️ WhatsApp send attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(1)
+    print(f"❌ Failed to send WhatsApp message to {to} after 3 attempts.")
+    return False
 
 async def send_whatsapp_image(to: str, url: str, caption: str, phone_id: str):
-    async with httpx.AsyncClient() as c:
-        await c.post(
-            f"https://graph.facebook.com/v21.0/{phone_id}/messages",
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-            json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": url, "caption": caption}}
-        )
+    api_url = f"https://graph.facebook.com/v21.0/{phone_id}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": url, "caption": caption}}
+
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
+                res = await c.post(api_url, headers=headers, json=payload)
+                if res.status_code == 200:
+                    return True
+                print(f"⚠️ Meta API image responded with status {res.status_code}: {res.text}")
+        except Exception as e:
+            print(f"⚠️ WhatsApp image send attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(1)
+    print(f"❌ Failed to send WhatsApp image to {to} after 3 attempts.")
+    return False
