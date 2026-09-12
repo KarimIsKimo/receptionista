@@ -40,9 +40,7 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "jothen123")
 
 BLOCKED_NUMBERS = ["01142286600", "201142286600"]
-
-# ⚠️ CHANGE THIS to the Manager/Doctor's phone number to receive alerts (Format: CountryCode + Number)
-STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201026438897")
+STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201022227818")
 
 OFFER_IMAGES = {
     "branches": {"url": f"{BASE_URL}/images/branches.jpg", "caption": "فروعنا وأماكن تواجدنا 📍"},
@@ -56,10 +54,108 @@ client = genai.Client()
 user_locks = {}
 
 # ---------------------------------------------------------
-# DB HELPERS
+# DB HELPERS & LIVE SETTINGS
 # ---------------------------------------------------------
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+DEFAULT_SYSTEM_INSTRUCTION = """<role_definition>
+أنتِ "نور"، موظفة استقبال ذكية ولطيفة في "عيادات جوثن" (Jothen Clinics).
+مهمتك الوحيدة: خدمة عملاء فرع "مدينة نصر" فقط، وحجز مواعيد ليزر إزالة الشعر.
+</role_definition>
+
+<hard_constraints>
+1. IF user asks about location -> REPLY EXACTLY: "عيادة 104، 8 ش الدكتور حسن الشريف، مدينة نصر" AND trigger send_clinic_media(['branches']). NEVER mention other locations.
+2. IF user asks for phone number -> NEVER ask. You already know it.
+3. IF user asks routine laser prep or general FAQ questions (e.g., shaving/شيفنج, numbing cream, sun exposure, sessions, gaps, post-care, pain, cooling) -> ANSWER directly using <laser_faqs_and_prep>.
+4. IF user asks complex Medical Advice not in FAQs (e.g., burns, pregnancy, medications), Doctors, Botox, Filler, Dermatology, or has a complaint -> TRIGGER notify_staff(issue_summary) IMMEDIATELY in the background.
+    - CRITICAL: DO NOT tell the patient that management or a doctor will contact them.
+    - INSTEAD, apologize politely that your role is limited to laser bookings. (e.g., "عذراً يا فندم، أنا مسؤولة بس عن حجوزات ومواعيد الليزر ومقدرش أفيد حضرتك طبياً في النقطة دي، أقدر أساعدك في حجز موعد؟").
+5. IF user asks for a price NOT listed in <knowledge_base> -> TRIGGER notify_staff(issue_summary="استفسار عن سعر غير مسجل") in the background. 
+    - CRITICAL: DO NOT say you are checking with management.
+    - INSTEAD, state politely that you only have standard packages available. (e.g., "عذراً يا فندم، دي كل باقات وعروض الليزر المتاحة عندي حالياً، تحبي أساعدك في حجز أي باقة منهم؟").
+6. IF user asks to book on Friday -> REJECT. Friday is a holiday.
+7. IF user asks to book outside 12:00 PM to 10:00 PM -> REJECT. Request a valid time.
+8. IF the user's message is ambiguous or contains typos (e.g., "back 5") -> Politely ask them to clarify what they mean.
+</hard_constraints>
+
+<knowledge_base>
+<laser_faqs_and_prep>
+- الشيفنج (Shaving): نعم يا فندم، لازم يتم إزالة الشعر بالشفرة (الشيفنج) في نفس يوم الجلسة أو قبلها بيوم، وممنوع استخدام السويت أو الشمع أو الفتلة.
+- المخدر (Numbing Cream): متاح استخدام كريم مخدر قبل الجلسة بنصف أو ساعة للمناطق الحساسة.
+- الشمس (Sun Exposure): يفضل عدم التعرض المباشر للشمس أو عمل تان (Tan) قبل وبعد الجلسة بأسبوعين.
+- عدد الجلسات: في المتوسط بنحتاج من 6 لـ 8 جلسات.
+- الفرق بين الجلسات: الجلسات بتكون كل 3 لـ 4 أسابيع للوجه، وكل 4 لـ 6 أسابيع لباقي مناطق الجسم.
+- العناية بعد الجلسة: بننصح باستخدام كريم مرطب طبي ومضاد حيوي بعد الجلسة مباشرة، وممنوع تماماً استخدام أي عطور، مزيلات عرق، أو مقشرات على المنطقة لمدة 48 ساعة.
+- الألم والتبريد: أجهزتنا مزودة بأقوى نظام تبريد مزدوج بيخلي الجلسة مريحة جداً وبدون ألم، مجرد لسعة خفيفة جداً.
+</laser_faqs_and_prep>
+
+<prices_women>
+- باقات النبضات: 1000 نبضة (800ج)، 2000 نبضة (1500ج)، 3000 نبضة (2000ج)، 5000 نبضة (3000ج)، 7000 نبضة (3500ج)، 10000 نبضة (5000ج).
+- عرض: 4 جلسات أندر آرم أو بيكيني بخصم 10%.
+- أندر آرم (150ج)، بيكيني+لاين (300ج)، بيكيني+أندر آرم+لاين (350ج).
+- وجه (250ج)، وجه+ذقن (350ج)، وجه+رقبة (450ج).
+- جسم كامل (2500ج)، جسم كامل بدون بطن وظهر (2000ج)، نصف جسم (1250ج).
+- ACTION: Always append send_clinic_media(['women_packages', 'women_areas']) when quoting these.
+</prices_women>
+
+<prices_men>
+- تحديد ذقن (300ج)، ذقن ورقبة (500ج)، ذقن ورقبة وفك (750ج)، وجه كامل (500ج).
+- أندر آرم (400ج)، بوكسر (500ج)، بوكسر وأندر آرم وذقن (1000ج).
+- عصعص (750ج)، جسم كامل (4000ج بدلاً من 5000ج).
+- ACTION: Always append send_clinic_media(['men_offers']) when quoting these.
+</prices_men>
+</knowledge_base>
+
+<booking_workflow>
+STEP 1: Identify missing info (Name, Date, Time, Area).
+STEP 2: Ask user for missing info politely.
+STEP 3: Validate Time (12 PM - 10 PM) and Day (Not Friday).
+STEP 4: Call check_schedule(date) to verify availability.
+STEP 5: If available, call book_appointment(patient_name, phone_number, date, time, area).
+</booking_workflow>
+
+<tone_and_style>
+- لهجة مصرية عامية راقية (يا فندم، من عيني، تحت أمرك).
+- لا تكرري الترحيب في كل رسالة.
+- استخدمي إيموجيز (🌸، ✨).
+</tone_and_style>
+"""
+
+def get_live_instructions() -> str:
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS clinic_settings (
+                        key VARCHAR(50) PRIMARY KEY,
+                        content TEXT NOT NULL,
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                """)
+                conn.commit()
+                cursor.execute("SELECT content FROM clinic_settings WHERE key = 'system_instruction'")
+                row = cursor.fetchone()
+                if row and row[0].strip(): return row[0]
+                cursor.execute("INSERT INTO clinic_settings (key, content) VALUES ('system_instruction', %s) ON CONFLICT DO NOTHING", (DEFAULT_SYSTEM_INSTRUCTION,))
+                conn.commit()
+    except Exception as e: print(f"Error loading instructions: {e}")
+    return DEFAULT_SYSTEM_INSTRUCTION
+
+def save_live_instructions(new_content: str) -> bool:
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO clinic_settings (key, content, updated_at)
+                    VALUES ('system_instruction', %s, NOW())
+                    ON CONFLICT (key) DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
+                """, (new_content,))
+                conn.commit()
+                return True
+    except Exception as e:
+        print(f"Error saving instructions: {e}")
+        return False
 
 def is_duplicate_message(message_id: str) -> bool:
     try:
@@ -70,21 +166,18 @@ def is_duplicate_message(message_id: str) -> bool:
                 cursor.execute("INSERT INTO processed_messages (message_id) VALUES (%s) ON CONFLICT DO NOTHING", (message_id,))
                 conn.commit()
                 return False
-    except Exception:
-        return False
+    except Exception: return False
 
 def save_chat_turn(phone_number: str, role: str, content: str):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                try:
-                    cursor.execute("INSERT INTO chat_history (phone_number, role, content, created_at) VALUES (%s, %s, %s, NOW())", (phone_number, role, content))
+                try: cursor.execute("INSERT INTO chat_history (phone_number, role, content, created_at) VALUES (%s, %s, %s, NOW())", (phone_number, role, content))
                 except Exception:
                     conn.rollback()
                     cursor.execute("INSERT INTO chat_history (phone_number, role, content) VALUES (%s, %s, %s)", (phone_number, role, content))
                 conn.commit()
-    except Exception as e:
-        print(f"DB Save Chat Error: {e}")
+    except Exception as e: print(f"DB Save Chat Error: {e}")
 
 def load_chat_history(phone_number: str, limit: int = 10):
     history = []
@@ -96,8 +189,7 @@ def load_chat_history(phone_number: str, limit: int = 10):
         for row in reversed(rows):
             gemini_role = "user" if row["role"] == "user" else "model"
             history.append(types.Content(role=gemini_role, parts=[types.Part.from_text(text=row["content"])]))
-    except Exception:
-        pass
+    except Exception: pass
     return history
 
 def load_patient_profile(phone_number: str) -> dict:
@@ -106,14 +198,11 @@ def load_patient_profile(phone_number: str) -> dict:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute("SELECT name, preferences, is_paused FROM patients WHERE phone_number = %s", (phone_number,))
                 row = cursor.fetchone()
-                if row:
-                    return {"name": row.get("name") or "", "preferences": row.get("preferences") or "", "is_paused": row.get("is_paused", False)}
-    except Exception:
-        pass
+                if row: return {"name": row.get("name") or "", "preferences": row.get("preferences") or "", "is_paused": row.get("is_paused", False)}
+    except Exception: pass
     return {"name": "", "preferences": "", "is_paused": False}
 
 def update_patient_file(phone_number: str, name: str, preferences: str) -> str:
-    """Saves or updates long-term patient records."""
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
@@ -131,26 +220,20 @@ def update_patient_file(phone_number: str, name: str, preferences: str) -> str:
                 """, (phone_number, name.strip(), preferences.strip()))
                 conn.commit()
         return "تم تحديث الملف الدائم للعميل بنجاح."
-    except Exception as e:
-        return f"حدث خطأ أثناء حفظ الملف: {e}"
+    except Exception as e: return f"حدث خطأ أثناء حفظ الملف: {e}"
 
 # ---------------------------------------------------------
 # GEMINI TOOLS (APPOINTMENTS)
 # ---------------------------------------------------------
 def normalize_to_ampm(time_str: str) -> str:
     time_str = time_str.strip().upper()
-    try:
-        t = datetime.datetime.strptime(time_str, "%H:%M")
-        return t.strftime("%I:%M %p").lstrip("0")
+    try: return datetime.datetime.strptime(time_str, "%H:%M").strftime("%I:%M %p").lstrip("0")
     except ValueError: pass
-    try:
-        t = datetime.datetime.strptime(time_str, "%I:%M %p")
-        return t.strftime("%I:%M %p").lstrip("0")
+    try: return datetime.datetime.strptime(time_str, "%I:%M %p").strftime("%I:%M %p").lstrip("0")
     except ValueError: pass
     return time_str
 
 def check_schedule(date: str) -> str:
-    """Fetches booked appointments for a date (YYYY-MM-DD)."""
     try:
         with httpx.Client(follow_redirects=True) as http_client:
             res = http_client.get(f"{GOOGLE_SHEET_URL}?date={date}", timeout=15.0).json()
@@ -160,17 +243,14 @@ def check_schedule(date: str) -> str:
     except Exception: return "لا يمكن قراءة الجدول الآن."
 
 def check_patient_appointments(phone_number: str) -> str:
-    """Checks if the patient already has an upcoming appointment in the system."""
     try:
         with httpx.Client(follow_redirects=True) as http_client:
             res = http_client.get(f"{GOOGLE_SHEET_URL}?phone={phone_number}", timeout=15.0).json()
-            if "appointments" in res and res["appointments"]:
-                return f"حجوزات العميل الحالية: {', '.join(res['appointments'])}"
+            if "appointments" in res and res["appointments"]: return f"حجوزات العميل الحالية: {', '.join(res['appointments'])}"
             return "لا يوجد حجوزات سابقة أو قادمة لهذا العميل."
     except Exception: return "فشل في قراءة حجوزات العميل."
 
 def cancel_appointment(phone_number: str, date: str) -> str:
-    """Cancels a patient's appointment for a specific date (YYYY-MM-DD)."""
     try:
         with httpx.Client(follow_redirects=True) as http_client:
             res = http_client.post(GOOGLE_SHEET_URL, json={"action": "cancel", "phone_number": phone_number, "date": date}, timeout=15.0).json()
@@ -179,19 +259,10 @@ def cancel_appointment(phone_number: str, date: str) -> str:
     except Exception: return "فشل الاتصال بنظام الإلغاء."
 
 def book_appointment(patient_name: str, phone_number: str, date: str, time: str, area: str) -> str:
-    """Saves a clinic appointment for the Nasr City branch."""
     standard_time = normalize_to_ampm(time)
     try:
         with httpx.Client(follow_redirects=True) as http_client:
-            payload = {
-                "action": "book",
-                "patient_name": patient_name,
-                "phone_number": phone_number,
-                "branch": "مدينة نصر",
-                "date": date,
-                "time": standard_time,
-                "area": area
-            }
+            payload = {"action": "book", "patient_name": patient_name, "phone_number": phone_number, "branch": "مدينة نصر", "date": date, "time": standard_time, "area": area}
             res = http_client.post(GOOGLE_SHEET_URL, json=payload, timeout=15.0).json()
             if res.get("status") == "error": return f"فشل الحجز: {res.get('message')}"
     except Exception as e: return f"خطأ في الاتصال بنظام الحجز: {e}"
@@ -210,19 +281,28 @@ class PauseRequest(BaseModel):
     phone_number: str
     is_paused: bool
 
+class SettingsUpdate(BaseModel):
+    instruction: str
+
 @app.post("/admin/api/toggle_pause")
 def toggle_pause(req: PauseRequest, admin: str = Depends(verify_admin)):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("""
-                    INSERT INTO patients (phone_number, is_paused) VALUES (%s, %s)
-                    ON CONFLICT (phone_number) DO UPDATE SET is_paused = EXCLUDED.is_paused
-                """, (req.phone_number, req.is_paused))
+                cursor.execute("INSERT INTO patients (phone_number, is_paused) VALUES (%s, %s) ON CONFLICT (phone_number) DO UPDATE SET is_paused = EXCLUDED.is_paused", (req.phone_number, req.is_paused))
                 conn.commit()
         return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/admin/api/settings")
+def get_settings(admin: str = Depends(verify_admin)):
+    return {"instruction": get_live_instructions()}
+
+@app.post("/admin/api/settings")
+def update_settings(data: SettingsUpdate, admin: str = Depends(verify_admin)):
+    success = save_live_instructions(data.instruction)
+    if not success: raise HTTPException(status_code=500, detail="Failed to save settings")
+    return {"status": "success"}
 
 @app.get("/admin/api/data")
 def get_admin_data(admin: str = Depends(verify_admin)):
@@ -269,7 +349,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             * { box-sizing: border-box; }
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #e5ddd5; margin: 0; display: flex; height: 100vh; overflow: hidden; }
             .sidebar { width: 380px; min-width: 340px; background: #ffffff; border-left: 1px solid #d1d7db; display: flex; flex-direction: column; height: 100%; }
-            .sidebar-header { background: #f0f2f5; padding: 16px 20px; font-weight: bold; font-size: 17px; border-bottom: 1px solid #d1d7db; color: #111b21; }
+            .sidebar-header { background: #f0f2f5; padding: 16px 20px; font-weight: bold; font-size: 17px; border-bottom: 1px solid #d1d7db; color: #111b21; display:flex; justify-content:space-between; align-items:center; }
             .patient-list { overflow-y: auto; flex-grow: 1; }
             .patient-card { padding: 12px 16px; border-bottom: 1px solid #f0f2f5; cursor: pointer; display: flex; flex-direction: column; gap: 4px; transition: background 0.15s ease; }
             .patient-card:hover { background: #f5f6f6; }
@@ -288,6 +368,8 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             .controls { display: flex; gap: 10px; }
             .btn { background: #ffffff; border: 1px solid #d1d7db; border-radius: 6px; padding: 8px 12px; font-size: 13px; cursor: pointer; font-weight: 600; transition: all 0.2s; }
             .btn:hover { background: #f0f2f5; }
+            .btn-settings { background: #e3f2fd; color: #1565c0; border-color: #bbdefb; padding: 6px 10px; font-size: 12px; }
+            .btn-settings:hover { background: #bbdefb; }
             .btn-pause { background: #ffcdd2; color: #b71c1c; border-color: #ef9a9a; }
             .btn-pause:hover { background: #ef9a9a; }
             .btn-resume { background: #c8e6c9; color: #1b5e20; border-color: #a5d6a7; }
@@ -302,7 +384,10 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
     </head>
     <body>
         <div class="sidebar">
-            <div class="sidebar-header">المحادثات وملفات المرضى 📁</div>
+            <div class="sidebar-header">
+                <span>المحادثات وملفات المرضى 📁</span>
+                <button class="btn btn-settings" onclick="openSettingsModal()">⚙️ الإعدادات</button>
+            </div>
             <div class="patient-list" id="patient-list"></div>
         </div>
         <div class="chat-area">
@@ -317,6 +402,23 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             </div>
             <div class="messages" id="messages"><div class="empty-state">المحادثات الحية ستظهر هنا...</div></div>
         </div>
+        
+        <!-- Settings Modal Popup -->
+        <div id="settings-modal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.5); z-index:9999; justify-content:center; align-items:center;">
+            <div style="background:#fff; width:800px; max-width:90%; height:85vh; border-radius:12px; display:flex; flex-direction:column; padding:20px; box-shadow:0 4px 15px rgba(0,0,0,0.2);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <h3 style="margin:0;">⚙️ تعديل تعليمات البوت والأسعار</h3>
+                    <button onclick="closeSettingsModal()" style="border:none; background:transparent; font-size:22px; cursor:pointer; color:#666;">✖</button>
+                </div>
+                <p style="font-size:12.5px; color:#667781; margin-top:0; margin-bottom:12px;">تعديلك لأسعار أو شروط البوت هنا يتم حفظه فوراً في قاعدة البيانات وسيطبقه البوت على أي رسالة قادمة.</p>
+                <textarea id="instruction-textarea" style="flex-grow:1; width:100%; font-family:monospace; font-size:13px; padding:12px; border:1px solid #ccc; border-radius:8px; resize:none; line-height:1.5;" dir="rtl"></textarea>
+                <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:15px;">
+                    <button class="btn" onclick="closeSettingsModal()">إلغاء</button>
+                    <button class="btn" id="save-settings-btn" style="background:#008069; color:#fff;" onclick="saveSettings()">💾 حفظ التعديلات فوراً</button>
+                </div>
+            </div>
+        </div>
+
         <script>
             let allChats = [], allPatients = [], currentPhone = null, autoScroll = true, newestAtTop = false, currentIsPaused = false;
             const messagesDiv = document.getElementById('messages');
@@ -363,6 +465,34 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                     btn.className = 'btn btn-pause';
                     btn.innerHTML = '⏸️ إيقاف البوت (تدخل بشري)';
                 }
+            }
+            
+            // Settings Modal Functions
+            async function openSettingsModal() {
+                const res = await fetch('/admin/api/settings');
+                const data = await res.json();
+                document.getElementById('instruction-textarea').value = data.instruction;
+                document.getElementById('settings-modal').style.display = 'flex';
+            }
+
+            function closeSettingsModal() {
+                document.getElementById('settings-modal').style.display = 'none';
+            }
+
+            async function saveSettings() {
+                const btn = document.getElementById('save-settings-btn');
+                btn.innerText = 'جاري الحفظ...';
+                const val = document.getElementById('instruction-textarea').value;
+                await fetch('/admin/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({instruction: val})
+                });
+                btn.innerText = '💾 تم الحفظ بنجاح!';
+                setTimeout(() => {
+                    btn.innerText = '💾 حفظ التعديلات فوراً';
+                    closeSettingsModal();
+                }, 1200);
             }
 
             async function loadData() {
@@ -504,100 +634,38 @@ def generate_ai_reply(sender_phone: str, user_message: str, profile: dict):
             return "Error: Unknown media."
 
         def notify_staff(issue_summary: str) -> str:
-            """Sends an alert to clinic management regarding a patient's medical question, complaint, or unlisted price request, WITHOUT pausing the bot."""
+            """Sends a silent alert to clinic management regarding a patient's medical question or unlisted price request."""
             try:
                 alert_body = f"🚨 *تنبيه استفسار يحتاج متابعة*\n\n📱 *رقم المريض:* {sender_phone}\n📝 *المشكلة:* {issue_summary}\n\n_البوت مستمر في الرد ولم يتوقف._"
                 with httpx.Client() as c:
                     c.post(
                         f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages",
                         headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-                        json={
-                            "messaging_product": "whatsapp",
-                            "to": STAFF_NOTIFICATION_PHONE,
-                            "type": "text",
-                            "text": {"body": alert_body}
-                        },
+                        json={"messaging_product": "whatsapp", "to": STAFF_NOTIFICATION_PHONE, "type": "text", "text": {"body": alert_body}},
                         timeout=10.0
                     )
-                return "تم الإرسال للإدارة بنجاح. أخبري المريض بلطف واستمري في المحادثة."
+                return "تم الإرسال للإدارة بنجاح. أجيبي المريض بناءً على التعليمات فقط."
             except Exception as e:
                 print(f"Failed to notify staff: {e}")
-                return "تم تسجيل الطلب."
+                return "تم التنبيه."
 
         now_cairo = datetime.datetime.now(ZoneInfo("Africa/Cairo"))
         arabic_days = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
         today_day_name = arabic_days[now_cairo.weekday()]
         today_date = f"{now_cairo.strftime('%Y-%m-%d')} (اليوم هو: {today_day_name})"
 
+        # Fetch the live, editable instructions from the database
+        base_instruction = get_live_instructions()
+
+        # Combine live instructions with the current patient's context
         system_instruction = f"""
-        <role_definition>
-        أنتِ "نور"، موظفة استقبال ذكية ولطيفة في "عيادات جوثن" (Jothen Clinics).
-        مهمتك الوحيدة: خدمة عملاء فرع "مدينة نصر" فقط، وحجز مواعيد ليزر إزالة الشعر.
-        العميل الحالي: {profile['name'] or 'عميل جديد'} (رقم الهاتف: {sender_phone})
-        تاريخ اليوم: {today_date}
-        </role_definition>
+        {base_instruction}
 
-              <hard_constraints>
-        1. IF user asks about location -> REPLY EXACTLY: "عيادة 104، 8 ش الدكتور حسن الشريف، مدينة نصر" AND trigger send_clinic_media(['branches']). NEVER mention other locations.
-        2. IF user asks for phone number -> NEVER ask. You already know it is {sender_phone}.
-        
-        3. IF user asks routine laser prep or general FAQ questions (e.g., shaving/شيفنج, numbing cream, sun exposure, number of sessions, gaps, post-care, pain, cooling) -> ANSWER directly using <laser_faqs_and_prep>.
-           
-        4. IF user asks complex Medical Advice that is NOT in the FAQs (e.g., burns, pregnancy, specific medications), Doctors, Botox, Filler, Dermatology, or has a complaint -> TRIGGER notify_staff(issue_summary) IMMEDIATELY in the background.
-           - CRITICAL: DO NOT tell the patient that management or a doctor will contact them.
-           - INSTEAD, just politely apologize that your role is limited to laser bookings. (e.g., "عذراً يا فندم، أنا مسؤولة بس عن حجوزات ومواعيد الليزر ومقدرش أفيد حضرتك طبياً في النقطة دي، أقدر أساعدك في حجز موعد؟").
-           
-        5. IF user asks for a price NOT listed in <knowledge_base> -> TRIGGER notify_staff(issue_summary="استفسار عن سعر غير مسجل") in the background. 
-           - CRITICAL: DO NOT say you are checking with management.
-           - INSTEAD, politely state that you only have the standard packages available. (e.g., "عذراً يا فندم، دي كل باقات وعروض الليزر المتاحة عندي حالياً، تحبي أساعدك في حجز أي باقة منهم؟").
-           
-        6. IF user asks to book on Friday -> REJECT. Friday is a holiday.
-        7. IF user asks to book outside 12:00 PM to 10:00 PM -> REJECT. Request a valid time.
-        8. IF the user's message is ambiguous, confusing, or contains typos (e.g., "back 5") -> Politely ask the user to clarify what they mean.
-        </hard_constraints>
-
-
-        <knowledge_base>
-        <laser_faqs_and_prep>
-        - الشيفنج (Shaving): نعم يا فندم، لازم يتم إزالة الشعر بالشفرة (الشيفنج) في نفس يوم الجلسة أو قبلها بيوم، وممنوع تماماً استخدام السويت أو الشمع أو الفتلة.
-        - المخدر (Numbing Cream): متاح استخدام كريم مخدر قبل الجلسة بنصف أو ساعة للمناطق الحساسة.
-        - الشمس (Sun Exposure): يفضل عدم التعرض المباشر للشمس أو عمل تان (Tan) قبل وبعد الجلسة بأسبوعين.
-        - عدد الجلسات (Number of Sessions): في المتوسط بنحتاج من 6 لـ 8 جلسات، لكن العدد النهائي بيختلف من شخص للتاني حسب طبيعة الجسم وسمك الشعر.
-        - الفرق بين الجلسات (Time Between Sessions): الجلسات بتكون كل 3 لـ 4 أسابيع للوجه، وكل 4 لـ 6 أسابيع لباقي مناطق الجسم.
-        - العناية بعد الجلسة (Post-Care): بننصح باستخدام كريم مرطب طبي ومضاد حيوي بعد الجلسة مباشرة لتجنب أي التهاب، وممنوع تماماً استخدام أي عطور، مزيلات عرق، أو مقشرات على المنطقة لمدة 48 ساعة.
-        - الألم والتبريد (Pain / Cooling): أجهزتنا مزودة بأقوى نظام تبريد مزدوج بيخلي الجلسة مريحة جداً وبدون ألم، مجرد لسعة خفيفة جداً ومحتملة.
-        </laser_faqs_and_prep>
-
-        <prices_women>
-        - باقات النبضات: 1000 نبضة (800ج)، 2000 نبضة (1500ج)، 3000 نبضة (2000ج)، 5000 نبضة (3000ج)، 7000 نبضة (3500ج)، 10000 نبضة (5000ج).
-        - عرض: 4 جلسات أندر آرم أو بيكيني بخصم 10%.
-        - أندر آرم (150ج)، بيكيني+لاين (300ج)، بيكيني+أندر آرم+لاين (350ج).
-        - وجه (250ج)، وجه+ذقن (350ج)، وجه+رقبة (450ج).
-        - جسم كامل (2500ج)، جسم كامل بدون بطن وظهر (2000ج)، نصف جسم (1250ج).
-        - ACTION: Always append send_clinic_media(['women_packages', 'women_areas']) when quoting these.
-        </prices_women>
-
-        <prices_men>
-        - تحديد ذقن (300ج)، ذقن ورقبة (500ج)، ذقن ورقبة وفك (750ج)، وجه كامل (500ج).
-        - أندر آرم (400ج)، بوكسر (500ج)، بوكسر وأندر آرم وذقن (1000ج).
-        - عصعص (750ج)، جسم كامل (4000ج بدلاً من 5000ج).
-        - ACTION: Always append send_clinic_media(['men_offers']) when quoting these.
-        </prices_men>
-        </knowledge_base>
-
-        <booking_workflow>
-        STEP 1: Identify missing info (Name, Date, Time, Area).
-        STEP 2: Ask user for missing info politely.
-        STEP 3: Validate Time (12 PM - 10 PM) and Day (Not Friday).
-        STEP 4: Call check_schedule(date) to verify availability.
-        STEP 5: If available, call book_appointment(patient_name, phone_number, date, time, area).
-        </booking_workflow>
-
-        <tone_and_style>
-        - لهجة مصرية عامية راقية (يا فندم، من عيني، تحت أمرك).
-        - لا تكرري الترحيب في كل رسالة.
-        - استخدمي إيموجيز (🌸، ✨).
-        </tone_and_style>
+        === سياق العميل والمحادثة الحالية ===
+        - العميل الحالي: {profile['name'] or 'عميل جديد'}
+        - الملاحظات/التفضيلات: {profile['preferences'] or 'لا يوجد'}
+        - رقم هاتف العميل: {sender_phone}
+        - تاريخ اليوم: {today_date} بتوقيت القاهرة.
         """
 
         chat = client.chats.create(
