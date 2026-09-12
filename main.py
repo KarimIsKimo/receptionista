@@ -492,6 +492,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             <div class="tabs-container">
                 <button class="nav-tab active" id="tab-btn-chats" onclick="switchView('chats')">💬 المحادثات</button>
                 <button class="nav-tab" id="tab-btn-schedule" onclick="switchView('schedule')">📅 جدول جوجل شيت</button>
+                <button class="btn" id="lang-toggle-btn" style="border-radius: 20px; font-weight: bold;" onclick="toggleLanguage()">🌐 English</button>
             </div>
             <!-- ADDED: Global Bot Toggle Button -->
             <div style="display: flex; gap: 10px; align-items: center;">
@@ -588,15 +589,128 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
 
         <script>
             let allChats = [], allPatients = [], currentPhone = null, currentName = '', autoScroll = true, newestAtTop = false, currentIsPaused = false;
-            let isBotGloballyActive = true; // ADDED
+            let isBotGloballyActive = true;
+            let currentLang = localStorage.getItem('admin_lang') || 'ar';
             const messagesDiv = document.getElementById('messages');
-            
+
+            const i18n = {
+                ar: {
+                    dir: 'rtl',
+                    langBtn: '🌐 English',
+                    tabChats: '💬 المحادثات',
+                    tabSchedule: '📅 جدول جوجل شيت',
+                    btnSettings: '⚙️ إعدادات البوت والأسعار',
+                    botRunning: '🟢 البوت يعمل (إيقاف كلي)',
+                    botStopped: '🔴 البوت متوقف كلياً (تشغيل)',
+                    sidebarTitle: 'ملفات المرضى 📁',
+                    selectChatPrompt: 'اختر محادثة',
+                    btnRename: '✏️ تعديل اسم المريض',
+                    btnOrderDown: '⬇️ الأحدث بالأسفل',
+                    btnOrderUp: '⬆️ الأحدث بالأعلى',
+                    btnPause: '⏸️ إيقاف البوت (تدخل بشري)',
+                    btnResume: '▶️ تفعيل البوت (إنهاء التدخل البشري)',
+                    emptyChats: 'المحادثات الحية ستظهر هنا...',
+                    scheduleTitle: 'حجوزات العيادة 📅',
+                    slotBooked: '🔴 محجوزة',
+                    slotAvailable: '🟢 متاحة',
+                    btnCancelSlot: 'إلغاء الحجز',
+                    btnBookSlot: '+ حجز موعد',
+                    badgeHuman: '⏸️ تدخل بشري',
+                    newPatient: 'مريض جديد',
+                    noMessages: 'لا رسائل',
+                    promptRename: 'أدخل الاسم الصحيح للمريض:',
+                    confirmGlobalPause: 'هل أنت متأكد من إيقاف البوت بالكامل عن جميع المرضى؟',
+                    confirmGlobalResume: 'هل أنت متأكد من إعادة تفعيل البوت للرد تلقائياً؟',
+                    loadingSchedule: '⏳ جاري قراءة الحجوزات من جوجل شيت...',
+                    areaLabel: 'المنطقة:'
+                },
+                en: {
+                    dir: 'ltr',
+                    langBtn: '🌐 العربية',
+                    tabChats: '💬 Chats',
+                    tabSchedule: '📅 Appointments Grid',
+                    btnSettings: '⚙️ Bot & Pricing Settings',
+                    botRunning: '🟢 Bot Active (Global Stop)',
+                    botStopped: '🔴 Bot Paused Globally (Resume)',
+                    sidebarTitle: 'Patient Directory 📁',
+                    selectChatPrompt: 'Select a conversation',
+                    btnRename: '✏️ Rename Patient',
+                    btnOrderDown: '⬇️ Oldest First',
+                    btnOrderUp: '⬆️ Newest First',
+                    btnPause: '⏸️ Pause Bot (Human Takeover)',
+                    btnResume: '▶️ Resume Bot (Auto-Reply)',
+                    emptyChats: 'Live conversations will appear here...',
+                    scheduleTitle: 'Clinic Appointments 📅',
+                    slotBooked: '🔴 Booked',
+                    slotAvailable: '🟢 Available',
+                    btnCancelSlot: 'Cancel Booking',
+                    btnBookSlot: '+ Book Slot',
+                    badgeHuman: '⏸️ Human Takeover',
+                    newPatient: 'New Patient',
+                    noMessages: 'No messages',
+                    promptRename: 'Enter updated patient name:',
+                    confirmGlobalPause: 'Are you sure you want to pause the AI globally for all patients?',
+                    confirmGlobalResume: 'Are you sure you want to resume automated AI responses?',
+                    loadingSchedule: '⏳ Loading bookings from Google Sheets...',
+                    areaLabel: 'Area:'
+                }
+            };
+
+            function t(key) {
+                return (i18n[currentLang] && i18n[currentLang][key]) || (i18n.ar[key] || '');
+            }
+
+            function applyLanguage(lang) {
+                currentLang = lang;
+                localStorage.setItem('admin_lang', lang);
+                const dict = i18n[lang];
+
+                document.documentElement.setAttribute('lang', lang);
+                document.documentElement.setAttribute('dir', dict.dir);
+                document.body.style.direction = dict.dir;
+
+                const langBtn = document.getElementById('lang-toggle-btn');
+                if (langBtn) langBtn.innerText = dict.langBtn;
+
+                const tabChats = document.getElementById('tab-btn-chats');
+                if (tabChats) tabChats.innerText = dict.tabChats;
+
+                const tabSched = document.getElementById('tab-btn-schedule');
+                if (tabSched) tabSched.innerText = dict.tabSchedule;
+
+                const btnSettings = document.querySelector('.btn-settings');
+                if (btnSettings) btnSettings.innerText = dict.btnSettings;
+
+                const sidebarH = document.querySelector('.sidebar-header');
+                if (sidebarH) sidebarH.innerText = dict.sidebarTitle;
+
+                const renameBtn = document.querySelector('button[onclick="renameCurrentPatient()"]');
+                if (renameBtn) renameBtn.innerText = dict.btnRename;
+
+                const orderBtn = document.getElementById('order-toggle-btn');
+                if (orderBtn) orderBtn.innerText = newestAtTop ? dict.btnOrderUp : dict.btnOrderDown;
+
+                const schedHeader = document.querySelector('.schedule-header h2');
+                if (schedHeader) schedHeader.innerText = dict.scheduleTitle;
+
+                updateGlobalBotButton();
+                updatePauseButton();
+                renderPatientList();
+                if (document.getElementById('view-schedule').style.display !== 'none') {
+                    loadSchedule();
+                }
+            }
+
+            function toggleLanguage() {
+                applyLanguage(currentLang === 'ar' ? 'en' : 'ar');
+            }
+
             function switchView(viewName) {
                 document.getElementById('view-chats').style.display = viewName === 'chats' ? 'flex' : 'none';
                 document.getElementById('view-schedule').style.display = viewName === 'schedule' ? 'flex' : 'none';
                 document.getElementById('tab-btn-chats').className = viewName === 'chats' ? 'nav-tab active' : 'nav-tab';
                 document.getElementById('tab-btn-schedule').className = viewName === 'schedule' ? 'nav-tab active' : 'nav-tab';
-                
+
                 if (viewName === 'schedule') {
                     const dp = document.getElementById('schedule-date-picker');
                     if (!dp.value) {
@@ -609,7 +723,6 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 }
             }
 
-            // --- ADDED: GLOBAL BOT JS LOGIC ---
             async function checkGlobalBotStatus() {
                 try {
                     const res = await fetch('/admin/api/bot_status');
@@ -626,19 +739,19 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                     btn.style.background = '#e8f5e9';
                     btn.style.color = '#2e7d32';
                     btn.style.borderColor = '#a5d6a7';
-                    btn.innerHTML = '🟢 البوت يعمل (إيقاف كلي)';
+                    btn.innerHTML = t('botRunning');
                 } else {
                     btn.style.background = '#ffebee';
                     btn.style.color = '#c62828';
                     btn.style.borderColor = '#ef9a9a';
-                    btn.innerHTML = '🔴 البوت متوقف كلياً (تشغيل)';
+                    btn.innerHTML = t('botStopped');
                 }
             }
 
             async function toggleGlobalBot() {
-                const action = isBotGloballyActive ? 'إيقاف البوت بالكامل عن جميع المرضى' : 'إعادة تفعيل البوت للرد تلقائياً';
-                if (!confirm(`هل أنت متأكد من ${action}؟`)) return;
-                
+                const actionPrompt = isBotGloballyActive ? t('confirmGlobalPause') : t('confirmGlobalResume');
+                if (!confirm(actionPrompt)) return;
+
                 const nextState = !isBotGloballyActive;
                 await fetch('/admin/api/toggle_global_bot', {
                     method: 'POST',
@@ -648,13 +761,12 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 isBotGloballyActive = nextState;
                 updateGlobalBotButton();
             }
-            // ----------------------------------
 
             const CLINIC_TIMES = ["12:00 PM", "12:30 PM", "01:00 PM", "01:30 PM", "02:00 PM", "02:30 PM", "03:00 PM", "03:30 PM", "04:00 PM", "04:30 PM", "05:00 PM", "05:30 PM", "06:00 PM", "06:30 PM", "07:00 PM", "07:30 PM", "08:00 PM", "08:30 PM", "09:00 PM", "09:30 PM", "10:00 PM"];
 
-            function normalizeTimeJS(t) {
-                if (!t) return "";
-                let clean = String(t).toUpperCase().replace(/[^A-Z0-9:]/g, ''); 
+            function normalizeTimeJS(tStr) {
+                if (!tStr) return "";
+                let clean = String(tStr).toUpperCase().replace(/[^A-Z0-9:]/g, '');
                 if (clean.startsWith("0")) return clean.substring(1);
                 return clean;
             }
@@ -662,25 +774,25 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             async function loadSchedule() {
                 const date = document.getElementById('schedule-date-picker').value;
                 const slotsDiv = document.getElementById('schedule-slots');
-                slotsDiv.innerHTML = '<div class="empty-state">⏳ جاري قراءة الحجوزات من جوجل شيت...</div>';
-                
+                slotsDiv.innerHTML = `<div class="empty-state">${t('loadingSchedule')}</div>`;
+
                 try {
                     const res = await fetch(`/admin/api/schedule?date=${date}`);
                     const data = await res.json();
-                    
+
                     if (data.error) {
-                        slotsDiv.innerHTML = `<div class="empty-state" style="color:#cf1322;">❌ خطأ من جوجل شيت: ${data.error}</div>`;
+                        slotsDiv.innerHTML = `<div class="empty-state" style="color:#cf1322;">❌ ${data.error}</div>`;
                         return;
                     }
-                    
+
                     let bookedSlots = {};
                     if (data.booked && Array.isArray(data.booked)) {
                         data.booked.forEach(b => {
                             if (typeof b === 'string') {
-                                bookedSlots[normalizeTimeJS(b)] = { name: "غير مسجل", phone: "", area: "" };
+                                bookedSlots[normalizeTimeJS(b)] = { name: t('newPatient'), phone: "", area: "" };
                             } else {
                                 bookedSlots[normalizeTimeJS(b.time)] = {
-                                    name: b.name || "غير مسجل",
+                                    name: b.name || t('newPatient'),
                                     phone: b.phone || "",
                                     area: b.area || ""
                                 };
@@ -689,50 +801,53 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                     }
 
                     slotsDiv.innerHTML = '';
-                    CLINIC_TIMES.forEach(t => {
-                        const normalizedClinicTime = normalizeTimeJS(t);
+                    CLINIC_TIMES.forEach(timeSlot => {
+                        const normalizedClinicTime = normalizeTimeJS(timeSlot);
                         const bookingData = bookedSlots[normalizedClinicTime];
                         const isBooked = !!bookingData;
-                        
+
                         const slotDiv = document.createElement('div');
                         slotDiv.className = 'slot-row';
                         slotDiv.style.background = isBooked ? '#fff1f0' : '#f6ffed';
                         slotDiv.style.borderColor = isBooked ? '#ffa39e' : '#b7eb8f';
-                        
+
                         if (isBooked) {
                             slotDiv.innerHTML = `
                                 <div class="slot-top">
-                                    <span class="slot-badge" style="color:#cf1322; background:#fff; border-color:#ffa39e;">🔴 محجوزة</span>
-                                    <div class="slot-time" style="color: #cf1322;">${t}</div>
+                                    <span class="slot-badge" style="color:#cf1322; background:#fff; border-color:#ffa39e;">${t('slotBooked')}</span>
+                                    <div class="slot-time" style="color: #cf1322;">${timeSlot}</div>
                                 </div>
                                 <div style="font-size:13.5px; color:#54656f; font-weight:600; line-height: 1.6; margin-bottom: 16px; flex-grow: 1;">
                                     👤 <span style="color:#111b21;">${bookingData.name}</span> <br>
                                     📞 <span dir="ltr" style="color:#111b21;">${bookingData.phone}</span> <br>
-                                    🎯 المنطقة: <span style="color:#111b21;">${bookingData.area}</span>
+                                    🎯 ${t('areaLabel')} <span style="color:#111b21;">${bookingData.area}</span>
                                 </div>
-                                <button onclick="promptCancel('${date}', '${t}', '${bookingData.phone}')" style="background:#ff4d4f; color:#fff; border:none; padding:10px; border-radius:8px; cursor:pointer; font-weight:bold; transition: 0.2s; width:100%;">إلغاء الحجز</button>
+                                <button onclick="promptCancel('${date}', '${timeSlot}', '${bookingData.phone}')" style="background:#ff4d4f; color:#fff; border:none; padding:10px; border-radius:8px; cursor:pointer; font-weight:bold; width:100%;">${t('btnCancelSlot')}</button>
                             `;
                         } else {
                             slotDiv.innerHTML = `
                                 <div class="slot-top" style="margin-bottom:0;">
-                                    <span class="slot-badge" style="color:#389e0d; border-color:transparent;">🟢 متاحة</span>
-                                    <div class="slot-time" style="color: #389e0d;">${t}</div>
+                                    <span class="slot-badge" style="color:#389e0d; border-color:transparent;">${t('slotAvailable')}</span>
+                                    <div class="slot-time" style="color: #389e0d;">${timeSlot}</div>
                                 </div>
                                 <div style="flex-grow: 1;"></div>
-                                <button onclick="openBookingModal('${date}', '${t}')" style="background:#52c41a; color:#fff; border:none; padding:10px; border-radius:8px; cursor:pointer; font-weight:bold; transition: 0.2s; width:100%; margin-top:16px;">+ حجز موعد</button>
+                                <button onclick="openBookingModal('${date}', '${timeSlot}')" style="background:#52c41a; color:#fff; border:none; padding:10px; border-radius:8px; cursor:pointer; font-weight:bold; width:100%; margin-top:16px;">${t('btnBookSlot')}</button>
                             `;
                         }
                         slotsDiv.appendChild(slotDiv);
                     });
                 } catch (e) {
-                    slotsDiv.innerHTML = '<div class="empty-state" style="color:#cf1322;">❌ حدث خطأ في الاتصال بجوجل شيت. يرجى المحاولة لاحقاً.</div>';
+                    slotsDiv.innerHTML = '<div class="empty-state" style="color:#cf1322;">❌ Connection Error</div>';
                 }
             }
 
-            async function promptCancel(date, time, currentPhoneHint) {
-                const phone = prompt(`أنت على وشك إلغاء حجز الساعة ${time} يوم ${date}.\n\nالرجاء إدخال رقم هاتف المريض لتأكيد الإلغاء:`, currentPhoneHint || "");
+            async function promptCancel(date, timeSlot, currentPhoneHint) {
+                const promptMsg = currentLang === 'ar'
+                    ? `أنت على وشك إلغاء حجز الساعة ${timeSlot} يوم ${date}.\n\nالرجاء إدخال رقم هاتف المريض لتأكيد الإلغاء:`
+                    : `You are about to cancel booking for ${timeSlot} on ${date}.\n\nEnter patient phone to confirm:`;
+                const phone = prompt(promptMsg, currentPhoneHint || "");
                 if (!phone) return;
-                
+
                 const res = await fetch('/admin/api/cancel', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -743,9 +858,9 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 loadSchedule();
             }
 
-            function openBookingModal(date, time) {
+            function openBookingModal(date, timeSlot) {
                 document.getElementById('book-date').value = date;
-                document.getElementById('book-time').value = time;
+                document.getElementById('book-time').value = timeSlot;
                 document.getElementById('book-name').value = '';
                 document.getElementById('book-phone').value = '';
                 document.getElementById('booking-modal').style.display = 'flex';
@@ -757,29 +872,25 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 const phone = document.getElementById('book-phone').value;
                 const area = document.getElementById('book-area').value;
                 const date = document.getElementById('book-date').value;
-                const time = document.getElementById('book-time').value;
+                const timeSlot = document.getElementById('book-time').value;
 
-                if(!name || !phone) return alert('الرجاء إدخال اسم المريض ورقم الهاتف');
+                if (!name || !phone) return alert(currentLang === 'ar' ? 'الرجاء إدخال اسم المريض ورقم الهاتف' : 'Please enter name and phone number');
 
                 const btn = document.getElementById('submit-booking-btn');
-                btn.innerText = 'جاري الحفظ في جوجل شيت...';
+                btn.innerText = '...';
 
                 const res = await fetch('/admin/api/book', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ patient_name: name, phone_number: phone, date: date, time: time, area: area })
+                    body: JSON.stringify({ patient_name: name, phone_number: phone, date: date, time: timeSlot, area: area })
                 });
                 const data = await res.json();
                 alert(data.status);
-                
                 closeBookingModal();
-                btn.innerText = 'تأكيد الحجز';
+                btn.innerText = t('btnBookSlot');
                 loadSchedule();
             }
 
-            // ==========================================
-            // CHATS & SETTINGS LOGIC
-            // ==========================================
             messagesDiv.addEventListener('scroll', () => {
                 if (!newestAtTop) autoScroll = (messagesDiv.scrollHeight - messagesDiv.scrollTop <= messagesDiv.clientHeight + 60);
             });
@@ -789,7 +900,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 const d = new Date(isoString);
                 if (isNaN(d.getTime())) return '';
                 let hours = d.getHours();
-                const ampm = hours >= 12 ? 'م' : 'ص';
+                const ampm = currentLang === 'ar' ? (hours >= 12 ? 'م' : 'ص') : (hours >= 12 ? 'PM' : 'AM');
                 hours = hours % 12 || 12;
                 const timeStr = `${hours}:${d.getMinutes().toString().padStart(2, '0')} ${ampm}`;
                 return d.toDateString() === new Date().toDateString() ? timeStr : `${d.getMonth() + 1}/${d.getDate()} ${timeStr}`;
@@ -797,12 +908,12 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
 
             function toggleOrder() {
                 newestAtTop = !newestAtTop;
-                document.getElementById('order-toggle-btn').innerHTML = newestAtTop ? '⬆️ الأحدث بالأعلى' : '⬇️ الأحدث بالأسفل';
+                document.getElementById('order-toggle-btn').innerHTML = newestAtTop ? t('btnOrderUp') : t('btnOrderDown');
                 renderActiveChat();
             }
 
             async function togglePause() {
-                if(!currentPhone) return;
+                if (!currentPhone) return;
                 currentIsPaused = !currentIsPaused;
                 await fetch('/admin/api/toggle_pause', {
                     method: 'POST',
@@ -815,9 +926,9 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
 
             async function renameCurrentPatient() {
                 if (!currentPhone) return;
-                const newName = prompt("أدخل الاسم الصحيح للمريض:", currentName === 'مريض جديد' ? '' : currentName);
+                const newName = prompt(t('promptRename'), currentName === t('newPatient') ? '' : currentName);
                 if (!newName || !newName.trim()) return;
-                
+
                 await fetch('/admin/api/rename_patient', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -830,15 +941,16 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
 
             function updatePauseButton() {
                 const btn = document.getElementById('pause-btn');
-                if(currentIsPaused) {
+                if (!btn) return;
+                if (currentIsPaused) {
                     btn.className = 'btn btn-resume';
-                    btn.innerHTML = '▶️ تفعيل البوت (إنهاء التدخل البشري)';
+                    btn.innerHTML = t('btnResume');
                 } else {
                     btn.className = 'btn btn-pause';
-                    btn.innerHTML = '⏸️ إيقاف البوت (تدخل بشري)';
+                    btn.innerHTML = t('btnPause');
                 }
             }
-            
+
             async function openSettingsModal() {
                 const res = await fetch('/admin/api/settings');
                 const data = await res.json();
@@ -850,15 +962,48 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
 
             async function saveSettings() {
                 const btn = document.getElementById('save-settings-btn');
-                btn.innerText = 'جاري الحفظ...';
+                btn.innerText = '...';
                 const val = document.getElementById('instruction-textarea').value;
                 await fetch('/admin/api/settings', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({instruction: val})
                 });
-                btn.innerText = '💾 تم الحفظ بنجاح!';
-                setTimeout(() => { btn.innerText = '💾 حفظ التعديلات فوراً'; closeSettingsModal(); }, 1200);
+                btn.innerText = '✔️ Saved';
+                setTimeout(() => { btn.innerText = '💾 Save Settings'; closeSettingsModal(); }, 1200);
+            }
+
+            function renderPatientList() {
+                const pList = document.getElementById('patient-list');
+                if (!pList) return;
+                pList.innerHTML = '';
+
+                allPatients.forEach(p => {
+                    const div = document.createElement('div');
+                    div.className = 'patient-card' + (currentPhone === p.phone_number ? ' active' : '');
+                    const patientMsgs = allChats.filter(c => c.phone_number === p.phone_number);
+                    const lastMsg = patientMsgs.length > 0 ? patientMsgs[patientMsgs.length - 1].content : '';
+
+                    div.innerHTML = `
+                        <div class="p-header-row">
+                            <span class="p-name">${p.name || t('newPatient')}</span>
+                            <span class="p-time">${formatTime(p.last_msg_time)}</span>
+                        </div>
+                        <div class="p-last-msg">${lastMsg ? (lastMsg.length > 40 ? lastMsg.substring(0,40)+'...' : lastMsg) : t('noMessages')}</div>
+                        <div class="p-phone">${p.phone_number}</div>
+                        <div class="p-badges">
+                            ${p.is_paused ? `<span class="badge badge-human">${t('badgeHuman')}</span>` : ''}
+                            ${p.preferences ? `<span style="color:#008069; font-size:11px;">📌 ${p.preferences.replace(/ \| /g, ' • ')}</span>` : ''}
+                        </div>
+                    `;
+                    div.onclick = () => showChat(p.phone_number, p.name || t('newPatient'), p.is_paused);
+                    pList.appendChild(div);
+
+                    if (currentPhone === p.phone_number) {
+                        currentIsPaused = p.is_paused;
+                        currentName = p.name || t('newPatient');
+                    }
+                });
             }
 
             async function loadData() {
@@ -867,44 +1012,14 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                     const data = await res.json();
                     allChats = data.chats || [];
                     allPatients = data.patients || [];
-                    
-                    const pList = document.getElementById('patient-list');
-                    pList.innerHTML = '';
-                    
-                    allPatients.forEach(p => {
-                        const div = document.createElement('div');
-                        div.className = 'patient-card' + (currentPhone === p.phone_number ? ' active' : '');
-                        const patientMsgs = allChats.filter(c => c.phone_number === p.phone_number);
-                        const lastMsg = patientMsgs.length > 0 ? patientMsgs[patientMsgs.length - 1].content : '';
-                        
-                        div.innerHTML = `
-                            <div class="p-header-row">
-                                <span class="p-name">${p.name || 'مريض جديد'}</span>
-                                <span class="p-time">${formatTime(p.last_msg_time)}</span>
-                            </div>
-                            <div class="p-last-msg">${lastMsg ? (lastMsg.length > 40 ? lastMsg.substring(0,40)+'...' : lastMsg) : 'لا رسائل'}</div>
-                            <div class="p-phone">${p.phone_number}</div>
-                            <div class="p-badges">
-                                ${p.is_paused ? '<span class="badge badge-human">⏸️ تدخل بشري</span>' : ''}
-                                ${p.preferences ? `<span style="color:#008069; font-size:11px;">📌 ${p.preferences.replace(/ \| /g, ' • ')}</span>` : ''}
-                            </div>
-                        `;
-                        div.onclick = () => showChat(p.phone_number, p.name || 'مريض جديد', p.is_paused);
-                        pList.appendChild(div);
-                        if(currentPhone === p.phone_number) {
-                            currentIsPaused = p.is_paused;
-                            currentName = p.name || 'مريض جديد';
-                        }
-                    });
-                    
+
+                    renderPatientList();
+
                     if (currentPhone) {
                         updatePauseButton();
                         renderActiveChat();
                     }
-                    
-                    // --- ADDED: Check global status loop ---
                     checkGlobalBotStatus();
-                    
                 } catch (err) {}
             }
 
@@ -918,7 +1033,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 autoScroll = true;
                 renderActiveChat();
             }
-            
+
             function renderActiveChat() {
                 if (!currentPhone) return;
                 messagesDiv.innerHTML = '';
@@ -931,12 +1046,17 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                     div.innerHTML = `<div class="msg-text">${c.content.replace(/\\n/g, '<br>')}</div><div class="msg-meta">${formatTime(c.created_at)}</div>`;
                     messagesDiv.appendChild(div);
                 });
-                
+
                 if (!newestAtTop && autoScroll) messagesDiv.scrollTop = messagesDiv.scrollHeight;
                 else if (newestAtTop) messagesDiv.scrollTop = 0;
             }
 
-            loadData(); setInterval(loadData, 5000);
+            // Initialization
+            window.addEventListener('DOMContentLoaded', () => {
+                applyLanguage(currentLang);
+                loadData();
+                setInterval(loadData, 5000);
+            });
         </script>
     </body>
     </html>
