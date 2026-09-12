@@ -109,7 +109,7 @@ DEFAULT_SYSTEM_INSTRUCTION = """<role_definition>
 
 <booking_workflow>
 STEP 1: Identify missing info (Name, Date, Time, Area).
-STEP 2: Ask user for missing info politely.
+STEP 2: When patient gives their Name, IMMEDIATELY call update_patient_file(phone_number, name, preferences="").
 STEP 3: Validate Time (12 PM - 10 PM) and Day (Not Friday).
 STEP 4: Call check_schedule(date) to verify availability.
 STEP 5: If available, call book_appointment(patient_name, phone_number, date, time, area).
@@ -267,6 +267,13 @@ def cancel_appointment(phone_number: str, date: str) -> str:
 
 def book_appointment(patient_name: str, phone_number: str, date: str, time: str, area: str) -> str:
     standard_time = normalize_to_ampm(time)
+    
+    # Save patient name and booking note in Postgres
+    try:
+        update_patient_file(phone_number, patient_name, f"حجز {area} ({date} {standard_time})")
+    except Exception as e:
+        print(f"Error updating postgres on booking: {e}")
+
     try:
         with httpx.Client(follow_redirects=True) as http_client:
             payload = {"action": "book", "patient_name": patient_name, "phone_number": phone_number, "branch": "مدينة نصر", "date": date, "time": standard_time, "area": area}
@@ -288,6 +295,7 @@ class PauseRequest(BaseModel): phone_number: str; is_paused: bool
 class SettingsUpdate(BaseModel): instruction: str
 class BookReq(BaseModel): patient_name: str; phone_number: str; date: str; time: str; area: str
 class CancelReq(BaseModel): phone_number: str; date: str
+class RenamePatientReq(BaseModel): phone_number: str; name: str
 
 @app.post("/admin/api/toggle_pause")
 def toggle_pause(req: PauseRequest, admin: str = Depends(verify_admin)):
@@ -298,6 +306,11 @@ def toggle_pause(req: PauseRequest, admin: str = Depends(verify_admin)):
                 conn.commit()
         return {"status": "success"}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/admin/api/rename_patient")
+def api_rename_patient(req: RenamePatientReq, admin: str = Depends(verify_admin)):
+    update_patient_file(req.phone_number, name=req.name)
+    return {"status": "success"}
 
 @app.get("/admin/api/settings")
 def get_settings(admin: str = Depends(verify_admin)):
@@ -405,16 +418,14 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             .msg.model { background: #d9fdd3; align-self: flex-end; border-top-left-radius: 0; }
             .msg-meta { font-size: 10.5px; color: #667781; text-align: left; direction: ltr; margin-top: 3px; }
             
-            /* SCHEDULE VIEW - UPDATED FOR GRID LAYOUT */
+            /* SCHEDULE VIEW - GRID LAYOUT */
             #view-schedule { display: none; height: calc(100vh - 60px); width: 100%; background: #efeae2; padding: 30px; overflow-y: auto; }
             .schedule-container { background: #fff; border-radius: 12px; padding: 24px; width: 100%; max-width: 1400px; margin: 0 auto; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
             .schedule-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 2px solid #f0f2f5; }
             .schedule-header h2 { margin: 0; color: #111b21; font-size: 20px; }
             .date-picker { padding: 10px 15px; border: 1px solid #d1d7db; border-radius: 8px; font-size: 15px; font-family: inherit; outline: none; color: #111b21; cursor: pointer; }
             
-            /* GRID MAGIC HERE */
             #schedule-slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
-            
             .slot-row { display: flex; flex-direction: column; padding: 16px; border-radius: 10px; border: 1px solid #d1d7db; transition: transform 0.1s; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
             .slot-row:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.08); }
             .slot-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
@@ -431,7 +442,6 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
         </style>
     </head>
     <body>
-        <!-- Top Navigation -->
         <div class="top-nav">
             <div class="tabs-container">
                 <button class="nav-tab active" id="tab-btn-chats" onclick="switchView('chats')">💬 المحادثات</button>
@@ -452,6 +462,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                         <strong style="color: #54656f;">اختر محادثة</strong>
                     </div>
                     <div class="controls" id="chat-controls" style="display:none;">
+                        <button class="btn" onclick="renameCurrentPatient()">✏️ تعديل اسم المريض</button>
                         <button class="btn" id="order-toggle-btn" onclick="toggleOrder()">⬇️ الأحدث بالأسفل</button>
                         <button class="btn" id="pause-btn" onclick="togglePause()"></button>
                     </div>
@@ -467,13 +478,11 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                     <h2>حجوزات العيادة 📅</h2>
                     <input type="date" id="schedule-date-picker" class="date-picker" onchange="loadSchedule()">
                 </div>
-                <div id="schedule-slots">
-                    <!-- Populated by JS -->
-                </div>
+                <div id="schedule-slots"></div>
             </div>
         </div>
         
-        <!-- Booking Form Modal -->
+        <!-- Booking Modal -->
         <div id="booking-modal" class="modal-overlay">
             <div class="modal-content" style="width: 400px; max-width: 90%;">
                 <h3 style="margin-top:0;">إضافة حجز جديد</h3>
@@ -511,7 +520,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             </div>
         </div>
 
-        <!-- Settings Form Modal -->
+        <!-- Settings Modal -->
         <div id="settings-modal" class="modal-overlay">
             <div class="modal-content" style="width:800px; max-width:90%; height:85vh; display:flex; flex-direction:column;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
@@ -528,7 +537,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
         </div>
 
         <script>
-            let allChats = [], allPatients = [], currentPhone = null, autoScroll = true, newestAtTop = false, currentIsPaused = false;
+            let allChats = [], allPatients = [], currentPhone = null, currentName = '', autoScroll = true, newestAtTop = false, currentIsPaused = false;
             const messagesDiv = document.getElementById('messages');
             
             function switchView(viewName) {
@@ -549,9 +558,6 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 }
             }
 
-            // ==========================================
-            // SCHEDULE & GOOGLE SHEETS LOGIC
-            // ==========================================
             const CLINIC_TIMES = ["12:00 PM", "12:30 PM", "01:00 PM", "01:30 PM", "02:00 PM", "02:30 PM", "03:00 PM", "03:30 PM", "04:00 PM", "04:30 PM", "05:00 PM", "05:30 PM", "06:00 PM", "06:30 PM", "07:00 PM", "07:30 PM", "08:00 PM", "08:30 PM", "09:00 PM", "09:30 PM", "10:00 PM"];
 
             function normalizeTimeJS(t) {
@@ -715,6 +721,21 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 loadData();
             }
 
+            async function renameCurrentPatient() {
+                if (!currentPhone) return;
+                const newName = prompt("أدخل الاسم الصحيح للمريض:", currentName === 'مريض جديد' ? '' : currentName);
+                if (!newName || !newName.trim()) return;
+                
+                await fetch('/admin/api/rename_patient', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({phone_number: currentPhone, name: newName.trim()})
+                });
+                currentName = newName.trim();
+                document.getElementById('chat-header-info').innerHTML = `<strong>${currentName}</strong><span style="font-size: 13px; color: #667781;" dir="ltr">${currentPhone}</span>`;
+                loadData();
+            }
+
             function updatePauseButton() {
                 const btn = document.getElementById('pause-btn');
                 if(currentIsPaused) {
@@ -778,7 +799,10 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                         `;
                         div.onclick = () => showChat(p.phone_number, p.name || 'مريض جديد', p.is_paused);
                         pList.appendChild(div);
-                        if(currentPhone === p.phone_number) currentIsPaused = p.is_paused;
+                        if(currentPhone === p.phone_number) {
+                            currentIsPaused = p.is_paused;
+                            currentName = p.name || 'مريض جديد';
+                        }
                     });
                     
                     if (currentPhone) {
@@ -790,6 +814,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
 
             function showChat(phone, name, isPaused) {
                 currentPhone = phone;
+                currentName = name;
                 currentIsPaused = isPaused;
                 document.getElementById('chat-header-info').innerHTML = `<strong>${name}</strong><span style="font-size: 13px; color: #667781;" dir="ltr">${phone}</span>`;
                 document.getElementById('chat-controls').style.display = 'flex';
