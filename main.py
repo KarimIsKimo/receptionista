@@ -157,6 +157,35 @@ def save_live_instructions(new_content: str) -> bool:
         print(f"Error saving instructions: {e}")
         return False
 
+# --- ADDED: MASTER SWITCH DATABASE LOGIC ---
+def is_bot_globally_active() -> bool:
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT content FROM clinic_settings WHERE key = 'bot_globally_active'")
+                row = cursor.fetchone()
+                if row and row[0].strip() == "false":
+                    return False
+    except Exception as e:
+        print(f"Error checking global bot status: {e}")
+    return True
+
+def set_bot_globally_active(active: bool) -> bool:
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO clinic_settings (key, content, updated_at)
+                    VALUES ('bot_globally_active', %s, NOW())
+                    ON CONFLICT (key) DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
+                """, ("true" if active else "false",))
+                conn.commit()
+                return True
+    except Exception as e:
+        print(f"Error setting global bot status: {e}")
+        return False
+# ------------------------------------------
+
 def is_duplicate_message(message_id: str) -> bool:
     try:
         with get_db_connection() as conn:
@@ -297,6 +326,11 @@ class BookReq(BaseModel): patient_name: str; phone_number: str; date: str; time:
 class CancelReq(BaseModel): phone_number: str; date: str
 class RenamePatientReq(BaseModel): phone_number: str; name: str
 
+# --- ADDED: GLOBAL BOT SCHEMA ---
+class GlobalBotReq(BaseModel):
+    is_active: bool
+# --------------------------------
+
 @app.post("/admin/api/toggle_pause")
 def toggle_pause(req: PauseRequest, admin: str = Depends(verify_admin)):
     try:
@@ -320,6 +354,18 @@ def get_settings(admin: str = Depends(verify_admin)):
 def update_settings(data: SettingsUpdate, admin: str = Depends(verify_admin)):
     if not save_live_instructions(data.instruction): raise HTTPException(status_code=500, detail="Failed to save settings")
     return {"status": "success"}
+
+# --- ADDED: GLOBAL BOT ROUTES ---
+@app.get("/admin/api/bot_status")
+def api_get_bot_status(admin: str = Depends(verify_admin)):
+    return {"is_active": is_bot_globally_active()}
+
+@app.post("/admin/api/toggle_global_bot")
+def api_toggle_global_bot(req: GlobalBotReq, admin: str = Depends(verify_admin)):
+    if not set_bot_globally_active(req.is_active):
+        raise HTTPException(status_code=500, detail="Failed to update bot status")
+    return {"status": "success", "is_active": req.is_active}
+# --------------------------------
 
 @app.get("/admin/api/schedule")
 def api_get_schedule(date: str, admin: str = Depends(verify_admin)):
@@ -447,7 +493,11 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 <button class="nav-tab active" id="tab-btn-chats" onclick="switchView('chats')">💬 المحادثات</button>
                 <button class="nav-tab" id="tab-btn-schedule" onclick="switchView('schedule')">📅 جدول جوجل شيت</button>
             </div>
-            <button class="btn btn-settings" onclick="openSettingsModal()">⚙️ إعدادات البوت والأسعار</button>
+            <!-- ADDED: Global Bot Toggle Button -->
+            <div style="display: flex; gap: 10px; align-items: center;">
+                <button id="global-bot-btn" class="btn" style="border-radius: 20px; padding: 6px 16px; font-size: 13px;" onclick="toggleGlobalBot()"></button>
+                <button class="btn btn-settings" onclick="openSettingsModal()">⚙️ إعدادات البوت والأسعار</button>
+            </div>
         </div>
 
         <!-- 1. CHATS VIEW -->
@@ -538,6 +588,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
 
         <script>
             let allChats = [], allPatients = [], currentPhone = null, currentName = '', autoScroll = true, newestAtTop = false, currentIsPaused = false;
+            let isBotGloballyActive = true; // ADDED
             const messagesDiv = document.getElementById('messages');
             
             function switchView(viewName) {
@@ -557,6 +608,47 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                     loadSchedule();
                 }
             }
+
+            // --- ADDED: GLOBAL BOT JS LOGIC ---
+            async function checkGlobalBotStatus() {
+                try {
+                    const res = await fetch('/admin/api/bot_status');
+                    const data = await res.json();
+                    isBotGloballyActive = data.is_active;
+                    updateGlobalBotButton();
+                } catch(e) {}
+            }
+
+            function updateGlobalBotButton() {
+                const btn = document.getElementById('global-bot-btn');
+                if (!btn) return;
+                if (isBotGloballyActive) {
+                    btn.style.background = '#e8f5e9';
+                    btn.style.color = '#2e7d32';
+                    btn.style.borderColor = '#a5d6a7';
+                    btn.innerHTML = '🟢 البوت يعمل (إيقاف كلي)';
+                } else {
+                    btn.style.background = '#ffebee';
+                    btn.style.color = '#c62828';
+                    btn.style.borderColor = '#ef9a9a';
+                    btn.innerHTML = '🔴 البوت متوقف كلياً (تشغيل)';
+                }
+            }
+
+            async function toggleGlobalBot() {
+                const action = isBotGloballyActive ? 'إيقاف البوت بالكامل عن جميع المرضى' : 'إعادة تفعيل البوت للرد تلقائياً';
+                if (!confirm(`هل أنت متأكد من ${action}؟`)) return;
+                
+                const nextState = !isBotGloballyActive;
+                await fetch('/admin/api/toggle_global_bot', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({is_active: nextState})
+                });
+                isBotGloballyActive = nextState;
+                updateGlobalBotButton();
+            }
+            // ----------------------------------
 
             const CLINIC_TIMES = ["12:00 PM", "12:30 PM", "01:00 PM", "01:30 PM", "02:00 PM", "02:30 PM", "03:00 PM", "03:30 PM", "04:00 PM", "04:30 PM", "05:00 PM", "05:30 PM", "06:00 PM", "06:30 PM", "07:00 PM", "07:30 PM", "08:00 PM", "08:30 PM", "09:00 PM", "09:30 PM", "10:00 PM"];
 
@@ -809,6 +901,10 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                         updatePauseButton();
                         renderActiveChat();
                     }
+                    
+                    // --- ADDED: Check global status loop ---
+                    checkGlobalBotStatus();
+                    
                 } catch (err) {}
             }
 
@@ -887,6 +983,12 @@ async def handle_ai_conversation(sender_phone: str, user_text: str, phone_number
     async with user_locks[sender_phone]:
         save_chat_turn(sender_phone, "user", user_text)
         
+        # --- ADDED: Global Kill-Switch Check ---
+        if not is_bot_globally_active():
+            print("🛑 Bot is GLOBALLY STOPPED by admin. Human takes over all chats.")
+            return
+        # ---------------------------------------
+
         profile = load_patient_profile(sender_phone)
         if profile.get("is_paused"):
             print(f"🛑 Chat with {sender_phone} is manually paused by admin. Human takes over.")
