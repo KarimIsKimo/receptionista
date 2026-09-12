@@ -40,7 +40,7 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "jothen123")
 
 BLOCKED_NUMBERS = ["01142286600", "201142286600"]
-STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201026438897")
+STAFF_NOTIFICATION_PHONE = os.getenv("STAFF_NOTIFICATION_PHONE", "201022227818")
 
 OFFER_IMAGES = {
     "branches": {"url": f"{BASE_URL}/images/branches.jpg", "caption": "فروعنا وأماكن تواجدنا 📍"},
@@ -238,7 +238,14 @@ def check_schedule(date: str) -> str:
         with httpx.Client(follow_redirects=True) as http_client:
             res = http_client.get(f"{GOOGLE_SHEET_URL}?date={date}", timeout=15.0).json()
             if "booked" in res and not res["booked"]: return f"يوم {date} متاح بالكامل."
-            if "booked" in res: return f"المواعيد المحجوزة مسبقاً يوم {date} هي: {', '.join(res['booked'])}"
+            
+            if "booked" in res:
+                # Updated to handle the new detailed object format from Google Apps Script
+                if len(res["booked"]) > 0 and isinstance(res["booked"][0], dict):
+                    booked_times = [b.get("time", "") for b in res["booked"]]
+                else:
+                    booked_times = res["booked"]
+                return f"المواعيد المحجوزة مسبقاً يوم {date} هي: {', '.join(booked_times)}"
             return "حدث خطأ في قراءة الجدول."
     except Exception: return "لا يمكن قراءة الجدول الآن."
 
@@ -301,7 +308,6 @@ def update_settings(data: SettingsUpdate, admin: str = Depends(verify_admin)):
     if not save_live_instructions(data.instruction): raise HTTPException(status_code=500, detail="Failed to save settings")
     return {"status": "success"}
 
-# ---- NEW ENDPOINTS FOR SCHEDULE TAB ----
 @app.get("/admin/api/schedule")
 def api_get_schedule(date: str, admin: str = Depends(verify_admin)):
     try:
@@ -319,7 +325,6 @@ def api_admin_book(req: BookReq, admin: str = Depends(verify_admin)):
 def api_admin_cancel(req: CancelReq, admin: str = Depends(verify_admin)):
     res = cancel_appointment(req.phone_number, req.date)
     return {"status": res}
-# ----------------------------------------
 
 @app.get("/admin/api/data")
 def get_admin_data(admin: str = Depends(verify_admin)):
@@ -406,9 +411,9 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             .schedule-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 2px solid #f0f2f5; }
             .schedule-header h2 { margin: 0; color: #111b21; font-size: 20px; }
             .date-picker { padding: 10px 15px; border: 1px solid #d1d7db; border-radius: 8px; font-size: 15px; font-family: inherit; outline: none; color: #111b21; cursor: pointer; }
-            .slot-row { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-radius: 8px; border: 1px solid #d1d7db; margin-bottom: 10px; transition: transform 0.1s; }
+            .slot-row { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-radius: 8px; border: 1px solid #d1d7db; margin-bottom: 12px; transition: transform 0.1s; }
             .slot-row:hover { transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
-            .slot-time { font-weight: bold; font-family: monospace; font-size: 16px; direction: ltr; }
+            .slot-time { font-weight: bold; font-family: monospace; font-size: 18px; direction: ltr; }
             
             /* MODALS */
             .modal-overlay { display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.5); z-index:9999; justify-content:center; align-items:center; }
@@ -516,15 +521,13 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             </div>
         </div>
 
-        <<script>
+        <script>
             let allChats = [], allPatients = [], currentPhone = null, autoScroll = true, newestAtTop = false, currentIsPaused = false;
             const messagesDiv = document.getElementById('messages');
             
-            // View Switching Logic
             function switchView(viewName) {
                 document.getElementById('view-chats').style.display = viewName === 'chats' ? 'flex' : 'none';
                 document.getElementById('view-schedule').style.display = viewName === 'schedule' ? 'flex' : 'none';
-                
                 document.getElementById('tab-btn-chats').className = viewName === 'chats' ? 'nav-tab active' : 'nav-tab';
                 document.getElementById('tab-btn-schedule').className = viewName === 'schedule' ? 'nav-tab active' : 'nav-tab';
                 
@@ -545,10 +548,8 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             // ==========================================
             const CLINIC_TIMES = ["12:00 PM", "12:30 PM", "01:00 PM", "01:30 PM", "02:00 PM", "02:30 PM", "03:00 PM", "03:30 PM", "04:00 PM", "04:30 PM", "05:00 PM", "05:30 PM", "06:00 PM", "06:30 PM", "07:00 PM", "07:30 PM", "08:00 PM", "08:30 PM", "09:00 PM", "09:30 PM", "10:00 PM"];
 
-            // دالة التنظيف الصارمة (تحذف الأصفار، المسافات، وتطابق الحروف)
             function normalizeTimeJS(t) {
                 if (!t) return "";
-                // تحذف أي شيء ليس حرف أو رقم أو نقطتين، وتوحد حالة الأحرف
                 let clean = String(t).toUpperCase().replace(/[^A-Z0-9:]/g, ''); 
                 if (clean.startsWith("0")) return clean.substring(1);
                 return clean;
@@ -568,34 +569,56 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                         return;
                     }
                     
-                    let bookedTimes = [];
+                    let bookedSlots = {};
                     if (data.booked && Array.isArray(data.booked)) {
-                        // تنظيف الأوقات القادمة من جوجل شيت
-                        bookedTimes = data.booked.map(normalizeTimeJS);
+                        data.booked.forEach(b => {
+                            if (typeof b === 'string') {
+                                bookedSlots[normalizeTimeJS(b)] = { name: "غير مسجل", phone: "", area: "" };
+                            } else {
+                                bookedSlots[normalizeTimeJS(b.time)] = {
+                                    name: b.name || "غير مسجل",
+                                    phone: b.phone || "",
+                                    area: b.area || ""
+                                };
+                            }
+                        });
                     }
 
                     slotsDiv.innerHTML = '';
                     CLINIC_TIMES.forEach(t => {
-                        // تنظيف أوقات العيادة قبل مقارنتها
                         const normalizedClinicTime = normalizeTimeJS(t);
-                        const isBooked = bookedTimes.includes(normalizedClinicTime);
+                        const bookingData = bookedSlots[normalizedClinicTime];
+                        const isBooked = !!bookingData;
                         
                         const slotDiv = document.createElement('div');
                         slotDiv.className = 'slot-row';
                         slotDiv.style.background = isBooked ? '#fff1f0' : '#f6ffed';
                         slotDiv.style.borderColor = isBooked ? '#ffa39e' : '#b7eb8f';
                         
-                        slotDiv.innerHTML = `
-                            <div class="slot-time" style="color: ${isBooked ? '#cf1322' : '#389e0d'};">${t}</div>
-                            <div>
-                                ${isBooked ? 
-                                  `<span style="color:#cf1322; font-weight:bold; margin-left:15px; font-size:14px;">🔴 محجوزة</span>
-                                   <button onclick="promptCancel('${date}', '${t}')" style="background:#ff4d4f; color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-weight:bold;">إلغاء الحجز</button>` : 
-                                  `<span style="color:#389e0d; font-weight:bold; margin-left:15px; font-size:14px;">🟢 متاحة</span>
-                                   <button onclick="openBookingModal('${date}', '${t}')" style="background:#52c41a; color:#fff; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-weight:bold;">+ حجز موعد</button>`
-                                }
-                            </div>
-                        `;
+                        if (isBooked) {
+                            slotDiv.innerHTML = `
+                                <div style="display:flex; flex-direction:column; justify-content:center; text-align:right;">
+                                    <div class="slot-time" style="color: #cf1322;">${t}</div>
+                                    <div style="font-size:13.5px; color:#54656f; margin-top:8px; font-weight:600; line-height: 1.5;">
+                                        👤 <span style="color:#111b21;">${bookingData.name}</span> <br>
+                                        📞 <span dir="ltr" style="color:#111b21;">${bookingData.phone}</span> <br>
+                                        🎯 المنطقة: <span style="color:#111b21;">${bookingData.area}</span>
+                                    </div>
+                                </div>
+                                <div style="display:flex; flex-direction:column; align-items:flex-end; justify-content:center; gap:10px;">
+                                    <span style="color:#cf1322; font-weight:bold; font-size:14px; background:#fff; padding:4px 10px; border-radius:12px; border:1px solid #ffa39e;">🔴 محجوزة</span>
+                                    <button onclick="promptCancel('${date}', '${t}', '${bookingData.phone}')" style="background:#ff4d4f; color:#fff; border:none; padding:8px 14px; border-radius:6px; cursor:pointer; font-weight:bold; transition: 0.2s;">إلغاء الحجز</button>
+                                </div>
+                            `;
+                        } else {
+                            slotDiv.innerHTML = `
+                                <div class="slot-time" style="color: #389e0d; display:flex; align-items:center;">${t}</div>
+                                <div style="display:flex; align-items:center; gap: 15px;">
+                                    <span style="color:#389e0d; font-weight:bold; font-size:14px;">🟢 متاحة</span>
+                                    <button onclick="openBookingModal('${date}', '${t}')" style="background:#52c41a; color:#fff; border:none; padding:8px 14px; border-radius:6px; cursor:pointer; font-weight:bold; transition: 0.2s;">+ حجز موعد</button>
+                                </div>
+                            `;
+                        }
                         slotsDiv.appendChild(slotDiv);
                     });
                 } catch (e) {
@@ -603,8 +626,8 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 }
             }
 
-            async function promptCancel(date, time) {
-                const phone = prompt(`أنت على وشك إلغاء حجز الساعة ${time} يوم ${date}.\n\nالرجاء إدخال رقم هاتف المريض لتأكيد الإلغاء (يجب أن يتطابق مع الرقم في الشيت):`);
+            async function promptCancel(date, time, currentPhoneHint) {
+                const phone = prompt(`أنت على وشك إلغاء حجز الساعة ${time} يوم ${date}.\n\nالرجاء إدخال رقم هاتف المريض لتأكيد الإلغاء:`, currentPhoneHint || "");
                 if (!phone) return;
                 
                 const res = await fetch('/admin/api/cancel', {
@@ -624,10 +647,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 document.getElementById('book-phone').value = '';
                 document.getElementById('booking-modal').style.display = 'flex';
             }
-            
-            function closeBookingModal() {
-                document.getElementById('booking-modal').style.display = 'none';
-            }
+            function closeBookingModal() { document.getElementById('booking-modal').style.display = 'none'; }
 
             async function submitBooking() {
                 const name = document.getElementById('book-name').value;
@@ -708,9 +728,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 document.getElementById('settings-modal').style.display = 'flex';
             }
 
-            function closeSettingsModal() {
-                document.getElementById('settings-modal').style.display = 'none';
-            }
+            function closeSettingsModal() { document.getElementById('settings-modal').style.display = 'none'; }
 
             async function saveSettings() {
                 const btn = document.getElementById('save-settings-btn');
