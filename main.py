@@ -957,21 +957,59 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
         body = await request.json()
         entries = body.get("entry", [])
         if entries:
-            value = entries[0].get("changes", [{}])[0].get("value", {})
-            target_phone_id = value.get("metadata", {}).get("phone_number_id", PHONE_NUMBER_ID)
+            for entry in entries:
+                for change in entry.get("changes", []):
+                    value = change.get("value", {})
+                    target_phone_id = value.get("metadata", {}).get("phone_number_id", PHONE_NUMBER_ID)
 
-            messages = value.get("messages", [])
-            if messages:
-                incoming_msg = messages[0]
-                if is_duplicate_message(incoming_msg.get("id")): return Response(content="DUPLICATE", status_code=200)
+                    # 1. INCOMING MESSAGES FROM PATIENT
+                    messages = value.get("messages", [])
+                    if messages:
+                        incoming_msg = messages[0]
+                        if is_duplicate_message(incoming_msg.get("id")):
+                            return Response(content="DUPLICATE", status_code=200)
 
-                msg_type = incoming_msg.get("type")
-                if msg_type in ["text", "image"]:
-                    sender_phone = incoming_msg.get("from", "").strip()
-                    user_text = incoming_msg.get("text", {}).get("body", "").strip() if msg_type == "text" else incoming_msg.get("image", {}).get("caption", "[قام المريض بإرسال صورة]").strip()
-                    if sender_phone in BLOCKED_NUMBERS or sender_phone.endswith("1142286600"): return Response(content="BLOCKED", status_code=200)
-                    
-                    background_tasks.add_task(handle_ai_conversation, sender_phone, user_text, target_phone_id)
+                        msg_type = incoming_msg.get("type")
+                        if msg_type in ["text", "image"]:
+                            sender_phone = incoming_msg.get("from", "").strip()
+                            user_text = (
+                                incoming_msg.get("text", {}).get("body", "").strip()
+                                if msg_type == "text"
+                                else incoming_msg.get("image", {}).get("caption", "[قام المريض بإرسال صورة]").strip()
+                            )
+                            if sender_phone in BLOCKED_NUMBERS or sender_phone.endswith("1142286600"):
+                                return Response(content="BLOCKED", status_code=200)
+                            
+                            background_tasks.add_task(handle_ai_conversation, sender_phone, user_text, target_phone_id)
+
+                    # 2. RECEPTIONIST MESSAGES FROM PHONE (smb_message_echoes)
+                    echoes = value.get("smb_message_echoes") or value.get("message_echoes")
+                    if echoes and isinstance(echoes, list):
+                        echo = echoes[0]
+                        if not is_duplicate_message(echo.get("id")):
+                            customer_phone = echo.get("to", "").strip()
+                            echo_type = echo.get("type")
+                            text_body = echo.get("text", {}).get("body", "").strip() if echo_type == "text" else f"[{echo_type}]"
+
+                            if customer_phone and text_body:
+                                # Save her message as 'model' so Gemini sees it in context
+                                save_chat_turn(customer_phone, "model", text_body)
+
+                                # Auto-pause the bot so it won't interrupt her
+                                try:
+                                    with get_db_connection() as conn:
+                                        with conn.cursor() as cursor:
+                                            cursor.execute("""
+                                                INSERT INTO patients (phone_number, is_paused)
+                                                VALUES (%s, TRUE)
+                                                ON CONFLICT (phone_number)
+                                                DO UPDATE SET is_paused = TRUE
+                                            """, (customer_phone,))
+                                            conn.commit()
+                                    print(f"⏸️ Receptionist sent a message to {customer_phone}. Synced to Gemini context & bot paused.")
+                                except Exception as e:
+                                    print(f"Database error on echo: {e}")
+
     except Exception as e: 
         print(f"Webhook error: {e}")
     return Response(content="EVENT_RECEIVED", status_code=200)
