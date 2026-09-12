@@ -516,7 +516,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             </div>
         </div>
 
-        <script>
+        <<script>
             let allChats = [], allPatients = [], currentPhone = null, autoScroll = true, newestAtTop = false, currentIsPaused = false;
             const messagesDiv = document.getElementById('messages');
             
@@ -530,7 +530,12 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 
                 if (viewName === 'schedule') {
                     const dp = document.getElementById('schedule-date-picker');
-                    if (!dp.value) dp.valueAsDate = new Date();
+                    if (!dp.value) {
+                        const today = new Date();
+                        const offset = today.getTimezoneOffset() * 60000;
+                        const localDate = new Date(today.getTime() - offset);
+                        dp.value = localDate.toISOString().split('T')[0];
+                    }
                     loadSchedule();
                 }
             }
@@ -539,6 +544,15 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             // SCHEDULE & GOOGLE SHEETS LOGIC
             // ==========================================
             const CLINIC_TIMES = ["12:00 PM", "12:30 PM", "01:00 PM", "01:30 PM", "02:00 PM", "02:30 PM", "03:00 PM", "03:30 PM", "04:00 PM", "04:30 PM", "05:00 PM", "05:30 PM", "06:00 PM", "06:30 PM", "07:00 PM", "07:30 PM", "08:00 PM", "08:30 PM", "09:00 PM", "09:30 PM", "10:00 PM"];
+
+            // دالة التنظيف الصارمة (تحذف الأصفار، المسافات، وتطابق الحروف)
+            function normalizeTimeJS(t) {
+                if (!t) return "";
+                // تحذف أي شيء ليس حرف أو رقم أو نقطتين، وتوحد حالة الأحرف
+                let clean = String(t).toUpperCase().replace(/[^A-Z0-9:]/g, ''); 
+                if (clean.startsWith("0")) return clean.substring(1);
+                return clean;
+            }
 
             async function loadSchedule() {
                 const date = document.getElementById('schedule-date-picker').value;
@@ -549,15 +563,23 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                     const res = await fetch(`/admin/api/schedule?date=${date}`);
                     const data = await res.json();
                     
+                    if (data.error) {
+                        slotsDiv.innerHTML = `<div class="empty-state" style="color:#cf1322;">❌ خطأ من جوجل شيت: ${data.error}</div>`;
+                        return;
+                    }
+                    
                     let bookedTimes = [];
-                    if (data.booked) {
-                        // Normalize times returned from Google Sheet to match our array
-                        bookedTimes = data.booked.map(t => t.trim().toUpperCase());
+                    if (data.booked && Array.isArray(data.booked)) {
+                        // تنظيف الأوقات القادمة من جوجل شيت
+                        bookedTimes = data.booked.map(normalizeTimeJS);
                     }
 
                     slotsDiv.innerHTML = '';
                     CLINIC_TIMES.forEach(t => {
-                        const isBooked = bookedTimes.includes(t);
+                        // تنظيف أوقات العيادة قبل مقارنتها
+                        const normalizedClinicTime = normalizeTimeJS(t);
+                        const isBooked = bookedTimes.includes(normalizedClinicTime);
+                        
                         const slotDiv = document.createElement('div');
                         slotDiv.className = 'slot-row';
                         slotDiv.style.background = isBooked ? '#fff1f0' : '#f6ffed';
@@ -629,7 +651,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                 
                 closeBookingModal();
                 btn.innerText = 'تأكيد الحجز';
-                loadSchedule(); // Refresh the list instantly
+                loadSchedule();
             }
 
             // ==========================================
