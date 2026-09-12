@@ -405,15 +405,21 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             .msg.model { background: #d9fdd3; align-self: flex-end; border-top-left-radius: 0; }
             .msg-meta { font-size: 10.5px; color: #667781; text-align: left; direction: ltr; margin-top: 3px; }
             
-            /* SCHEDULE VIEW */
-            #view-schedule { display: none; height: calc(100vh - 60px); width: 100%; background: #efeae2; padding: 30px 20px; overflow-y: auto; flex-direction: column; align-items: center; }
-            .schedule-container { background: #fff; border-radius: 12px; padding: 24px; width: 100%; max-width: 800px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+            /* SCHEDULE VIEW - UPDATED FOR GRID LAYOUT */
+            #view-schedule { display: none; height: calc(100vh - 60px); width: 100%; background: #efeae2; padding: 30px; overflow-y: auto; }
+            .schedule-container { background: #fff; border-radius: 12px; padding: 24px; width: 100%; max-width: 1400px; margin: 0 auto; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
             .schedule-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 2px solid #f0f2f5; }
             .schedule-header h2 { margin: 0; color: #111b21; font-size: 20px; }
             .date-picker { padding: 10px 15px; border: 1px solid #d1d7db; border-radius: 8px; font-size: 15px; font-family: inherit; outline: none; color: #111b21; cursor: pointer; }
-            .slot-row { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-radius: 8px; border: 1px solid #d1d7db; margin-bottom: 12px; transition: transform 0.1s; }
-            .slot-row:hover { transform: translateY(-1px); box-shadow: 0 2px 5px rgba(0,0,0,0.05); }
-            .slot-time { font-weight: bold; font-family: monospace; font-size: 18px; direction: ltr; }
+            
+            /* GRID MAGIC HERE */
+            #schedule-slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+            
+            .slot-row { display: flex; flex-direction: column; padding: 16px; border-radius: 10px; border: 1px solid #d1d7db; transition: transform 0.1s; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+            .slot-row:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.08); }
+            .slot-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+            .slot-time { font-weight: bold; font-family: monospace; font-size: 18px; direction: ltr; margin: 0; }
+            .slot-badge { font-weight: bold; font-size: 12px; padding: 4px 10px; border-radius: 12px; border: 1px solid; }
             
             /* MODALS */
             .modal-overlay { display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.5); z-index:9999; justify-content:center; align-items:center; }
@@ -421,7 +427,7 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
             .form-group { margin-bottom: 15px; display: flex; flex-direction: column; gap: 5px; }
             .form-group label { font-size: 13px; font-weight: bold; color: #54656f; }
             .form-group input, .form-group select { padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; font-family: inherit; }
-            .empty-state { margin: auto; text-align: center; color: #8696a0; font-size: 16px; }
+            .empty-state { grid-column: 1 / -1; text-align: center; color: #8696a0; font-size: 16px; padding: 40px; }
         </style>
     </head>
     <body>
@@ -597,26 +603,25 @@ def admin_dashboard(admin: str = Depends(verify_admin)):
                         
                         if (isBooked) {
                             slotDiv.innerHTML = `
-                                <div style="display:flex; flex-direction:column; justify-content:center; text-align:right;">
+                                <div class="slot-top">
+                                    <span class="slot-badge" style="color:#cf1322; background:#fff; border-color:#ffa39e;">🔴 محجوزة</span>
                                     <div class="slot-time" style="color: #cf1322;">${t}</div>
-                                    <div style="font-size:13.5px; color:#54656f; margin-top:8px; font-weight:600; line-height: 1.5;">
-                                        👤 <span style="color:#111b21;">${bookingData.name}</span> <br>
-                                        📞 <span dir="ltr" style="color:#111b21;">${bookingData.phone}</span> <br>
-                                        🎯 المنطقة: <span style="color:#111b21;">${bookingData.area}</span>
-                                    </div>
                                 </div>
-                                <div style="display:flex; flex-direction:column; align-items:flex-end; justify-content:center; gap:10px;">
-                                    <span style="color:#cf1322; font-weight:bold; font-size:14px; background:#fff; padding:4px 10px; border-radius:12px; border:1px solid #ffa39e;">🔴 محجوزة</span>
-                                    <button onclick="promptCancel('${date}', '${t}', '${bookingData.phone}')" style="background:#ff4d4f; color:#fff; border:none; padding:8px 14px; border-radius:6px; cursor:pointer; font-weight:bold; transition: 0.2s;">إلغاء الحجز</button>
+                                <div style="font-size:13.5px; color:#54656f; font-weight:600; line-height: 1.6; margin-bottom: 16px; flex-grow: 1;">
+                                    👤 <span style="color:#111b21;">${bookingData.name}</span> <br>
+                                    📞 <span dir="ltr" style="color:#111b21;">${bookingData.phone}</span> <br>
+                                    🎯 المنطقة: <span style="color:#111b21;">${bookingData.area}</span>
                                 </div>
+                                <button onclick="promptCancel('${date}', '${t}', '${bookingData.phone}')" style="background:#ff4d4f; color:#fff; border:none; padding:10px; border-radius:8px; cursor:pointer; font-weight:bold; transition: 0.2s; width:100%;">إلغاء الحجز</button>
                             `;
                         } else {
                             slotDiv.innerHTML = `
-                                <div class="slot-time" style="color: #389e0d; display:flex; align-items:center;">${t}</div>
-                                <div style="display:flex; align-items:center; gap: 15px;">
-                                    <span style="color:#389e0d; font-weight:bold; font-size:14px;">🟢 متاحة</span>
-                                    <button onclick="openBookingModal('${date}', '${t}')" style="background:#52c41a; color:#fff; border:none; padding:8px 14px; border-radius:6px; cursor:pointer; font-weight:bold; transition: 0.2s;">+ حجز موعد</button>
+                                <div class="slot-top" style="margin-bottom:0;">
+                                    <span class="slot-badge" style="color:#389e0d; border-color:transparent;">🟢 متاحة</span>
+                                    <div class="slot-time" style="color: #389e0d;">${t}</div>
                                 </div>
+                                <div style="flex-grow: 1;"></div>
+                                <button onclick="openBookingModal('${date}', '${t}')" style="background:#52c41a; color:#fff; border:none; padding:10px; border-radius:8px; cursor:pointer; font-weight:bold; transition: 0.2s; width:100%; margin-top:16px;">+ حجز موعد</button>
                             `;
                         }
                         slotsDiv.appendChild(slotDiv);
