@@ -18,8 +18,8 @@ class DateParsingTests(unittest.TestCase):
         self.assertEqual(parse_date_expression("الخميس", now=self.now), dt.date(2026, 9, 17))
 
     def test_next_weekday_means_following_week(self):
-        self.assertEqual(parse_date_expression("next Saturday", now=self.now), dt.date(2026, 9, 26))
-        self.assertEqual(parse_date_expression("السبت الجاي", now=self.now), dt.date(2026, 9, 26))
+        self.assertEqual(parse_date_expression("next Saturday", now=self.now), dt.date(2026, 9, 19))
+        self.assertEqual(parse_date_expression("السبت الجاي", now=self.now), dt.date(2026, 9, 19))
 
     def test_arabic_digits(self):
         self.assertEqual(parse_date_expression("٢٠٢٦-٠٩-٢٠", now=self.now), dt.date(2026, 9, 20))

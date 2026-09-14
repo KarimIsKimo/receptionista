@@ -62,8 +62,6 @@ def parse_date_expression(
         delta = (target - today.weekday()) % 7
         if is_next:
             delta = delta or 7
-            if delta < 7:
-                delta += 7
         return today + dt.timedelta(days=delta)
 
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
