@@ -1147,6 +1147,10 @@ class PatientTagsReq(BaseModel):
     phone_number: str = Field(min_length=5, max_length=30)
     tags: list[str] = Field(default_factory=list, max_length=20)
 
+class PatientPreferencesReq(BaseModel):
+    phone_number: str = Field(min_length=5, max_length=30)
+    preferences: str = Field(default="", max_length=10000)
+
 # ------------------------------------------------------------
 # Admin API
 # ------------------------------------------------------------
@@ -1170,6 +1174,13 @@ def api_patient_tags(req: PatientTagsReq, admin: str = Depends(verify_admin)):
     phone = normalize_phone(req.phone_number)
     set_patient_tags(phone, req.tags)
     audit(admin, "update_patient_tags", phone, json.dumps(req.tags, ensure_ascii=False))
+    return {"status": "success"}
+
+@app.post("/admin/api/patient_preferences")
+def api_patient_preferences(req: PatientPreferencesReq, admin: str = Depends(verify_admin)):
+    phone = normalize_phone(req.phone_number)
+    update_patient_file(phone, preferences=req.preferences)
+    audit(admin, "update_patient_preferences", phone, req.preferences[:1000])
     return {"status": "success"}
 
 @app.get("/admin/api/settings")
@@ -1234,6 +1245,7 @@ def get_admin_data(
     search: str = Query("", max_length=100),
     paused: bool | None = None,
     limit: int = Query(100, ge=1, le=500),
+    include_chats: bool = Query(True),
     admin: str = Depends(verify_admin),
 ):
     search = search.strip()
@@ -1241,7 +1253,7 @@ def get_admin_data(
     where = []
 
     if search:
-        where.append("(p.phone_number ILIKE %s OR p.name ILIKE %s)")
+        where.append("(active.phone_number ILIKE %s OR COALESCE(p.name,'') ILIKE %s)")
         like = f"%{search}%"
         params.extend([like, like])
     if paused is not None:
@@ -1258,11 +1270,12 @@ def get_admin_data(
             COALESCE(p.preferences,'') AS preferences,
             COALESCE(p.tags,'{{}}') AS tags,
             COALESCE(p.is_paused,FALSE) AS is_paused,
+            p.created_at,
+            p.updated_at,
             MAX(c.created_at) AS last_msg_time,
             MAX(c.id) AS last_msg_id,
             (
-                SELECT ch.content
-                FROM chat_history ch
+                SELECT ch.content FROM chat_history ch
                 WHERE ch.phone_number=active.phone_number
                 ORDER BY ch.id DESC LIMIT 1
             ) AS last_message
@@ -1274,7 +1287,7 @@ def get_admin_data(
         LEFT JOIN patients p ON active.phone_number=p.phone_number
         LEFT JOIN chat_history c ON active.phone_number=c.phone_number
         {where_sql}
-        GROUP BY active.phone_number,p.name,p.preferences,p.tags,p.is_paused
+        GROUP BY active.phone_number,p.name,p.preferences,p.tags,p.is_paused,p.created_at,p.updated_at
         ORDER BY last_msg_time DESC NULLS LAST, last_msg_id DESC NULLS LAST
         LIMIT %s
         """,
@@ -1282,18 +1295,22 @@ def get_admin_data(
         fetchall=True,
     )
 
-    chats = db_execute(
-        """
-        SELECT id, phone_number, role, content, created_at
-        FROM chat_history
-        ORDER BY id DESC
-        LIMIT 5000
-        """,
-        fetchall=True,
-    )
-    chats.reverse()
-
-    return {"patients": patients, "chats": chats}
+    result = {"patients": patients}
+    if include_chats:
+        chats = db_execute(
+            """
+            SELECT id, phone_number, role, content, created_at
+            FROM chat_history
+            ORDER BY id DESC
+            LIMIT 1000
+            """,
+            fetchall=True,
+        )
+        chats.reverse()
+        result["chats"] = chats
+    else:
+        result["chats"] = []
+    return result
 
 @app.get("/admin/api/stats")
 def admin_stats(admin: str = Depends(verify_admin)):
@@ -1313,19 +1330,35 @@ def admin_stats(admin: str = Depends(verify_admin)):
     return {**dict(row), "bot_active": is_bot_globally_active()}
 
 @app.get("/admin/api/patient/{phone_number}")
-def admin_patient(phone_number: str, admin: str = Depends(verify_admin)):
+def admin_patient(
+    phone_number: str,
+    before_id: int | None = Query(None, ge=1),
+    limit: int = Query(60, ge=1, le=200),
+    admin: str = Depends(verify_admin),
+):
     phone = normalize_phone(phone_number)
     profile = load_patient_profile(phone)
-    messages = db_execute(
-        """
+    params = [phone]
+    clause = ""
+    if before_id is not None:
+        clause = " AND id < %s"
+        params.append(before_id)
+    params.append(limit + 1)
+    rows = db_execute(
+        f"""
         SELECT id, role, content, created_at
-        FROM chat_history WHERE phone_number=%s
-        ORDER BY id ASC LIMIT 1000
+        FROM chat_history
+        WHERE phone_number=%s{clause}
+        ORDER BY id DESC
+        LIMIT %s
         """,
-        (phone,),
+        tuple(params),
         fetchall=True,
     )
-    return {"patient": profile, "messages": messages}
+    has_more = len(rows) > limit
+    messages = rows[:limit]
+    messages.reverse()
+    return {"patient": profile, "messages": messages, "has_more": has_more}
 
 @app.get("/admin/api/audit")
 def admin_audit(limit: int = Query(100, ge=1, le=500), admin: str = Depends(verify_admin)):
