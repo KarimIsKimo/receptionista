@@ -3,36 +3,39 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Jothen Clinic — Admin v2</title>
+<title>Jothen Clinics — Receptionist Admin</title>
 <style>
-:root{--bg:#f4f6f8;--card:#fff;--line:#e4e8ec;--text:#17212b;--muted:#667781;--accent:#008069;--danger:#d93025;--warn:#b26a00}
-*{box-sizing:border-box}body{margin:0;font-family:Segoe UI,Tahoma,sans-serif;background:var(--bg);color:var(--text)}
-button,input,textarea,select{font:inherit}.top{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 18px;position:sticky;top:0;z-index:10}
-.brand{font-weight:800}.nav{display:flex;gap:7px}.nav button,.btn{border:1px solid var(--line);background:#fff;padding:9px 12px;border-radius:9px;cursor:pointer;font-weight:650}.nav button.active{background:#e8f5f2;color:var(--accent);border-color:#bfe3da}
-main{padding:18px;max-width:1600px;margin:auto}.view{display:none}.view.active{display:block}
-.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:14px}.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:15px}.stat b{display:block;font-size:25px;margin-top:5px}.muted{color:var(--muted);font-size:12px}
-.chat-layout{display:grid;grid-template-columns:350px 1fr;direction:ltr;height:calc(100vh - 105px);min-height:600px;background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}
-.sidebar{direction:var(--lang-dir);border-right:1px solid var(--line);display:flex;flex-direction:column}.search{padding:10px;border-bottom:1px solid var(--line)}.search input{width:100%;padding:10px;border:1px solid var(--line);border-radius:9px}
-.list{overflow:auto}.patient{padding:12px;border-bottom:1px solid #f0f2f5;cursor:pointer}.patient:hover,.patient.active{background:#f4f7f7}.patient .row{display:flex;justify-content:space-between;gap:8px}.patient .name{font-weight:700}.patient .last{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}.badge{font-size:10px;padding:3px 6px;border-radius:8px;background:#fff0f0;color:#b42318}
-.chat{direction:var(--lang-dir);display:flex;flex-direction:column;background:#efeae2}.chat-head{background:#f7f8f9;padding:12px 15px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;align-items:center}.chat-head .actions{display:flex;gap:6px;flex-wrap:wrap}.messages{flex:1;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:8px}.msg{max-width:72%;padding:9px 12px;border-radius:9px;white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 1px #00000010}.msg.user{align-self:flex-start;background:#fff}.msg.model{align-self:flex-end;background:#d9fdd3}.msg.staff{align-self:flex-end;background:#dbeafe;border:1px solid #bfdbfe}.meta{font-size:10px;color:var(--muted);margin-top:4px;direction:ltr}
-.composer{background:#f0f2f5;padding:10px;display:flex;gap:8px}.composer textarea{flex:1;min-height:46px;max-height:130px;border:1px solid var(--line);border-radius:10px;padding:10px;resize:vertical}.send{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:0 18px;cursor:pointer;font-weight:800}
-.panel{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}.toolbar input,.toolbar select,.panel textarea{padding:10px;border:1px solid var(--line);border-radius:9px}.toolbar input{min-width:230px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:12px}.slot{border:1px solid var(--line);border-radius:11px;padding:13px}.slot.booked{background:#fff4f2;border-color:#ffd0ca}.slot.free{background:#f3fbf6;border-color:#c7ead2}.slot .time{font-weight:900;font-size:18px}
-.modal{display:none;position:fixed;inset:0;background:#0008;z-index:50;align-items:center;justify-content:center}.modal.open{display:flex}.modalbox{width:min(900px,94vw);max-height:90vh;background:#fff;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:10px}.modalbox textarea{flex:1;min-height:55vh;direction:rtl}
-.danger{background:#fff1f0!important;color:#b42318!important;border-color:#ffc9c5!important}.success{background:#eaf7ee!important;color:#176b2b!important;border-color:#bce3c8!important}
-@media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}.chat-layout{grid-template-columns:1fr;height:calc(100vh - 95px)}.sidebar{display:none}.chat{min-height:600px}}
+:root{
+ --bg:#f3f5f7;--card:#fff;--panel:#f7f9fa;--line:#e2e7eb;--text:#17212b;--muted:#6d7a83;
+ --accent:#008069;--accent2:#00a884;--danger:#d93025;--warn:#a85b00;--blue:#2563eb;--shadow:0 6px 22px rgba(0,0,0,.07);
+}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;font-family:Segoe UI,Tahoma,Arial,sans-serif;background:var(--bg);color:var(--text);overflow:hidden}
+button,input,textarea,select{font:inherit}.top{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 18px;position:relative;z-index:20}.brand{font-weight:800;display:flex;align-items:center;gap:8px}.nav{display:flex;gap:7px;align-items:center}.nav button,.btn{border:1px solid var(--line);background:#fff;padding:9px 12px;border-radius:10px;cursor:pointer;font-weight:650;color:var(--text)}.nav button:hover,.btn:hover{background:#f6f8f9}.nav button.active{background:#e8f5f2;color:var(--accent);border-color:#bfe3da}.iconbtn{width:38px;height:38px;padding:0!important;display:inline-flex;align-items:center;justify-content:center}.danger{background:#fff1f0!important;color:#b42318!important;border-color:#ffc9c5!important}.success{background:#eaf7ee!important;color:#176b2b!important;border-color:#bce3c8!important}.primary{background:var(--accent)!important;color:#fff!important;border-color:var(--accent)!important}.muted{color:var(--muted);font-size:12px}.hidden{display:none!important}
+main{padding:12px 14px;max-width:1800px;margin:auto;height:calc(100vh - 64px);overflow:hidden}.view{display:none;height:100%}.view.active{display:block}.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:10px}.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;box-shadow:0 1px 2px rgba(0,0,0,.02)}.stat b{display:block;font-size:24px;margin-top:2px}
+.chat-layout{display:grid;grid-template-columns:360px minmax(0,1fr) 320px;direction:ltr;height:calc(100vh - 150px);min-height:520px;background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:var(--shadow)}
+.sidebar{direction:var(--dir);border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0;background:#fff}.sidebar-head{padding:12px;border-bottom:1px solid var(--line);display:flex;gap:7px;align-items:center}.search{flex:1;position:relative}.search input,.mini-search input,.profile input,.profile textarea,.composer textarea,.toolbar input,.toolbar select{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;outline:none}.search input:focus,.mini-search input:focus,.profile input:focus,.profile textarea:focus,.composer textarea:focus{border-color:#9dd6cb;box-shadow:0 0 0 3px rgba(0,128,105,.08)}
+.filters{display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid var(--line);overflow:auto}.filter{border:1px solid var(--line);background:#fff;border-radius:999px;padding:6px 9px;font-size:11px;cursor:pointer;white-space:nowrap}.filter.active{background:#e8f5f2;color:var(--accent);border-color:#bfe3da}
+.list{overflow:auto;min-height:0;scrollbar-gutter:stable}.patient{padding:12px 10px;border-bottom:1px solid #f0f2f5;cursor:pointer;position:relative}.patient:hover,.patient.active{background:#f4f7f7}.patient .row{display:flex;justify-content:space-between;gap:8px}.patient .name{font-weight:750}.patient .last{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}.patient .phone{font-size:11px;color:var(--muted);margin-top:2px}.badge{display:inline-flex;align-items:center;font-size:10px;padding:3px 6px;border-radius:8px;background:#f0f3f5;color:#51606a;margin-top:5px;margin-inline-end:4px}.badge.red{background:#fff0f0;color:#b42318}.badge.green{background:#eaf7ee;color:#176b2b}.badge.blue{background:#eef4ff;color:#1d4ed8}.unread-dot{position:absolute;top:14px;inset-inline-end:10px;width:9px;height:9px;border-radius:50%;background:var(--accent2)}
+.chat{direction:var(--dir);display:flex;flex-direction:column;background:#efeae2;min-width:0;position:relative}.chat-head{background:#f7f8f9;padding:10px 12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;align-items:center;flex:0 0 auto}.chat-ident{min-width:0}.chat-ident .title{font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.chat-ident .sub{display:flex;gap:7px;align-items:center}.actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.head-mobile{display:none}
+.messages{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:18px 20px;display:flex;flex-direction:column;gap:7px;scroll-behavior:auto}.date-sep{align-self:center;background:#fff8;border-radius:8px;padding:5px 9px;font-size:10px;color:#5f686d;box-shadow:0 1px 2px #0001;margin:7px 0}.msg{max-width:min(74%,680px);padding:9px 12px;border-radius:10px;white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 1px #00000010;position:relative}.msg.user{align-self:flex-start;background:#fff}.msg.model{align-self:flex-end;background:#d9fdd3}.msg.staff{align-self:flex-end;background:#dbeafe;border:1px solid #bfdbfe}.msg.system{align-self:center;background:#f2f4f5;color:#58636b;font-size:12px}.msg .meta{font-size:10px;color:var(--muted);margin-top:5px;direction:ltr;display:flex;justify-content:flex-end;gap:5px}.msg .copy{position:absolute;top:4px;inset-inline-end:4px;opacity:0;border:0;background:#fff9;border-radius:6px;font-size:10px;padding:2px 5px;cursor:pointer}.msg:hover .copy{opacity:1}.msg.selected{outline:2px solid #9dd6cb}.load-older{align-self:center;border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 12px;font-size:11px;cursor:pointer;margin-bottom:2px}
+.jump{position:absolute;bottom:84px;inset-inline-end:18px;border:1px solid var(--line);background:#fff;width:40px;height:40px;border-radius:50%;box-shadow:var(--shadow);cursor:pointer;display:none;z-index:4}.jump.show{display:block}.composer{background:#f0f2f5;padding:9px;display:flex;gap:8px;flex:0 0 auto}.composer textarea{flex:1;min-height:44px;max-height:160px;resize:vertical}.send{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:0 18px;cursor:pointer;font-weight:800}
+.profile{direction:var(--dir);background:#fff;border-left:1px solid var(--line);min-width:0;display:flex;flex-direction:column}.profile-head{padding:13px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.profile-body{padding:14px;overflow:auto}.profile-card{border:1px solid var(--line);border-radius:12px;padding:11px;margin-bottom:10px}.profile-card h4{margin:0 0 7px}.kv{display:grid;grid-template-columns:92px 1fr;gap:5px;font-size:12px;margin:4px 0}.kv b{color:#55636b}.tags{display:flex;gap:5px;flex-wrap:wrap}.quick{display:flex;gap:5px;flex-wrap:wrap}.quick button{border:1px solid var(--line);background:#fff;border-radius:999px;padding:6px 8px;font-size:11px;cursor:pointer}.profile-actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}.profile-actions .wide{grid-column:1/-1}
+.empty{height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);text-align:center;padding:20px}.typing{font-size:11px;color:var(--muted);padding:0 14px 5px}.panel{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px;overflow:auto;height:100%}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}.toolbar input,.toolbar select{width:auto}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:12px}.slot{border:1px solid var(--line);border-radius:11px;padding:13px}.slot.booked{background:#fff4f2;border-color:#ffd0ca}.slot.free{background:#f3fbf6;border-color:#c7ead2}.slot .time{font-weight:900;font-size:18px}.stats-detail{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}.detail-card{border:1px solid var(--line);border-radius:10px;padding:12px}
+.modal{display:none;position:fixed;inset:0;background:#0008;z-index:50;align-items:center;justify-content:center;padding:18px}.modal.open{display:flex}.modalbox{width:min(980px,96vw);max-height:92vh;background:#fff;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:10px;box-shadow:0 16px 50px #0003}.modalbox textarea{min-height:50vh;resize:vertical}.toast{position:fixed;bottom:18px;inset-inline-end:18px;background:#111;color:#fff;padding:10px 13px;border-radius:10px;opacity:0;transform:translateY(8px);transition:.2s;z-index:100;font-size:12px}.toast.show{opacity:1;transform:none}
+@media(max-width:1200px){.chat-layout{grid-template-columns:320px minmax(0,1fr)}.profile{display:none}.stats{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:800px){body{overflow:hidden}.top{height:58px;padding:0 9px}.brand{font-size:13px}.nav button{padding:7px 8px;font-size:11px}.nav button span{display:none}main{padding:8px;height:calc(100vh - 58px)}.stats{display:none}.chat-layout{height:calc(100vh - 74px);grid-template-columns:1fr;position:relative}.sidebar{position:absolute;inset:0 34% 0 0;z-index:8;box-shadow:8px 0 24px rgba(0,0,0,.12)}.sidebar.mobile-hidden{display:none}.head-mobile{display:inline-flex}.chat-head .actions .desktop-only{display:none}.msg{max-width:84%}.profile{position:absolute;inset:0;z-index:9}.profile.mobile-open{display:flex}.chat{height:100%}.composer{padding:7px}.send{padding:0 13px}}
 </style>
 </head>
 <body>
 <header class="top">
-  <div class="brand">🏥 Jothen Clinics — Nasr City</div>
+  <div class="brand">🏥 <span>Jothen Clinics — Nasr City</span></div>
   <div class="nav">
-  <button id="langBtn" class="btn" onclick="toggleLanguage()">🇬🇧 English</button>
-    <button class="active" onclick="view('chats',this)">💬 المحادثات</button>
+    <button id="langBtn" class="btn" onclick="toggleLanguage()">🇬🇧 English</button>
+    <button class="active" onclick="view('chats',this)">💬 <span data-i18n="chats">المحادثات</span></button>
     <button onclick="view('schedule',this)">📅 <span data-i18n="appointments">المواعيد</span></button>
     <button onclick="view('stats',this)">📊 <span data-i18n="stats">الإحصائيات</span></button>
-    <button onclick="openSettings()">⚙️ <span data-i18n="instructions">التعليمات</span></button>
     <button id="globalBtn" onclick="toggleGlobal()">...</button>
+    <button class="iconbtn" onclick="openSettings()">⚙️</button>
   </div>
 </header>
 <main>
@@ -46,184 +49,118 @@ main{padding:18px;max-width:1600px;margin:auto}.view{display:none}.view.active{d
 
   <section id="chats" class="view active">
     <div class="chat-layout">
-      <aside class="sidebar">
-        <div class="search"><input id="search" data-i18n-placeholder="searchPlaceholder" placeholder="بحث بالاسم أو رقم الهاتف..." oninput="loadData()"></div>
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-head">
+          <button class="btn iconbtn head-mobile" onclick="closeSidebar()">☰</button>
+          <div class="search"><input id="search" data-i18n-placeholder="searchPlaceholder" placeholder="بحث بالاسم أو رقم الهاتف..." oninput="debouncedLoadPatients()"></div>
+          <button class="btn iconbtn" onclick="loadPatients(true)">↻</button>
+        </div>
+        <div class="filters">
+          <button class="filter active" data-filter="all" onclick="setFilter('all',this)" data-i18n="filterAll">الكل</button>
+          <button class="filter" data-filter="paused" onclick="setFilter('paused',this)" data-i18n="filterPaused">موقوف</button>
+          <button class="filter" data-filter="active" onclick="setFilter('active',this)" data-i18n="filterActive">نشط</button>
+        </div>
         <div class="list" id="patients"></div>
       </aside>
+
       <section class="chat">
         <div class="chat-head">
-          <div id="chatTitle"><b data-i18n="selectChat">اختر محادثة</b></div>
+          <button class="btn iconbtn head-mobile" onclick="openSidebar()">☰</button>
+          <div class="chat-ident" id="chatTitle"><div class="title" data-i18n="selectChat">اختر محادثة</div></div>
           <div class="actions" id="chatActions" style="display:none">
-            <button class="btn" onclick="renamePatient()">✏️ الاسم</button>
-            <button class="btn" onclick="editTags()">🏷️ Tags</button>
+            <button class="btn desktop-only" onclick="openProfile()">👤</button>
+            <button class="btn" onclick="renamePatient()">✏️ <span data-i18n="rename">الاسم</span></button>
+            <button class="btn" onclick="editTags()">🏷️</button>
             <button class="btn" id="pauseBtn" onclick="togglePause()">...</button>
           </div>
         </div>
-        <div class="messages" id="messages"><div class="muted" data-i18n="chatWillAppear">المحادثة ستظهر هنا.</div></div>
+        <div class="messages" id="messages">
+          <div class="empty"><div><div style="font-size:34px">💬</div><div data-i18n="chatWillAppear">المحادثة ستظهر هنا.</div></div></div>
+        </div>
+        <button class="jump" id="jumpBtn" onclick="scrollToBottom(true)">↓</button>
+        <div class="typing" id="typing" style="display:none">...</div>
         <div class="composer" id="composer" style="display:none">
-          <textarea id="reply" data-i18n-placeholder="manualReplyPlaceholder" placeholder="اكتب رسالة يدوية للمريض..."></textarea>
+          <textarea id="reply" data-i18n-placeholder="manualReplyPlaceholder" placeholder="اكتب رسالة يدوية للمريض..." onkeydown="composerKeydown(event)"></textarea>
           <button class="send" onclick="sendStaff()"><span data-i18n="send">إرسال</span></button>
         </div>
       </section>
+
+      <aside class="profile" id="profilePanel">
+        <div class="profile-head"><b data-i18n="patientDetails">تفاصيل المريض</b><button class="btn iconbtn" onclick="closeProfile()">✕</button></div>
+        <div class="profile-body" id="profileBody"></div>
+      </aside>
     </div>
   </section>
 
   <section id="schedule" class="view">
     <div class="panel">
-      <div class="toolbar">
-        <h2 style="margin:0">📅 <span data-i18n="scheduleTitle">جدول المواعيد</span></h2>
-        <input type="date" id="date" onchange="loadSchedule()">
-        <button class="btn" onclick="loadSchedule()"><span data-i18n="refresh">تحديث</span></button>
-      </div>
+      <div class="toolbar"><h2 style="margin:0">📅 <span data-i18n="scheduleTitle">جدول المواعيد</span></h2><input type="date" id="date" onchange="loadSchedule()"><button class="btn" onclick="loadSchedule()"><span data-i18n="refresh">تحديث</span></button></div>
       <div class="grid" id="slots"></div>
     </div>
   </section>
 
   <section id="stats" class="view">
     <div class="panel">
-      <h2>📊 الإحصائيات</h2>
+      <h2>📊 <span data-i18n="analyticsTitle">Analytics</span></h2>
       <p class="muted" data-i18n="statsNote">هذه الأرقام تأتي مباشرة من قاعدة البيانات.</p>
-      <div id="statsDetail"></div>
-    </div>
-    <div class="panel" style="margin-top:12px">
-      <h3 data-i18n="auditTitle">🧾 آخر عمليات الإدارة</h3>
-      <div id="audit"></div>
+      <div id="statsDetail" class="stats-detail"></div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
+      <h3 data-i18n="auditTitle">🧾 آخر عمليات الإدارة</h3><div id="audit"></div>
     </div>
   </section>
 </main>
 
-<div id="settingsModal" class="modal">
- <div class="modalbox">
-  <h2 style="margin:0">⚙️ <span data-i18n="botInstructions">تعليمات البوت</span></h2>
-  <p class="muted" data-i18n="instructionNote">يمكن تعديل الـsystem instruction مباشرة. احفظ نسخة احتياطية قبل تغييرات كبيرة.</p>
-  <textarea id="instruction"></textarea>
-  <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn" onclick="closeSettings()"><span data-i18n="cancel">إلغاء</span></button><button class="btn success" onclick="saveSettings()"><span data-i18n="save">💾 حفظ</span></button></div>
- </div>
-</div>
+<div id="settingsModal" class="modal"><div class="modalbox"><h2 style="margin:0">⚙️ <span data-i18n="botInstructions">تعليمات البوت</span></h2><p class="muted" data-i18n="instructionNote">يمكن تعديل الـsystem instruction مباشرة.</p><textarea id="instruction"></textarea><div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn" onclick="closeSettings()"><span data-i18n="cancel">إلغاء</span></button><button class="btn success" onclick="saveSettings()"><span data-i18n="save">💾 حفظ</span></button></div></div></div>
+<div id="toast" class="toast"></div>
 
 <script>
-const I18N = {
-  ar: {
-    chats:"المحادثات", appointments:"المواعيد", stats:"الإحصائيات", instructions:"التعليمات",
-    patients:"العملاء", allMessages:"كل الرسائل", incoming24:"رسائل آخر 24 ساعة",
-    staff24:"تدخل بشري 24 ساعة", pausedChats:"محادثات موقوفة",
-    searchPlaceholder:"بحث بالاسم أو رقم الهاتف...", selectChat:"اختر محادثة",
-    chatWillAppear:"المحادثة ستظهر هنا.", manualReplyPlaceholder:"اكتب رسالة يدوية للمريض...",
-    send:"إرسال", scheduleTitle:"جدول المواعيد", refresh:"تحديث",
-    statsNote:"هذه الأرقام تأتي مباشرة من قاعدة البيانات.", auditTitle:"🧾 آخر عمليات الإدارة",
-    botInstructions:"تعليمات البوت",
-    instructionNote:"يمكن تعديل الـsystem instruction مباشرة. احفظ نسخة احتياطية قبل تغييرات كبيرة.",
-    cancel:"إلغاء", save:"حفظ", newPatient:"مريض جديد", noMessages:"لا رسائل",
-    humanTakeover:"تدخل بشري", resumeBot:"تشغيل البوت", pauseBot:"إيقاف البوت",
-    patientNamePrompt:"اسم المريض:", tagsPrompt:"Tags مفصولة بفواصل:",
-    sendPauseConfirm:"إرسال الرسالة للمريض وإيقاف البوت لهذا الشات؟",
-    loading:"جاري التحميل...", enableGlobal:"تشغيل البوت عالمياً؟",
-    disableGlobal:"إيقاف البوت عالمياً؟", instructionTooShort:"التعليمات قصيرة جداً",
-    saved:"تم الحفظ", botRunning:"البوت يعمل", botStopped:"البوت متوقف",
-    english:"🇬🇧 English", arabic:"🇪🇬 العربية"
-  },
-  en: {
-    chats:"Chats", appointments:"Appointments", stats:"Analytics", instructions:"Bot Instructions",
-    patients:"Patients", allMessages:"All Messages", incoming24:"Incoming (24h)",
-    staff24:"Human Intervention (24h)", pausedChats:"Paused Chats",
-    searchPlaceholder:"Search by name or phone number...", selectChat:"Select a conversation",
-    chatWillAppear:"The conversation will appear here.", manualReplyPlaceholder:"Write a manual message to the patient...",
-    send:"Send", scheduleTitle:"Appointment Schedule", refresh:"Refresh",
-    statsNote:"These numbers come directly from the database.", auditTitle:"🧾 Recent Admin Activity",
-    botInstructions:"Bot Instructions",
-    instructionNote:"You can edit the system instruction directly. Back up your current version before making major changes.",
-    cancel:"Cancel", save:"Save", newPatient:"New Patient", noMessages:"No messages",
-    humanTakeover:"Human takeover", resumeBot:"Resume Bot", pauseBot:"Pause Bot",
-    patientNamePrompt:"Patient name:", tagsPrompt:"Tags separated by commas:",
-    sendPauseConfirm:"Send this message and pause the bot for this chat?",
-    loading:"Loading...", enableGlobal:"Enable the bot globally?",
-    disableGlobal:"Disable the bot globally?", instructionTooShort:"The instructions are too short",
-    saved:"Saved", botRunning:"Bot is running", botStopped:"Bot is stopped",
-    english:"🇬🇧 English", arabic:"🇪🇬 العربية"
-  }
+const I18N={
+ ar:{chats:"المحادثات",appointments:"المواعيد",stats:"الإحصائيات",patients:"العملاء",allMessages:"كل الرسائل",incoming24:"رسائل آخر 24 ساعة",staff24:"تدخل بشري 24 ساعة",pausedChats:"محادثات موقوفة",searchPlaceholder:"بحث بالاسم أو رقم الهاتف...",selectChat:"اختر محادثة",chatWillAppear:"المحادثة ستظهر هنا.",manualReplyPlaceholder:"اكتب رسالة يدوية للمريض...",send:"إرسال",scheduleTitle:"جدول المواعيد",refresh:"تحديث",analyticsTitle:"الإحصائيات",statsNote:"هذه الأرقام تأتي مباشرة من قاعدة البيانات.",auditTitle:"🧾 آخر عمليات الإدارة",botInstructions:"تعليمات البوت",instructionNote:"يمكن تعديل تعليمات النظام مباشرة.",cancel:"إلغاء",save:"حفظ",newPatient:"مريض جديد",noMessages:"لا رسائل",humanTakeover:"تدخل بشري",resumeBot:"تشغيل البوت",pauseBot:"إيقاف البوت",patientNamePrompt:"اسم المريض:",tagsPrompt:"Tags مفصولة بفواصل:",sendPauseConfirm:"إرسال الرسالة للمريض وإيقاف البوت لهذا الشات؟",loading:"جاري التحميل...",enableGlobal:"تشغيل البوت عالمياً؟",disableGlobal:"إيقاف البوت عالمياً؟",instructionTooShort:"التعليمات قصيرة جداً",saved:"تم الحفظ",botRunning:"البوت يعمل",botStopped:"البوت متوقف",english:"🇬🇧 English",arabic:"🇪🇬 العربية",patientDetails:"تفاصيل المريض",rename:"الاسم",filterAll:"الكل",filterPaused:"موقوف",filterActive:"نشط",notes:"ملاحظات / تفضيلات",quickReplies:"ردود سريعة",appointment:"المواعيد",openProfile:"فتح التفاصيل",copy:"نسخ",copied:"تم النسخ",noTags:"لا توجد tags",loadOlder:"تحميل رسائل أقدم",olderLoaded:"تم تحميل الرسائل الأقدم",noOlder:"لا توجد رسائل أقدم",botStatus:"حالة البوت",phone:"الهاتف",created:"تاريخ الإنشاء",updated:"آخر تحديث",close:"إغلاق"},
+ en:{chats:"Chats",appointments:"Appointments",stats:"Analytics",patients:"Patients",allMessages:"All messages",incoming24:"Incoming 24h",staff24:"Staff replies 24h",pausedChats:"Human takeovers",searchPlaceholder:"Search name or phone...",selectChat:"Select a conversation",chatWillAppear:"The conversation will appear here.",manualReplyPlaceholder:"Write a manual message to the patient...",send:"Send",scheduleTitle:"Appointment Schedule",refresh:"Refresh",analyticsTitle:"Analytics",statsNote:"These numbers come directly from the database.",auditTitle:"🧾 Recent Admin Activity",botInstructions:"Bot Instructions",instructionNote:"Edit the live system instruction directly.",cancel:"Cancel",save:"Save",newPatient:"New patient",noMessages:"No messages",humanTakeover:"Human takeover",resumeBot:"Resume bot",pauseBot:"Pause bot",patientNamePrompt:"Patient name:",tagsPrompt:"Tags separated by commas:",sendPauseConfirm:"Send this message and pause the bot for this chat?",loading:"Loading...",enableGlobal:"Enable the bot globally?",disableGlobal:"Disable the bot globally?",instructionTooShort:"Instructions are too short",saved:"Saved",botRunning:"Bot running",botStopped:"Bot stopped",english:"🇬🇧 English",arabic:"🇪🇬 العربية",patientDetails:"Patient details",rename:"Name",filterAll:"All",filterPaused:"Paused",filterActive:"Active",notes:"Notes / preferences",quickReplies:"Quick replies",appointment:"Appointments",openProfile:"Open details",copy:"Copy",copied:"Copied",noTags:"No tags",loadOlder:"Load older messages",olderLoaded:"Older messages loaded",noOlder:"No older messages",botStatus:"Bot status",phone:"Phone",created:"Created",updated:"Updated",close:"Close"}
 };
-
-let currentLang = localStorage.getItem("jothen_admin_lang") || "ar";
-function t(key){ return (I18N[currentLang] && I18N[currentLang][key]) || I18N.ar[key] || key; }
-
-function applyLanguage(){
-  const root=document.getElementById("htmlRoot");
-  root.lang=currentLang;
-  root.dir=currentLang==="ar" ? "rtl" : "ltr";
-  document.body.dir=root.dir;
-  document.documentElement.style.setProperty("--lang-dir", root.dir);
-
-  document.querySelectorAll("[data-i18n]").forEach(el => {
-    const key=el.getAttribute("data-i18n");
-    el.textContent=t(key);
-  });
-  document.querySelectorAll("[data-i18n-placeholder]").forEach(el => {
-    el.placeholder=t(el.getAttribute("data-i18n-placeholder"));
-  });
-
-  const b=document.getElementById("langBtn");
-  if(b) b.textContent=currentLang==="ar" ? t("english") : t("arabic");
-  updateGlobal();
-  if(typeof updatePause==="function") updatePause();
-  if(typeof renderPatients==="function") renderPatients();
-  if(typeof renderChat==="function" && currentPhone) renderChat();
-}
-function toggleLanguage(){
-  currentLang=currentLang==="ar" ? "en" : "ar";
-  localStorage.setItem("jothen_admin_lang",currentLang);
-  applyLanguage();
-}
-
-let patients=[],chats=[],currentPhone=null,currentPatient=null;
-
-function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
-function fmt(x){if(!x)return '';let d=new Date(x);return isNaN(d)?'':d.toLocaleString('ar-EG',{dateStyle:'short',timeStyle:'short'});}
-function view(id,btn){document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));if(btn)btn.classList.add('active');if(id==='schedule')loadSchedule();if(id==='stats')loadStats();}
-async function api(url,opt={}){let r=await fetch(url,opt);let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.detail||'Request failed');return j;}
-
-async function loadData(){
- try{
-  let q=encodeURIComponent(document.getElementById('search').value||'');
-  let d=await api('/admin/api/data?search='+q+'&limit=300');patients=d.patients||[];chats=d.chats||[];renderPatients();if(currentPhone)renderChat();loadStats();
- }catch(e){console.error(e);}
-}
-function renderPatients(){
- const box=document.getElementById('patients');box.innerHTML='';
- patients.forEach(p=>{
-  let el=document.createElement('div');el.className='patient'+(p.phone_number===currentPhone?' active':'');
-  el.innerHTML=`<div class="row"><span class="name">${esc(p.name||t('newPatient'))}</span><span class="muted">${fmt(p.last_msg_time)}</span></div>
-  <div class="last">${esc(p.last_message||t('noMessages'))}</div><div class="muted" dir="ltr">${esc(p.phone_number)}</div>
-  ${p.is_paused?'<span class="badge">⏸ '+t('humanTakeover')+'</span>':''}
-  ${(p.tags||[]).map(t=>'<span class="badge" style="margin-right:3px">'+esc(t)+'</span>').join('')}`;
-  el.onclick=()=>showChat(p);box.appendChild(el);
- });
-}
-function showChat(p){currentPhone=p.phone_number;currentPatient=p;document.getElementById('chatActions').style.display='flex';document.getElementById('composer').style.display='flex';document.getElementById('chatTitle').innerHTML=`<b>${esc(p.name||t('newPatient'))}</b> <span class="muted" dir="ltr">${esc(p.phone_number)}</span>`;updatePause();renderPatients();renderChat();}
-function renderChat(){
- if(!currentPhone)return;let rows=chats.filter(x=>x.phone_number===currentPhone),box=document.getElementById('messages');box.innerHTML='';
- rows.forEach(m=>{let el=document.createElement('div');el.className='msg '+m.role;el.innerHTML=`${esc(m.content)}<div class="meta">${fmt(m.created_at)}</div>`;box.appendChild(el);});
- box.scrollTop=box.scrollHeight;
-}
-function updatePause(){let b=document.getElementById('pauseBtn');if(!currentPatient)return;b.className='btn '+(currentPatient.is_paused?'success':'danger');b.textContent=currentPatient.is_paused?'▶️ '+t('resumeBot'):'⏸️ '+t('pauseBot');}
-async function togglePause(){if(!currentPhone)return;let next=!currentPatient.is_paused;await api('/admin/api/toggle_pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,is_paused:next})});currentPatient.is_paused=next;updatePause();loadData();}
-async function renamePatient(){if(!currentPhone)return;let n=prompt(t('patientNamePrompt'),currentPatient.name||'');if(!n)return;await api('/admin/api/rename_patient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,name:n})});loadData();}
-async function editTags(){if(!currentPhone)return;let old=(currentPatient.tags||[]).join(', ');let s=prompt(t('tagsPrompt'),old);if(s===null)return;let tags=s.split(',').map(x=>x.trim()).filter(Boolean);await api('/admin/api/patient_tags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,tags})});loadData();}
-async function sendStaff(){let box=document.getElementById('reply'),msg=box.value.trim();if(!currentPhone||!msg)return;if(!confirm(t('sendPauseConfirm')))return;await api('/admin/api/send_message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,message:msg,pause_after_send:true})});box.value='';currentPatient.is_paused=true;loadData();}
-async function loadSchedule(){
- let d=document.getElementById('date');if(!d.value){d.value=new Date().toISOString().slice(0,10)}
- let box=document.getElementById('slots');box.innerHTML='<p class="muted">'+t('loading')+'</p>';
- try{let data=await api('/admin/api/schedule?date='+d.value);let booked={};(data.booked||[]).forEach(x=>{let t=typeof x==='string'?x:x.time;booked[String(t).toUpperCase()]=x});let times=["12:00 PM","12:30 PM","1:00 PM","1:30 PM","2:00 PM","2:30 PM","3:00 PM","3:30 PM","4:00 PM","4:30 PM","5:00 PM","5:30 PM","6:00 PM","6:30 PM","7:00 PM","7:30 PM","8:00 PM","8:30 PM","9:00 PM","9:30 PM","10:00 PM"];box.innerHTML=times.map(t=>{let x=booked[t.toUpperCase()]||booked[t.replace(/^0/,'').toUpperCase()];return `<div class="slot ${x?'booked':'free'}"><div class="time">${t}</div><div>${x?'🔴 محجوز':'🟢 متاح'}</div>${x?`<div class="muted">${esc(x.name||'')}<br>${esc(x.phone||'')}<br>${esc(x.area||'')}</div>`:''}</div>`}).join('');}catch(e){box.innerHTML='<p style="color:#b42318">تعذر قراءة الجدول.</p>';}
-}
-async function loadStats(){
- try{let s=await api('/admin/api/stats');document.getElementById('sPatients').textContent=s.patients;document.getElementById('sMessages').textContent=s.messages;document.getElementById('sIncoming').textContent=s.incoming_24h;document.getElementById('sStaff').textContent=s.staff_24h;document.getElementById('sTakeovers').textContent=s.human_takeovers;document.getElementById('statsDetail').innerHTML=`<p>حالة البوت: <b>${s.bot_active?'🟢 يعمل':'🔴 متوقف'}</b></p><p>العملاء: ${s.patients}</p><p>إجمالي الرسائل: ${s.messages}</p><p>الواردة آخر 24 ساعة: ${s.incoming_24h}</p><p>رسائل الموظفين آخر 24 ساعة: ${s.staff_24h}</p><p>التدخل البشري الحالي: ${s.human_takeovers}</p>`;let a=await api('/admin/api/audit?limit=100');document.getElementById('audit').innerHTML=(a.audit||[]).map(x=>`<div style="padding:8px;border-bottom:1px solid #eee"><b>${esc(x.action)}</b> — ${esc(x.actor)} <span class="muted">${fmt(x.created_at)}</span><br><span class="muted">${esc(x.phone_number||'')} ${esc(x.details||'')}</span></div>`).join('');}catch(e){}
-}
-async function toggleGlobal(){let s=await api('/admin/api/bot_status');let next=!s.is_active;if(!confirm(next?t('enableGlobal'):t('disableGlobal')))return;await api('/admin/api/toggle_global_bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({is_active:next})});updateGlobal();}
-async function updateGlobal(){try{let s=await api('/admin/api/bot_status');let b=document.getElementById('globalBtn');b.textContent=s.is_active?'🟢 '+t('botRunning'):'🔴 '+t('botStopped');b.className='btn '+(s.is_active?'success':'danger')}catch(e){}}
-async function openSettings(){let d=await api('/admin/api/settings');document.getElementById('instruction').value=d.instruction;document.getElementById('settingsModal').classList.add('open')}
+let currentLang=localStorage.getItem('jothen_admin_lang')||'ar',patients=[],currentPhone=null,currentPatient=null,currentMessages=[],hasMore=false,oldestId=null,filter='all',polling=false,patientTimer=null,chatTimer=null;
+function t(k){return (I18N[currentLang]?.[k]||I18N.ar[k]||k)}
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
+function fmt(x){if(!x)return '';const d=new Date(x);if(isNaN(d))return '';return d.toLocaleString(currentLang==='ar'?'ar-EG':'en-EG',{dateStyle:'short',timeStyle:'short'})}
+function applyLanguage(){const root=document.getElementById('htmlRoot');root.lang=currentLang;root.dir=currentLang==='ar'?'rtl':'ltr';document.body.dir=root.dir;document.documentElement.style.setProperty('--dir',root.dir);document.querySelectorAll('[data-i18n]').forEach(e=>e.textContent=t(e.dataset.i18n));document.querySelectorAll('[data-i18n-placeholder]').forEach(e=>e.placeholder=t(e.dataset.i18nPlaceholder));document.getElementById('langBtn').textContent=currentLang==='ar'?t('english'):t('arabic');updateGlobal();updatePause();renderPatients();if(currentPhone){renderChat();renderProfile()}}
+function toggleLanguage(){currentLang=currentLang==='ar'?'en':'ar';localStorage.setItem('jothen_admin_lang',currentLang);applyLanguage()}
+function view(id,btn){document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));if(btn)btn.classList.add('active');if(id==='schedule')loadSchedule();if(id==='stats')loadStats()}
+async function api(url,opt={}){const r=await fetch(url,opt);const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.detail||'Request failed');return j}
+function toast(msg){const e=document.getElementById('toast');e.textContent=msg;e.classList.add('show');clearTimeout(window.__tt);window.__tt=setTimeout(()=>e.classList.remove('show'),1800)}
+function setFilter(f,btn){filter=f;document.querySelectorAll('.filter').forEach(x=>x.classList.remove('active'));btn.classList.add('active');loadPatients(true)}
+function debouncedLoadPatients(){clearTimeout(patientTimer);patientTimer=setTimeout(()=>loadPatients(true),250)}
+async function loadPatients(reset=false){try{const q=encodeURIComponent(document.getElementById('search').value||'');let url='/admin/api/data?search='+q+'&limit=300&include_chats=false';if(filter==='paused')url+='&paused=true';if(filter==='active')url+='&paused=false';const d=await api(url);const oldCurrent=currentPhone;patients=d.patients||[];renderPatients();if(!currentPhone&&patients[0]) showChat(patients[0]);else if(oldCurrent&&currentPatient){const p=patients.find(x=>x.phone_number===oldCurrent);if(p){currentPatient={...currentPatient,...p};updatePause();renderProfile()}}}catch(e){console.error(e);}}
+function renderPatients(){const box=document.getElementById('patients');const keep=box.scrollTop;box.innerHTML='';if(!patients.length){box.innerHTML='<div class="empty">'+t('noMessages')+'</div>';return}patients.forEach(p=>{const el=document.createElement('div');el.className='patient'+(p.phone_number===currentPhone?' active':'');const tags=(p.tags||[]).map(x=>'<span class="badge">🏷️ '+esc(x)+'</span>').join('');el.innerHTML=`<div class="row"><span class="name">${esc(p.name||t('newPatient'))}</span><span class="muted">${fmt(p.last_msg_time)}</span></div><div class="last">${esc(p.last_message||t('noMessages'))}</div><div class="phone" dir="ltr">${esc(p.phone_number)}</div>${p.is_paused?'<span class="badge red">⏸ '+t('humanTakeover')+'</span>':''}${tags}`;el.onclick=()=>showChat(p);box.appendChild(el)});box.scrollTop=keep}
+function showChat(p){currentPhone=p.phone_number;currentPatient=p;document.getElementById('chatActions').style.display='flex';document.getElementById('composer').style.display='flex';document.getElementById('chatTitle').innerHTML=`<div class="title">${esc(p.name||t('newPatient'))}</div><div class="sub"><span class="muted" dir="ltr">${esc(p.phone_number)}</span>${p.is_paused?'<span class="badge red">⏸ '+t('humanTakeover')+'</span>':''}</div>`;updatePause();renderPatients();loadChat(true);renderProfile();closeSidebar()}
+async function loadChat(reset=false){if(!currentPhone)return;const box=document.getElementById('messages');const nearBottom=box.scrollHeight-box.scrollTop-box.clientHeight<120;if(reset){currentMessages=[];oldestId=null;hasMore=false;box.innerHTML='<div class="empty">'+t('loading')+'</div>'}try{let url='/admin/api/patient/'+encodeURIComponent(currentPhone)+'?limit=60';if(!reset&&oldestId)url+='&before_id='+encodeURIComponent(oldestId);const d=await api(url);if(reset){currentMessages=d.messages||[];hasMore=!!d.has_more;oldestId=currentMessages[0]?.id||null;renderChat();scrollToBottom(true)}else{const incoming=d.messages||[];const known=new Set(currentMessages.map(m=>m.id));const fresh=incoming.filter(m=>!known.has(m.id));if(fresh.length){const wasNear=box.scrollHeight-box.scrollTop-box.clientHeight<160;currentMessages=currentMessages.concat(fresh).sort((a,b)=>Number(a.id)-Number(b.id));renderChat();if(wasNear)scrollToBottom(true)}}}catch(e){console.error(e)}}
+async function loadOlder(){if(!currentPhone||!hasMore||!oldestId)return;const box=document.getElementById('messages');const oldHeight=box.scrollHeight,oldTop=box.scrollTop;try{const d=await api('/admin/api/patient/'+encodeURIComponent(currentPhone)+'?limit=60&before_id='+encodeURIComponent(oldestId));const older=d.messages||[];if(!older.length){hasMore=false;toast(t('noOlder'));return}currentMessages=older.concat(currentMessages);oldestId=currentMessages[0]?.id||null;hasMore=!!d.has_more;renderChat();box.scrollTop=box.scrollHeight-oldHeight+oldTop;toast(t('olderLoaded'))}catch(e){toast(e.message)}}
+function sameDay(a,b){if(!a||!b)return false;const da=new Date(a),db=new Date(b);return da.toDateString()===db.toDateString()}
+function renderChat(){if(!currentPhone)return;const box=document.getElementById('messages');const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<120;box.innerHTML='';if(hasMore)box.insertAdjacentHTML('beforeend',`<button class="load-older" onclick="loadOlder()">↑ ${t('loadOlder')}</button>`);let prev=null;currentMessages.forEach(m=>{if(!sameDay(prev,m.created_at))box.insertAdjacentHTML('beforeend',`<div class="date-sep">${new Date(m.created_at).toLocaleDateString(currentLang==='ar'?'ar-EG':'en-EG',{weekday:'short',month:'short',day:'numeric'})}</div>`);const el=document.createElement('div');el.className='msg '+m.role;el.dataset.id=m.id;el.innerHTML=`${esc(m.content)}<button class="copy" onclick="copyMsg(event,${JSON.stringify(String(m.content)).replace(/</g,'\\u003c')})">${t('copy')}</button><div class="meta">${fmt(m.created_at)}</div>`;box.appendChild(el);prev=m.created_at});if(atBottom)scrollToBottom(false)}
+function copyMsg(ev,text){ev.stopPropagation();navigator.clipboard?.writeText(text).then(()=>toast(t('copied')))}
+function scrollToBottom(force=true){const b=document.getElementById('messages');b.scrollTop=b.scrollHeight;if(force)document.getElementById('jumpBtn').classList.remove('show')}
+function updateJump(){const b=document.getElementById('messages');document.getElementById('jumpBtn').classList.toggle('show',b.scrollHeight-b.scrollTop-b.clientHeight>180)}
+function updatePause(){const b=document.getElementById('pauseBtn');if(!b||!currentPatient)return;b.className='btn '+(currentPatient.is_paused?'success':'danger');b.textContent=currentPatient.is_paused?'▶️ '+t('resumeBot'):'⏸️ '+t('pauseBot')}
+async function togglePause(){if(!currentPhone)return;const next=!currentPatient.is_paused;await api('/admin/api/toggle_pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,is_paused:next})});currentPatient.is_paused=next;updatePause();await loadPatients(true);renderProfile()}
+async function renamePatient(){if(!currentPhone)return;const n=prompt(t('patientNamePrompt'),currentPatient.name||'');if(!n)return;await api('/admin/api/rename_patient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,name:n})});currentPatient.name=n;await loadPatients(true);showChat(currentPatient);toast(t('saved'))}
+async function editTags(){if(!currentPhone)return;const old=(currentPatient.tags||[]).join(', ');const s=prompt(t('tagsPrompt'),old);if(s===null)return;const tags=s.split(',').map(x=>x.trim()).filter(Boolean);await api('/admin/api/patient_tags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,tags})});currentPatient.tags=tags;await loadPatients(true);renderProfile();toast(t('saved'))}
+async function sendStaff(){const box=document.getElementById('reply'),msg=box.value.trim();if(!currentPhone||!msg)return;if(!confirm(t('sendPauseConfirm')))return;try{await api('/admin/api/send_message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,message:msg,pause_after_send:true})});box.value='';currentPatient.is_paused=true;currentMessages.push({id:Date.now(),role:'staff',content:msg,created_at:new Date().toISOString()});renderChat();scrollToBottom(true);updatePause();await loadPatients(true);renderProfile()}catch(e){toast(e.message)}}
+function composerKeydown(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendStaff()}}
+function renderProfile(){const b=document.getElementById('profileBody');if(!currentPatient){b.innerHTML='<div class="empty">'+t('selectChat')+'</div>';return}const tags=(currentPatient.tags||[]).length?(currentPatient.tags||[]).map(x=>`<span class="badge blue">${esc(x)}</span>`).join(''):`<span class="muted">${t('noTags')}</span>`;b.innerHTML=`<div class="profile-card"><h4>${esc(currentPatient.name||t('newPatient'))}</h4><div class="kv"><b>${t('phone')}</b><span dir="ltr">${esc(currentPatient.phone_number)}</span></div><div class="kv"><b>${t('botStatus')}</b><span>${currentPatient.is_paused?'🔴 '+t('pauseBot'):'🟢 '+t('botRunning')}</span></div><div class="kv"><b>${t('created')}</b><span>${fmt(currentPatient.created_at)}</span></div><div class="kv"><b>${t('updated')}</b><span>${fmt(currentPatient.updated_at)}</span></div></div><div class="profile-card"><h4>${t('notes')}</h4><textarea id="prefsInput" rows="7">${esc(currentPatient.preferences||'')}</textarea><button class="btn primary" style="margin-top:7px;width:100%" onclick="savePreferences()">💾 ${t('save')}</button></div><div class="profile-card"><h4>🏷️ Tags</h4><div class="tags">${tags}</div><button class="btn" style="margin-top:8px;width:100%" onclick="editTags()">✏️ ${t('rename')}</button></div><div class="profile-card"><h4>⚡ ${t('quickReplies')}</h4><div class="quick"><button onclick="useQuick('مرحبا! كيف يمكننا مساعدتك؟')">👋 Greeting</button><button onclick="useQuick('تم استلام رسالتك، وسيتواصل معك فريق العيادة قريباً.')">📩 Received</button><button onclick="useQuick('يمكننا مساعدتك في حجز موعد مناسب. ما اليوم المناسب لك؟')">📅 Booking</button></div></div><div class="profile-card"><h4>🛠️</h4><div class="profile-actions"><button class="btn" onclick="renamePatient()">✏️ ${t('rename')}</button><button class="btn" onclick="togglePause()">⏯️ ${currentPatient.is_paused?t('resumeBot'):t('pauseBot')}</button><button class="btn wide primary" onclick="loadChat(true);closeProfile()">↻ Refresh chat</button></div></div>`}
+async function savePreferences(){const v=document.getElementById('prefsInput')?.value??'';await api('/admin/api/patient_preferences',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,preferences:v})});currentPatient.preferences=v;toast(t('saved'))}
+function useQuick(v){document.getElementById('reply').value=v;document.getElementById('reply').focus()}
+function openProfile(){document.getElementById('profilePanel').classList.add('mobile-open')}
+function closeProfile(){document.getElementById('profilePanel').classList.remove('mobile-open')}
+function openSidebar(){document.getElementById('sidebar').classList.remove('mobile-hidden')}
+function closeSidebar(){if(window.innerWidth<=800)document.getElementById('sidebar').classList.add('mobile-hidden')}
+async function loadSchedule(){const d=document.getElementById('date');if(!d.value)d.value=new Date().toISOString().slice(0,10);const box=document.getElementById('slots');box.innerHTML='<p class="muted">'+t('loading')+'</p>';try{const data=await api('/admin/api/schedule?date='+d.value);const booked={};(data.booked||[]).forEach(x=>{const tm=typeof x==='string'?x:x.time;booked[String(tm).toUpperCase()]=x});const times=['12:00 PM','12:30 PM','1:00 PM','1:30 PM','2:00 PM','2:30 PM','3:00 PM','3:30 PM','4:00 PM','4:30 PM','5:00 PM','5:30 PM','6:00 PM','6:30 PM','7:00 PM','7:30 PM','8:00 PM','8:30 PM','9:00 PM','9:30 PM','10:00 PM'];box.innerHTML=times.map(tm=>{const x=booked[tm.toUpperCase()]||booked[tm.replace(/^0/,'').toUpperCase()];return `<div class="slot ${x?'booked':'free'}"><div class="time">${tm}</div><div>${x?'🔴 Booked':'🟢 Available'}</div>${x?`<div class="muted">${esc(x.name||'')}<br>${esc(x.phone||'')}<br>${esc(x.area||'')}</div>`:''}</div>`}).join('')}catch(e){box.innerHTML='<p style="color:#b42318">'+esc(e.message)+'</p>'}}
+async function loadStats(){try{const s=await api('/admin/api/stats');document.getElementById('sPatients').textContent=s.patients;document.getElementById('sMessages').textContent=s.messages;document.getElementById('sIncoming').textContent=s.incoming_24h;document.getElementById('sStaff').textContent=s.staff_24h;document.getElementById('sTakeovers').textContent=s.human_takeovers;document.getElementById('statsDetail').innerHTML=`<div class="detail-card"><b>🤖 ${t('botStatus')}</b><div>${s.bot_active?'🟢 '+t('botRunning'):'🔴 '+t('botStopped')}</div></div><div class="detail-card"><b>👥 ${t('patients')}</b><div>${s.patients}</div></div><div class="detail-card"><b>💬 ${t('allMessages')}</b><div>${s.messages}</div></div><div class="detail-card"><b>👨‍💼 ${t('staff24')}</b><div>${s.staff_24h}</div></div>`;const a=await api('/admin/api/audit?limit=100');document.getElementById('audit').innerHTML=(a.audit||[]).map(x=>`<div style="padding:8px;border-bottom:1px solid #eee"><b>${esc(x.action)}</b> — ${esc(x.actor)} <span class="muted">${fmt(x.created_at)}</span><br><span class="muted">${esc(x.phone_number||'')} ${esc(x.details||'')}</span></div>`).join('')}catch(e){}}
+async function toggleGlobal(){const s=await api('/admin/api/bot_status');const next=!s.is_active;if(!confirm(next?t('enableGlobal'):t('disableGlobal')))return;await api('/admin/api/toggle_global_bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({is_active:next})});updateGlobal()}
+async function updateGlobal(){try{const s=await api('/admin/api/bot_status');const b=document.getElementById('globalBtn');b.textContent=s.is_active?'🟢 '+t('botRunning'):'🔴 '+t('botStopped');b.className='btn '+(s.is_active?'success':'danger')}catch(e){}}
+async function openSettings(){try{const d=await api('/admin/api/settings');document.getElementById('instruction').value=d.instruction;document.getElementById('settingsModal').classList.add('open')}catch(e){toast(e.message)}}
 function closeSettings(){document.getElementById('settingsModal').classList.remove('open')}
-async function saveSettings(){let v=document.getElementById('instruction').value;if(v.trim().length<20)return alert(t('instructionTooShort'));await api('/admin/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:v})});alert(t('saved'));closeSettings();}
-document.addEventListener('DOMContentLoaded',()=>{loadData();updateGlobal();setInterval(loadData,5000);});
-applyLanguage();
+async function saveSettings(){const v=document.getElementById('instruction').value;if(v.trim().length<20)return alert(t('instructionTooShort'));try{await api('/admin/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:v})});alert(t('saved'));closeSettings()}catch(e){toast(e.message)}}
+document.getElementById('messages').addEventListener('scroll',function(){updateJump();if(this.scrollTop<80&&hasMore)loadOlder()});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&currentPhone)loadChat(false)});
+document.addEventListener('DOMContentLoaded',()=>{applyLanguage();loadPatients(true);loadStats();updateGlobal();setInterval(()=>{loadPatients(false);if(currentPhone)loadChat(false)},5000);closeSidebar()});
 </script>
-</body>
-</html>
+</body></html>
