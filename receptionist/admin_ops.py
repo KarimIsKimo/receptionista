@@ -55,7 +55,6 @@ def sort_inbox_rows(rows: list[dict]) -> list[dict]:
 def build_dashboard_metrics(row: dict) -> dict:
     incoming = int(row.get("unique_incoming_patients_today") or 0)
     bookings = int(row.get("bookings_today") or 0)
-    conversion = round((bookings / incoming) * 100, 1) if incoming else None
     return {
         "total_patients": int(row.get("total_patients") or 0),
         "conversations_today": int(row.get("conversations_today") or 0),
@@ -67,9 +66,10 @@ def build_dashboard_metrics(row: dict) -> dict:
         "bookings_today": bookings,
         "cancellations_today": int(row.get("cancellations_today") or 0),
         "booking_conversion_rate": {
-            "value": conversion,
+            "value": None,
             "unit": "percent",
-            "status": "available" if conversion is not None else "unknown",
+            "status": "unknown",
+            "reason": "Bookings are not linked to a specific conversation session.",
         },
         # Apps Script has no global future-appointments endpoint. A partial cache
         # must not be presented as a global metric.
@@ -326,10 +326,11 @@ class AdminOperations:
             return None
         text = str(raw)
         for token in text.replace("/", "-").split():
-            try:
-                return dt.date.fromisoformat(token[:10])
-            except ValueError:
-                continue
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+                try:
+                    return dt.datetime.strptime(token[:10], fmt).date()
+                except ValueError:
+                    continue
         return None
 
     def _cache_appointments(
@@ -427,7 +428,14 @@ class AdminOperations:
                 raise AppsScriptTemporaryError("invalid_schedule")
             by_time: dict[str, Any] = {}
             for item in booked:
-                raw_time = item.get("time") if isinstance(item, dict) else item
+                raw_time = (
+                    next(
+                        (item.get(key) for key in ("time", "appointment_time", "Time", "الوقت") if item.get(key)),
+                        None,
+                    )
+                    if isinstance(item, dict)
+                    else item
+                )
                 if not isinstance(raw_time, str) or not raw_time.strip():
                     raise AppsScriptTemporaryError("invalid_schedule_item")
                 normalized = normalize_time(raw_time)
@@ -490,7 +498,7 @@ class AdminOperations:
                     (SELECT COUNT(*) FROM audit_log WHERE action='appointment_booked'
                      AND created_at >= date_trunc('day',NOW() AT TIME ZONE 'Africa/Cairo')
                          AT TIME ZONE 'Africa/Cairo') AS bookings_today,
-                    (SELECT COUNT(*) FROM audit_log WHERE action IN ('appointment_cancelled','appointment_cancel')
+                    (SELECT COUNT(*) FROM audit_log WHERE action='appointment_cancelled'
                      AND created_at >= date_trunc('day',NOW() AT TIME ZONE 'Africa/Cairo')
                          AT TIME ZONE 'Africa/Cairo') AS cancellations_today
                 """,

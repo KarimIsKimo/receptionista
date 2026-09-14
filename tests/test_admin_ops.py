@@ -108,7 +108,8 @@ class AdminOperationsTests(unittest.TestCase):
             "bookings_today": 2,
             "cancellations_today": 1,
         })
-        self.assertEqual(metrics["booking_conversion_rate"]["value"], 50.0)
+        self.assertIsNone(metrics["booking_conversion_rate"]["value"])
+        self.assertEqual(metrics["booking_conversion_rate"]["status"], "unknown")
         self.assertIsNone(metrics["upcoming_appointments"]["value"])
 
     def test_schedule_failure_is_not_empty_availability(self):
