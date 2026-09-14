@@ -71,10 +71,15 @@ class BookingService:
     def _request(self, method: str, payload: dict) -> dict:
         callback = self._get_func if method == "GET" else self._post_func
         if callback:
-            data = callback(payload)
-            if not isinstance(data, dict):
-                raise AppsScriptTemporaryError("invalid_json")
-            return data
+            try:
+                data = callback(payload)
+                if not isinstance(data, dict):
+                    raise AppsScriptTemporaryError("invalid_json")
+                return data
+            except AppsScriptTemporaryError:
+                raise
+            except Exception as exc:
+                raise AppsScriptTemporaryError("temporarily_unavailable") from exc
         last_error: Exception | None = None
         for attempt in range(3):
             try:
@@ -226,7 +231,7 @@ class BookingService:
             })
             if data.get("status") == "error" or data.get("success") is False:
                 return result(False, "reschedule_rejected", str(data.get("message") or "تعذر تغيير الموعد."))
-            if data.get("rescheduled") or data.get("success") is True or data.get("status") in {"ok", "success"}:
+            if data.get("rescheduled") is True:
                 if self._on_audit:
                     self._on_audit("appointment_rescheduled", phone, f"{old_date.isoformat()} -> {new_date.isoformat()} {new_slot}")
                 return result(True, "rescheduled", f"تم تغيير الحجز إلى {new_date.isoformat()} الساعة {new_slot}.", old_date=old_date.isoformat(), date=new_date.isoformat(), time=new_slot)

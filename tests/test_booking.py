@@ -65,6 +65,15 @@ class BookingTests(unittest.TestCase):
         self.assertEqual(answer["appointment"]["phone_number"], "201012345678")
         self.assertEqual(fake.posts[0]["date"], "2026-09-15")
 
+    def test_temporary_google_failure_never_confirms_booking(self):
+        fake = FakeAppsScript()
+        fake.fail = True
+        answer = self.service(fake).book("Mona", "01012345678", "tomorrow", "7:00 PM", "underarm")
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["code"], "booking_service_unavailable")
+        self.assertTrue(answer["retryable"])
+        self.assertEqual(fake.posts, [])
+
     def test_cancel_returns_structured_result(self):
         answer = self.service(FakeAppsScript()).cancel("01012345678", "Thursday")
         self.assertTrue(answer["ok"])

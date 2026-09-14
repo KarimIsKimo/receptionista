@@ -17,7 +17,7 @@ class DateParsingTests(unittest.TestCase):
         self.assertEqual(parse_date_expression("Thursday", now=self.now), dt.date(2026, 9, 17))
         self.assertEqual(parse_date_expression("الخميس", now=self.now), dt.date(2026, 9, 17))
 
-    def test_next_weekday_means_following_week(self):
+    def test_next_weekday_means_next_occurrence(self):
         self.assertEqual(parse_date_expression("next Saturday", now=self.now), dt.date(2026, 9, 19))
         self.assertEqual(parse_date_expression("السبت الجاي", now=self.now), dt.date(2026, 9, 19))
 
