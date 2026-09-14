@@ -21,6 +21,10 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
+from receptionist.booking import BookingService, normalize_time
+from receptionist.clinic import CLINIC, clinic_prompt
+from receptionist.dates import parse_date_expression
+
 # ============================================================
 # JOTHEN CLINICS - NASR CITY AI RECEPTIONIST v2
 # ============================================================
@@ -46,7 +50,7 @@ from google.genai import types
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("jothen")
 
-CAIRO = ZoneInfo("Africa/Cairo")
+CAIRO = CLINIC.timezone
 HTTP_TIMEOUT = httpx.Timeout(30.0, connect=15.0)
 
 def required_env(name: str) -> str:
@@ -134,9 +138,7 @@ DEFAULT_SYSTEM_INSTRUCTION = """<role_definition>
 </role_definition>
 
 <hard_constraints>
-1. إذا سأل العميل عن الموقع:
-   أجيبي: "عيادة 104، 8 ش الدكتور حسن الشريف، مدينة نصر"
-   واستدعي send_clinic_media(["branches"]).
+1. إذا سأل العميل عن الموقع، استخدمي الفرع والعنوان من "بيانات العيادة الرسمية" أدناه، ثم استدعي send_clinic_media(["branches"]).
 2. إذا سأل عن رقم الهاتف فلا تسأليه مرة أخرى؛ استخدمي الرقم المتاح في إعدادات العيادة إذا كان مسجلاً.
 3. أسئلة الليزر الروتينية يتم الرد عليها من الـFAQ أدناه.
 4. الأسئلة الطبية المعقدة أو الشكاوى أو Botox/Filler/Dermatology:
@@ -144,8 +146,7 @@ DEFAULT_SYSTEM_INSTRUCTION = """<role_definition>
    لا تقولي إن الطبيب/الإدارة سيتواصل معه.
 5. السعر غير الموجود في قاعدة الأسعار:
    استدعي notify_staff ثم قولي إن الأسعار المتاحة لديك هي الأسعار القياسية فقط.
-6. الجمعة إجازة ولا يمكن الحجز فيها.
-7. ساعات الحجز من 12:00 PM إلى 10:00 PM.
+6. اتبعي أيام وساعات الحجز الموجودة في "بيانات العيادة الرسمية" أدناه؛ فهي المرجع النهائي.
 8. إذا كانت الرسالة غامضة أو بها typo، اطلبي التوضيح بدل التخمين.
 9. لا تخترعي موعداً متاحاً. يجب استخدام check_schedule قبل الحجز.
 10. لا تؤكدي نجاح الحجز إلا بعد نجاح book_appointment.
@@ -452,7 +453,7 @@ def update_patient_file(phone_number: str, name: str = "", preferences: str = ""
         """,
         (phone_number, (name or "").strip(), (preferences or "").strip()),
     )
-    return "تم تحديث ملف العميل بنجاح."
+    return {"ok": True, "code": "patient_updated", "message": "تم تحديث ملف المريضة.", "patient_name": (name or "").strip()}
 
 def set_patient_pause(phone_number: str, paused: bool):
     phone_number = normalize_phone(phone_number)
@@ -573,119 +574,58 @@ async def cleanup_locks():
 # Appointment / Google Apps Script helpers
 # ------------------------------------------------------------
 
-CLINIC_TIMES = [
-    f"{hour:02d}:{minute:02d} {ampm}"
-    for hour in range(12, 11)  # replaced below
-    for minute in (0, 30)
-    for ampm in ("PM",)
-]
-CLINIC_TIMES = [
-    "12:00 PM","12:30 PM","1:00 PM","1:30 PM","2:00 PM","2:30 PM",
-    "3:00 PM","3:30 PM","4:00 PM","4:30 PM","5:00 PM","5:30 PM",
-    "6:00 PM","6:30 PM","7:00 PM","7:30 PM","8:00 PM","8:30 PM",
-    "9:00 PM","9:30 PM","10:00 PM"
-]
+booking_service = BookingService(
+    GOOGLE_SHEET_URL,
+    config=CLINIC,
+    on_booked=lambda phone, name, preference: update_patient_file(
+        phone, name=name, preferences=preference
+    ),
+    on_audit=lambda action, phone, details: audit("bot", action, phone, details),
+)
 
-def normalize_time(value: str) -> str:
-    raw = (value or "").strip().upper().replace(".", "")
-    for fmt in ("%H:%M", "%I:%M %p", "%I %p"):
-        try:
-            return dt.datetime.strptime(raw, fmt).strftime("%-I:%M %p")
-        except ValueError:
-            pass
-    # Windows-compatible fallback for environments where %-I is unsupported.
-    for fmt in ("%H:%M", "%I:%M %p", "%I %p"):
-        try:
-            x = dt.datetime.strptime(raw, fmt)
-            return x.strftime("%I:%M %p").lstrip("0")
-        except ValueError:
-            pass
-    return raw
 
 def parse_date(value: str) -> dt.date:
-    return dt.date.fromisoformat((value or "").strip())
+    """Parse an absolute or relative date in the clinic's Cairo timezone."""
+    return parse_date_expression(value, now=CLINIC.now(), timezone=CLINIC.timezone)
+
 
 def validate_booking(date_str: str, time_str: str):
-    try:
-        date = parse_date(date_str)
-    except ValueError:
-        raise ValueError("صيغة التاريخ غير صحيحة. استخدم YYYY-MM-DD.")
+    date = booking_service._validate_date(date_str)
+    return date, booking_service._validate_slot(date, time_str)
 
-    if date.weekday() == 4:
-        raise ValueError("الجمعة إجازة ولا يمكن الحجز فيها.")
-
-    time_norm = normalize_time(time_str)
-    if time_norm not in CLINIC_TIMES:
-        raise ValueError("الموعد يجب أن يكون بين 12:00 PM و10:00 PM وبفواصل نصف ساعة.")
-
-    return date, time_norm
 
 def google_get(params: dict) -> dict:
-    with httpx.Client(follow_redirects=True, timeout=15.0) as c:
-        r = c.get(GOOGLE_SHEET_URL, params=params)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, dict):
-            raise RuntimeError("Google Sheet returned invalid JSON.")
-        return data
+    return booking_service._request("GET", params)
+
 
 def google_post(payload: dict) -> dict:
-    with httpx.Client(follow_redirects=True, timeout=20.0) as c:
-        r = c.post(GOOGLE_SHEET_URL, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, dict):
-            raise RuntimeError("Google Sheet returned invalid JSON.")
-        return data
+    return booking_service._request("POST", payload)
 
-def check_schedule(date: str) -> str:
-    try:
-        parse_date(date)
-        data = google_get({"date": date})
-        booked = data.get("booked", [])
-        if not booked:
-            return f"يوم {date} متاح بالكامل."
 
-        times = []
-        for item in booked:
-            if isinstance(item, dict):
-                times.append(item.get("time", ""))
-            else:
-                times.append(str(item))
-        times = [x for x in times if x]
-        return (
-            f"المواعيد المحجوزة مسبقاً يوم {date} هي: {', '.join(times)}"
-            if times else f"يوم {date} متاح بالكامل."
-        )
-    except Exception:
-        log.exception("check_schedule failed")
-        return "لا يمكن قراءة الجدول الآن."
+def check_schedule(date: str) -> dict:
+    """Return structured available and booked slots for a date."""
+    return booking_service.schedule(date)
 
-def check_patient_appointments(phone_number: str) -> str:
-    try:
-        data = google_get({"phone": normalize_phone(phone_number)})
-        appointments = data.get("appointments", [])
-        if appointments:
-            return f"حجوزات العميل الحالية: {', '.join(map(str, appointments))}"
-        return "لا يوجد حجوزات سابقة أو قادمة لهذا العميل."
-    except Exception:
-        log.exception("check_patient_appointments failed")
-        return "فشل في قراءة حجوزات العميل."
 
-def cancel_appointment(phone_number: str, date: str) -> str:
-    try:
-        parse_date(date)
-        data = google_post({
-            "action": "cancel",
-            "phone_number": normalize_phone(phone_number),
-            "date": date,
-        })
-        if data.get("deleted"):
-            return f"تم إلغاء الحجز القديم يوم {date} بنجاح."
-        return f"لم يتم العثور على حجز لإلغائه في يوم {date}."
-    except Exception:
-        log.exception("cancel_appointment failed")
-        return "فشل الاتصال بنظام الإلغاء."
+def check_patient_appointments(phone_number: str) -> dict:
+    """Return structured appointments for the supplied WhatsApp identity."""
+    return booking_service.appointments(phone_number)
+
+
+def cancel_appointment(phone_number: str, date: str) -> dict:
+    """Cancel a patient's appointment and return a structured result."""
+    return booking_service.cancel(phone_number, date)
+
+
+def reschedule_appointment(
+    phone_number: str,
+    old_date: str,
+    new_date: str,
+    new_time: str,
+) -> dict:
+    """Move an existing appointment only when Apps Script confirms the change."""
+    return booking_service.reschedule(phone_number, old_date, new_date, new_time)
+
 
 def book_appointment(
     patient_name: str,
@@ -693,47 +633,10 @@ def book_appointment(
     date: str,
     time: str,
     area: str,
-) -> str:
-    if not patient_name.strip():
-        return "فشل الحجز: اسم العميل مطلوب."
-    if not area.strip():
-        return "فشل الحجز: المنطقة مطلوبة."
+) -> dict:
+    """Book only after re-checking the authoritative Apps Script schedule."""
+    return booking_service.book(patient_name, phone_number, date, time, area)
 
-    try:
-        _, standard_time = validate_booking(date, time)
-        phone = normalize_phone(phone_number)
-        if len(phone) < 10:
-            return "فشل الحجز: رقم الهاتف غير صحيح."
-
-        # IMPORTANT: the Apps Script remains the source of truth for appointment slots.
-        data = google_post({
-            "action": "book",
-            "patient_name": patient_name.strip(),
-            "phone_number": phone,
-            "branch": "مدينة نصر",
-            "date": date,
-            "time": standard_time,
-            "area": area.strip(),
-        })
-        if data.get("status") == "error":
-            return f"فشل الحجز: {data.get('message', 'خطأ غير معروف')}"
-
-        update_patient_file(
-            phone,
-            patient_name,
-            f"حجز {area.strip()} ({date} {standard_time})",
-        )
-        audit("bot", "appointment_booked", phone, f"{date} {standard_time} - {area}")
-        return (
-            f"تم تسجيل الحجز بنجاح باسم {patient_name.strip()} "
-            f"بفرع مدينة نصر يوم {date} الساعة {standard_time} "
-            f"لمنطقة {area.strip()}."
-        )
-    except ValueError as e:
-        return f"فشل الحجز: {e}"
-    except Exception:
-        log.exception("book_appointment failed")
-        return "فشل الاتصال بنظام الحجز. لم يتم تأكيد الموعد."
 
 # ------------------------------------------------------------
 # WhatsApp outbound
@@ -819,6 +722,8 @@ def build_system_instruction(profile: dict, phone: str) -> str:
     return f"""
 {get_live_instructions()}
 
+{clinic_prompt()}
+
 === سياق العميل ===
 - العميل: {profile.get('name') or 'عميل جديد'}
 - الملاحظات: {profile.get('preferences') or 'لا يوجد'}
@@ -830,7 +735,10 @@ def build_system_instruction(profile: dict, phone: str) -> str:
 - لا تخترعي توفر موعد.
 - استخدمي check_schedule قبل book_appointment.
 - لا تعيدي تأكيد الحجز إلا بعد نجاح book_appointment.
+- رقم الهاتف يأتي تلقائياً من واتساب. ممنوع سؤال المريضة عن رقمها.
+- إذا كان الاسم محفوظاً أعلاه فلا تسألي عنه مرة أخرى.
 - إذا كانت البيانات ناقصة، اسألي فقط عن البيانات الناقصة.
+- اعتمدي على نتائج الأدوات بصيغة JSON: ok=true يعني نجاحاً مؤكداً، وok=false يعني عدم التأكيد.
 """
 
 def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
@@ -844,11 +752,11 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
         for m in valid:
             if OFFER_IMAGES[m] not in queued_images:
                 queued_images.append(OFFER_IMAGES[m])
-        return (
-            f"Images queued: {', '.join(valid)}. "
-            "The application will send them after your response."
-            if valid else "No valid media requested."
-        )
+        return {
+            "ok": bool(valid),
+            "code": "media_queued" if valid else "invalid_media",
+            "media": valid,
+        }
 
     def notify_staff_tool(issue_summary: str) -> str:
         # Tool functions are synchronous because Gemini tool execution is synchronous.
@@ -872,10 +780,42 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
                     )
                     r.raise_for_status()
             audit("bot", "staff_notification", phone, issue_summary[:1000])
-            return "Staff notification attempted."
+            return {"ok": True, "code": "staff_notified"}
         except Exception:
             log.exception("notify_staff tool failed")
-            return "Staff notification failed."
+            return {
+                "ok": False,
+                "code": "staff_notification_failed",
+                "retryable": True,
+            }
+
+    def check_my_appointments() -> dict:
+        """Read appointments for the current WhatsApp patient; never ask for a phone."""
+        return check_patient_appointments(phone)
+
+    def cancel_my_appointment(date: str) -> dict:
+        """Cancel the current WhatsApp patient's appointment on a given date."""
+        return cancel_appointment(phone, date)
+
+    def reschedule_my_appointment(old_date: str, new_date: str, new_time: str) -> dict:
+        """Reschedule the current patient's booking without requesting a phone."""
+        return reschedule_appointment(phone, old_date, new_date, new_time)
+
+    def book_my_appointment(
+        patient_name: str,
+        date: str,
+        time: str,
+        area: str,
+    ) -> dict:
+        """Book the current WhatsApp patient; their phone is already known."""
+        return book_appointment(patient_name, phone, date, time, area)
+
+    def remember_patient_details(
+        patient_name: str = "",
+        preferences: str = "",
+    ) -> dict:
+        """Persist details already supplied so they are not requested again."""
+        return update_patient_file(phone, patient_name, preferences)
 
     try:
         chat = gemini_client.chats.create(
@@ -886,10 +826,11 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
                 temperature=0.1,
                 tools=[
                     check_schedule,
-                    check_patient_appointments,
-                    cancel_appointment,
-                    book_appointment,
-                    update_patient_file,
+                    check_my_appointments,
+                    cancel_my_appointment,
+                    reschedule_my_appointment,
+                    book_my_appointment,
+                    remember_patient_details,
                     send_clinic_media,
                     notify_staff_tool,
                 ],
@@ -899,7 +840,7 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
         return (result.text or "").strip(), queued_images
     except Exception:
         log.exception("Gemini generation failed")
-        return "أهلاً بحضرتك يا فندم 🌸 ثواني وهكون مع حضرتك.", []
+        return "حصل عطل مؤقت في خدمة الرد. حاولي تبعتي رسالتك مرة تانية بعد شوية، ومفيش أي حجز اتأكد من الرسالة دي.", []
 
 async def generate_ai_reply(phone: str, message: str, profile: dict):
     return await asyncio.to_thread(generate_ai_reply_sync, phone, message, profile)
@@ -918,28 +859,41 @@ async def handle_ai_conversation(
     lock = await get_user_lock(sender_phone)
 
     async with lock:
-        save_chat_turn(sender_phone, "user", user_text, message_id)
-
-        if not is_bot_globally_active():
-            log.info("Global bot off; ignoring %s", sender_phone)
+        try:
+            save_chat_turn(sender_phone, "user", user_text, message_id)
+            if not is_bot_globally_active():
+                log.info("Global bot off; ignoring %s", sender_phone)
+                return
+            profile = load_patient_profile(sender_phone)
+        except Exception:
+            log.exception("Postgres unavailable while starting conversation")
+            await send_whatsapp_message(
+                sender_phone,
+                "حصل عطل مؤقت في النظام ومفيش أي حجز اتأكد. حاولي مرة تانية بعد شوية.",
+                phone_number_id,
+            )
             return
 
-        profile = load_patient_profile(sender_phone)
         if profile.get("is_paused"):
             log.info("Human takeover active for %s", sender_phone)
             return
 
         response_text, images = await generate_ai_reply(sender_phone, user_text, profile)
 
-        for image in images:
-            await send_whatsapp_image(sender_phone, image, phone_number_id)
+        for clinic_image in images:
+            if not await send_whatsapp_image(sender_phone, clinic_image, phone_number_id):
+                audit("system", "whatsapp_image_failed", sender_phone, clinic_image.get("url", ""))
 
         if response_text:
             ok = await send_whatsapp_message(sender_phone, response_text, phone_number_id)
             if ok:
-                save_chat_turn(sender_phone, "model", response_text)
+                try:
+                    save_chat_turn(sender_phone, "model", response_text)
+                except Exception:
+                    log.exception("Reply sent but chat persistence failed")
             else:
                 audit("system", "whatsapp_send_failed", sender_phone, response_text[:500])
+
 
 # ------------------------------------------------------------
 # Webhook parsing
@@ -1205,8 +1159,8 @@ def api_toggle_global_bot(req: GlobalBotReq, admin: str = Depends(verify_admin))
 @app.get("/admin/api/schedule")
 def api_get_schedule(date: str, admin: str = Depends(verify_admin)):
     try:
-        parse_date(date)
-        return google_get({"date": date})
+        parsed_date = parse_date(date)
+        return google_get({"date": parsed_date.isoformat()})
     except Exception:
         log.exception("Admin schedule read failed")
         raise HTTPException(status_code=502, detail="Unable to read appointment schedule")
@@ -1220,13 +1174,13 @@ def api_admin_book(req: BookReq, admin: str = Depends(verify_admin)):
         req.time,
         req.area,
     )
-    return {"status": result}
+    return {"status": result.get("message", ""), "result": result}
 
 @app.post("/admin/api/cancel")
 def api_admin_cancel(req: CancelReq, admin: str = Depends(verify_admin)):
     result = cancel_appointment(req.phone_number, req.date)
     audit(admin, "appointment_cancel", normalize_phone(req.phone_number), req.date)
-    return {"status": result}
+    return {"status": result.get("message", ""), "result": result}
 
 @app.post("/admin/api/send_message")
 async def api_send_message(req: StaffMessageReq, admin: str = Depends(verify_admin)):
