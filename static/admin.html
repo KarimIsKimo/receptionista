@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Jothen Clinic — Admin v2</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--line:#e4e8ec;--text:#17212b;--muted:#667781;--accent:#008069;--danger:#d93025;--warn:#b26a00}
+*{box-sizing:border-box}body{margin:0;font-family:Segoe UI,Tahoma,sans-serif;background:var(--bg);color:var(--text)}
+button,input,textarea,select{font:inherit}.top{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 18px;position:sticky;top:0;z-index:10}
+.brand{font-weight:800}.nav{display:flex;gap:7px}.nav button,.btn{border:1px solid var(--line);background:#fff;padding:9px 12px;border-radius:9px;cursor:pointer;font-weight:650}.nav button.active{background:#e8f5f2;color:var(--accent);border-color:#bfe3da}
+main{padding:18px;max-width:1600px;margin:auto}.view{display:none}.view.active{display:block}
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:14px}.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:15px}.stat b{display:block;font-size:25px;margin-top:5px}.muted{color:var(--muted);font-size:12px}
+.chat-layout{display:grid;grid-template-columns:350px 1fr;direction:ltr;height:calc(100vh - 105px);min-height:600px;background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.sidebar{direction:rtl;border-right:1px solid var(--line);display:flex;flex-direction:column}.search{padding:10px;border-bottom:1px solid var(--line)}.search input{width:100%;padding:10px;border:1px solid var(--line);border-radius:9px}
+.list{overflow:auto}.patient{padding:12px;border-bottom:1px solid #f0f2f5;cursor:pointer}.patient:hover,.patient.active{background:#f4f7f7}.patient .row{display:flex;justify-content:space-between;gap:8px}.patient .name{font-weight:700}.patient .last{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}.badge{font-size:10px;padding:3px 6px;border-radius:8px;background:#fff0f0;color:#b42318}
+.chat{direction:rtl;display:flex;flex-direction:column;background:#efeae2}.chat-head{background:#f7f8f9;padding:12px 15px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:10px;align-items:center}.chat-head .actions{display:flex;gap:6px;flex-wrap:wrap}.messages{flex:1;overflow:auto;padding:18px;display:flex;flex-direction:column;gap:8px}.msg{max-width:72%;padding:9px 12px;border-radius:9px;white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 1px #00000010}.msg.user{align-self:flex-start;background:#fff}.msg.model{align-self:flex-end;background:#d9fdd3}.msg.staff{align-self:flex-end;background:#dbeafe;border:1px solid #bfdbfe}.meta{font-size:10px;color:var(--muted);margin-top:4px;direction:ltr}
+.composer{background:#f0f2f5;padding:10px;display:flex;gap:8px}.composer textarea{flex:1;min-height:46px;max-height:130px;border:1px solid var(--line);border-radius:10px;padding:10px;resize:vertical}.send{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:0 18px;cursor:pointer;font-weight:800}
+.panel{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}.toolbar input,.toolbar select,.panel textarea{padding:10px;border:1px solid var(--line);border-radius:9px}.toolbar input{min-width:230px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:12px}.slot{border:1px solid var(--line);border-radius:11px;padding:13px}.slot.booked{background:#fff4f2;border-color:#ffd0ca}.slot.free{background:#f3fbf6;border-color:#c7ead2}.slot .time{font-weight:900;font-size:18px}
+.modal{display:none;position:fixed;inset:0;background:#0008;z-index:50;align-items:center;justify-content:center}.modal.open{display:flex}.modalbox{width:min(900px,94vw);max-height:90vh;background:#fff;border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:10px}.modalbox textarea{flex:1;min-height:55vh;direction:rtl}
+.danger{background:#fff1f0!important;color:#b42318!important;border-color:#ffc9c5!important}.success{background:#eaf7ee!important;color:#176b2b!important;border-color:#bce3c8!important}
+@media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}.chat-layout{grid-template-columns:1fr;height:calc(100vh - 95px)}.sidebar{display:none}.chat{min-height:600px}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">🏥 Jothen Clinics — Nasr City</div>
+  <div class="nav">
+    <button class="active" onclick="view('chats',this)">💬 المحادثات</button>
+    <button onclick="view('schedule',this)">📅 المواعيد</button>
+    <button onclick="view('stats',this)">📊 الإحصائيات</button>
+    <button onclick="openSettings()">⚙️ التعليمات</button>
+    <button id="globalBtn" onclick="toggleGlobal()">...</button>
+  </div>
+</header>
+<main>
+  <section id="statsBar" class="stats">
+    <div class="stat"><span class="muted">العملاء</span><b id="sPatients">—</b></div>
+    <div class="stat"><span class="muted">كل الرسائل</span><b id="sMessages">—</b></div>
+    <div class="stat"><span class="muted">رسائل آخر 24 ساعة</span><b id="sIncoming">—</b></div>
+    <div class="stat"><span class="muted">تدخل بشري 24 ساعة</span><b id="sStaff">—</b></div>
+    <div class="stat"><span class="muted">محادثات موقوفة</span><b id="sTakeovers">—</b></div>
+  </section>
+
+  <section id="chats" class="view active">
+    <div class="chat-layout">
+      <aside class="sidebar">
+        <div class="search"><input id="search" placeholder="بحث بالاسم أو رقم الهاتف..." oninput="loadData()"></div>
+        <div class="list" id="patients"></div>
+      </aside>
+      <section class="chat">
+        <div class="chat-head">
+          <div id="chatTitle"><b>اختر محادثة</b></div>
+          <div class="actions" id="chatActions" style="display:none">
+            <button class="btn" onclick="renamePatient()">✏️ الاسم</button>
+            <button class="btn" onclick="editTags()">🏷️ Tags</button>
+            <button class="btn" id="pauseBtn" onclick="togglePause()">...</button>
+          </div>
+        </div>
+        <div class="messages" id="messages"><div class="muted">المحادثة ستظهر هنا.</div></div>
+        <div class="composer" id="composer" style="display:none">
+          <textarea id="reply" placeholder="اكتب رسالة يدوية للمريض..."></textarea>
+          <button class="send" onclick="sendStaff()">إرسال</button>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <section id="schedule" class="view">
+    <div class="panel">
+      <div class="toolbar">
+        <h2 style="margin:0">📅 جدول المواعيد</h2>
+        <input type="date" id="date" onchange="loadSchedule()">
+        <button class="btn" onclick="loadSchedule()">تحديث</button>
+      </div>
+      <div class="grid" id="slots"></div>
+    </div>
+  </section>
+
+  <section id="stats" class="view">
+    <div class="panel">
+      <h2>📊 الإحصائيات</h2>
+      <p class="muted">هذه الأرقام تأتي مباشرة من قاعدة البيانات.</p>
+      <div id="statsDetail"></div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <h3>🧾 آخر عمليات الإدارة</h3>
+      <div id="audit"></div>
+    </div>
+  </section>
+</main>
+
+<div id="settingsModal" class="modal">
+ <div class="modalbox">
+  <h2 style="margin:0">⚙️ تعليمات البوت</h2>
+  <p class="muted">يمكن تعديل الـsystem instruction مباشرة. احفظ نسخة احتياطية قبل تغييرات كبيرة.</p>
+  <textarea id="instruction"></textarea>
+  <div style="display:flex;justify-content:flex-end;gap:8px"><button class="btn" onclick="closeSettings()">إلغاء</button><button class="btn success" onclick="saveSettings()">💾 حفظ</button></div>
+ </div>
+</div>
+
+<script>
+let patients=[],chats=[],currentPhone=null,currentPatient=null;
+
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
+function fmt(x){if(!x)return '';let d=new Date(x);return isNaN(d)?'':d.toLocaleString('ar-EG',{dateStyle:'short',timeStyle:'short'});}
+function view(id,btn){document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));if(btn)btn.classList.add('active');if(id==='schedule')loadSchedule();if(id==='stats')loadStats();}
+async function api(url,opt={}){let r=await fetch(url,opt);let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.detail||'Request failed');return j;}
+
+async function loadData(){
+ try{
+  let q=encodeURIComponent(document.getElementById('search').value||'');
+  let d=await api('/admin/api/data?search='+q+'&limit=300');patients=d.patients||[];chats=d.chats||[];renderPatients();if(currentPhone)renderChat();loadStats();
+ }catch(e){console.error(e);}
+}
+function renderPatients(){
+ const box=document.getElementById('patients');box.innerHTML='';
+ patients.forEach(p=>{
+  let el=document.createElement('div');el.className='patient'+(p.phone_number===currentPhone?' active':'');
+  el.innerHTML=`<div class="row"><span class="name">${esc(p.name||'مريض جديد')}</span><span class="muted">${fmt(p.last_msg_time)}</span></div>
+  <div class="last">${esc(p.last_message||'لا رسائل')}</div><div class="muted" dir="ltr">${esc(p.phone_number)}</div>
+  ${p.is_paused?'<span class="badge">⏸ تدخل بشري</span>':''}
+  ${(p.tags||[]).map(t=>'<span class="badge" style="margin-right:3px">'+esc(t)+'</span>').join('')}`;
+  el.onclick=()=>showChat(p);box.appendChild(el);
+ });
+}
+function showChat(p){currentPhone=p.phone_number;currentPatient=p;document.getElementById('chatActions').style.display='flex';document.getElementById('composer').style.display='flex';document.getElementById('chatTitle').innerHTML=`<b>${esc(p.name||'مريض جديد')}</b> <span class="muted" dir="ltr">${esc(p.phone_number)}</span>`;updatePause();renderPatients();renderChat();}
+function renderChat(){
+ if(!currentPhone)return;let rows=chats.filter(x=>x.phone_number===currentPhone),box=document.getElementById('messages');box.innerHTML='';
+ rows.forEach(m=>{let el=document.createElement('div');el.className='msg '+m.role;el.innerHTML=`${esc(m.content)}<div class="meta">${fmt(m.created_at)}</div>`;box.appendChild(el);});
+ box.scrollTop=box.scrollHeight;
+}
+function updatePause(){let b=document.getElementById('pauseBtn');if(!currentPatient)return;b.className='btn '+(currentPatient.is_paused?'success':'danger');b.textContent=currentPatient.is_paused?'▶️ تشغيل البوت':'⏸️ إيقاف البوت';}
+async function togglePause(){if(!currentPhone)return;let next=!currentPatient.is_paused;await api('/admin/api/toggle_pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,is_paused:next})});currentPatient.is_paused=next;updatePause();loadData();}
+async function renamePatient(){if(!currentPhone)return;let n=prompt('اسم المريض:',currentPatient.name||'');if(!n)return;await api('/admin/api/rename_patient',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,name:n})});loadData();}
+async function editTags(){if(!currentPhone)return;let old=(currentPatient.tags||[]).join(', ');let s=prompt('Tags مفصولة بفواصل:',old);if(s===null)return;let tags=s.split(',').map(x=>x.trim()).filter(Boolean);await api('/admin/api/patient_tags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,tags})});loadData();}
+async function sendStaff(){let box=document.getElementById('reply'),msg=box.value.trim();if(!currentPhone||!msg)return;if(!confirm('إرسال الرسالة للمريض وإيقاف البوت لهذا الشات؟'))return;await api('/admin/api/send_message',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone_number:currentPhone,message:msg,pause_after_send:true})});box.value='';currentPatient.is_paused=true;loadData();}
+async function loadSchedule(){
+ let d=document.getElementById('date');if(!d.value){d.value=new Date().toISOString().slice(0,10)}
+ let box=document.getElementById('slots');box.innerHTML='<p class="muted">جاري التحميل...</p>';
+ try{let data=await api('/admin/api/schedule?date='+d.value);let booked={};(data.booked||[]).forEach(x=>{let t=typeof x==='string'?x:x.time;booked[String(t).toUpperCase()]=x});let times=["12:00 PM","12:30 PM","1:00 PM","1:30 PM","2:00 PM","2:30 PM","3:00 PM","3:30 PM","4:00 PM","4:30 PM","5:00 PM","5:30 PM","6:00 PM","6:30 PM","7:00 PM","7:30 PM","8:00 PM","8:30 PM","9:00 PM","9:30 PM","10:00 PM"];box.innerHTML=times.map(t=>{let x=booked[t.toUpperCase()]||booked[t.replace(/^0/,'').toUpperCase()];return `<div class="slot ${x?'booked':'free'}"><div class="time">${t}</div><div>${x?'🔴 محجوز':'🟢 متاح'}</div>${x?`<div class="muted">${esc(x.name||'')}<br>${esc(x.phone||'')}<br>${esc(x.area||'')}</div>`:''}</div>`}).join('');}catch(e){box.innerHTML='<p style="color:#b42318">تعذر قراءة الجدول.</p>';}
+}
+async function loadStats(){
+ try{let s=await api('/admin/api/stats');document.getElementById('sPatients').textContent=s.patients;document.getElementById('sMessages').textContent=s.messages;document.getElementById('sIncoming').textContent=s.incoming_24h;document.getElementById('sStaff').textContent=s.staff_24h;document.getElementById('sTakeovers').textContent=s.human_takeovers;document.getElementById('statsDetail').innerHTML=`<p>حالة البوت: <b>${s.bot_active?'🟢 يعمل':'🔴 متوقف'}</b></p><p>العملاء: ${s.patients}</p><p>إجمالي الرسائل: ${s.messages}</p><p>الواردة آخر 24 ساعة: ${s.incoming_24h}</p><p>رسائل الموظفين آخر 24 ساعة: ${s.staff_24h}</p><p>التدخل البشري الحالي: ${s.human_takeovers}</p>`;let a=await api('/admin/api/audit?limit=100');document.getElementById('audit').innerHTML=(a.audit||[]).map(x=>`<div style="padding:8px;border-bottom:1px solid #eee"><b>${esc(x.action)}</b> — ${esc(x.actor)} <span class="muted">${fmt(x.created_at)}</span><br><span class="muted">${esc(x.phone_number||'')} ${esc(x.details||'')}</span></div>`).join('');}catch(e){}
+}
+async function toggleGlobal(){let s=await api('/admin/api/bot_status');let next=!s.is_active;if(!confirm(next?'تشغيل البوت عالمياً؟':'إيقاف البوت عالمياً؟'))return;await api('/admin/api/toggle_global_bot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({is_active:next})});updateGlobal();}
+async function updateGlobal(){try{let s=await api('/admin/api/bot_status');let b=document.getElementById('globalBtn');b.textContent=s.is_active?'🟢 البوت يعمل':'🔴 البوت متوقف';b.className='btn '+(s.is_active?'success':'danger')}catch(e){}}
+async function openSettings(){let d=await api('/admin/api/settings');document.getElementById('instruction').value=d.instruction;document.getElementById('settingsModal').classList.add('open')}
+function closeSettings(){document.getElementById('settingsModal').classList.remove('open')}
+async function saveSettings(){let v=document.getElementById('instruction').value;if(v.trim().length<20)return alert('التعليمات قصيرة جداً');await api('/admin/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({instruction:v})});alert('تم الحفظ');closeSettings();}
+document.addEventListener('DOMContentLoaded',()=>{loadData();updateGlobal();setInterval(loadData,5000);});
+</script>
+</body>
+</html>
