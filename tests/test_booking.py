@@ -74,6 +74,50 @@ class BookingTests(unittest.TestCase):
         self.assertTrue(answer["retryable"])
         self.assertEqual(fake.posts, [])
 
+    def test_empty_or_ambiguous_response_never_confirms_booking(self):
+        responses = ({}, {"message": "maybe"}, {"status": "pending"})
+        for response in responses:
+            with self.subTest(response=response):
+                fake = FakeAppsScript()
+                fake.post = lambda payload, response=response: response
+                answer = self.service(fake).book(
+                    "Mona", "01012345678", "tomorrow", "7:00 PM", "underarm"
+                )
+                self.assertFalse(answer["ok"])
+                self.assertEqual(answer["code"], "booking_not_confirmed")
+                self.assertTrue(answer["retryable"])
+
+    def test_valid_future_slot_later_today_is_confirmed(self):
+        fake = FakeAppsScript()
+        answer = self.service(fake).book(
+            "Mona", "01012345678", "today", "7:00 PM", "underarm"
+        )
+        self.assertTrue(answer["ok"])
+        self.assertEqual(answer["code"], "booked")
+        self.assertEqual(answer["appointment"]["date"], "2026-09-14")
+        self.assertEqual(answer["appointment"]["time"], "7:00 PM")
+
+    def test_malformed_apps_script_responses_never_confirm(self):
+        malformed_cases = (
+            (lambda params: [], lambda payload: {"status": "success"}),
+            (lambda params: {"booked": "7:00 PM"}, lambda payload: {"status": "success"}),
+            (lambda params: {"booked": []}, lambda payload: []),
+        )
+        for get_func, post_func in malformed_cases:
+            with self.subTest(get_func=get_func, post_func=post_func):
+                service = BookingService(
+                    "https://example.invalid",
+                    get_func=get_func,
+                    post_func=post_func,
+                    now_func=lambda: NOW,
+                )
+                answer = service.book(
+                    "Mona", "01012345678", "tomorrow", "7:00 PM", "underarm"
+                )
+                self.assertFalse(answer["ok"])
+                self.assertEqual(answer["code"], "booking_service_unavailable")
+                self.assertTrue(answer["retryable"])
+
     def test_cancel_returns_structured_result(self):
         answer = self.service(FakeAppsScript()).cancel("01012345678", "Thursday")
         self.assertTrue(answer["ok"])

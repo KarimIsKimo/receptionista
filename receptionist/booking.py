@@ -129,8 +129,13 @@ class BookingService:
 
     @staticmethod
     def _booked_times(data: dict) -> set[str]:
+        booked = data.get("booked", [])
+        if booked is None:
+            booked = []
+        if not isinstance(booked, (list, tuple)):
+            raise AppsScriptTemporaryError("invalid_schedule")
         values: set[str] = set()
-        for item in data.get("booked", []) or []:
+        for item in booked:
             raw = item.get("time", "") if isinstance(item, dict) else str(item)
             if raw:
                 values.add(normalize_time(raw))
@@ -188,8 +193,31 @@ class BookingService:
                 "time": slot, "area": area,
             }
             data = self._request("POST", payload)
-            if data.get("status") == "error" or data.get("success") is False:
-                return result(False, "booking_rejected", str(data.get("message") or "تعذر تسجيل الموعد."), retryable=False)
+            status = str(data.get("status", "")).strip().lower()
+            explicitly_booked = (
+                data.get("success") is True
+                or data.get("booked") is True
+                or status in {"success", "ok", "booked"}
+            )
+            explicitly_rejected = (
+                data.get("success") is False
+                or data.get("booked") is False
+                or status in {"error", "failed", "rejected"}
+            )
+            if explicitly_rejected:
+                return result(
+                    False,
+                    "booking_rejected",
+                    str(data.get("message") or "تعذر تسجيل الموعد."),
+                    retryable=False,
+                )
+            if not explicitly_booked:
+                return result(
+                    False,
+                    "booking_not_confirmed",
+                    "نظام المواعيد لم يؤكد الحجز، لذلك الموعد غير مؤكد. حاولي مرة أخرى بعد قليل.",
+                    retryable=True,
+                )
             if self._on_booked:
                 self._on_booked(phone, name, f"حجز {area} ({date.isoformat()} {slot})")
             if self._on_audit:
