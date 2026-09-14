@@ -20,7 +20,7 @@ class DashboardHtmlTests(unittest.TestCase):
         for required in (
             'id="view-inbox"', 'id="view-appointments"',
             'id="view-analytics"', 'id="view-health"',
-            "clinic_closed", "unavailable", "message system",
+            "clinic_closed", "unavailable", ".message.system",
         ):
             self.assertIn(required, self.html)
 
