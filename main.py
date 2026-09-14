@@ -1333,11 +1333,37 @@ def admin_stats(admin: str = Depends(verify_admin)):
 def admin_patient(
     phone_number: str,
     before_id: int | None = Query(None, ge=1),
+    after_id: int | None = Query(None, ge=1),
     limit: int = Query(60, ge=1, le=200),
     admin: str = Depends(verify_admin),
 ):
+    """Return one page of patient chat history.
+
+    - before_id is used by the dashboard to load older messages.
+    - after_id is used by polling to fetch only genuinely new messages.
+    Keeping these directions separate prevents the UI from jumping or repeatedly
+    re-downloading the same page.
+    """
     phone = normalize_phone(phone_number)
     profile = load_patient_profile(phone)
+
+    if before_id is not None and after_id is not None:
+        raise HTTPException(status_code=400, detail="Use before_id or after_id, not both")
+
+    if after_id is not None:
+        rows = db_execute(
+            """
+            SELECT id, role, content, created_at
+            FROM chat_history
+            WHERE phone_number=%s AND id > %s
+            ORDER BY id ASC
+            LIMIT %s
+            """,
+            (phone, after_id, limit),
+            fetchall=True,
+        )
+        return {"patient": profile, "messages": rows, "has_more": False}
+
     params = [phone]
     clause = ""
     if before_id is not None:
