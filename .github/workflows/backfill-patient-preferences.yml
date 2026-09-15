@@ -1,0 +1,42 @@
+name: Backfill Patient Preferences
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run only - do not write to database"
+        required: true
+        default: true
+        type: boolean
+
+      limit:
+        description: "Number of patients to scan. Use 10 for testing, 0 for all."
+        required: true
+        default: "10"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install psycopg2-binary google-genai
+
+      - name: Run patient history scan
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.6-flash' }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          python backfill_preferences.py
