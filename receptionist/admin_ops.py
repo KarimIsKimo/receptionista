@@ -16,6 +16,9 @@ from .clinic import CLINIC, ClinicConfig
 from .dates import parse_date_expression
 
 
+APPOINTMENT_SNAPSHOT_TTL = dt.timedelta(minutes=10)
+
+
 def success(code: str, data: Any = None, **meta: Any) -> dict:
     response = {"ok": True, "code": code, "data": data if data is not None else {}}
     response.update(meta)
@@ -103,6 +106,34 @@ class AdminOperations:
             value = value.replace(tzinfo=self.config.timezone)
         return value.astimezone(self.config.timezone)
 
+    def _snapshot_state(self, status: Any, fetched_at: Any) -> str:
+        """Return the authoritative usability state of a cached snapshot."""
+        if status != "healthy":
+            return status if status in {"stale", "unavailable", "unknown"} else "unknown"
+        if not fetched_at:
+            return "unknown"
+        try:
+            fetched = fetched_at
+            if isinstance(fetched, str):
+                fetched = dt.datetime.fromisoformat(fetched.replace("Z", "+00:00"))
+            if not isinstance(fetched, dt.datetime):
+                return "unknown"
+            if fetched.tzinfo is None:
+                fetched = fetched.replace(tzinfo=self.config.timezone)
+            if self._now() - fetched.astimezone(self.config.timezone) > APPOINTMENT_SNAPSHOT_TTL:
+                return "stale"
+        except (TypeError, ValueError, OverflowError):
+            return "unknown"
+        return "healthy"
+
+    def _apply_snapshot_state(self, row: dict) -> dict:
+        state = self._snapshot_state(
+            row.get("appointment_status"), row.get("appointment_fetched_at")
+        )
+        row["appointment_status"] = state
+        row["appointment_freshness"] = "fresh" if state == "healthy" else state
+        return row
+
     def inbox(
         self,
         *,
@@ -135,8 +166,8 @@ class AdminOperations:
             "unread": "COALESCE(u.unread_count,0) > 0",
             "human": "COALESCE(p.is_paused,FALSE) = TRUE",
             "ai": "COALESCE(p.is_paused,FALSE) = FALSE",
-            "booked": "aps.status = 'healthy' AND aps.next_appointment IS NOT NULL",
-            "no_booking": "aps.status = 'healthy' AND aps.next_appointment IS NULL",
+            "booked": "aps.status = 'healthy' AND aps.fetched_at >= NOW() - INTERVAL '10 minutes' AND aps.next_appointment IS NOT NULL",
+            "no_booking": "aps.status = 'healthy' AND aps.fetched_at >= NOW() - INTERVAL '10 minutes' AND aps.next_appointment IS NULL",
         }
         if state in filters:
             where.append(filters[state])
@@ -194,7 +225,9 @@ class AdminOperations:
             return failure("database_unavailable", "Could not load the inbox.", retryable=True)
 
         has_more = len(rows) > limit
-        patients = sort_inbox_rows([dict(row) for row in rows[:limit]])
+        patients = sort_inbox_rows(
+            [self._apply_snapshot_state(dict(row)) for row in rows[:limit]]
+        )
         ids = [int(row.get("last_message_id") or 0) for row in patients]
         return success(
             "inbox_loaded",
@@ -206,21 +239,25 @@ class AdminOperations:
             },
         )
 
-    def mark_read(self, phone_number: str) -> dict:
+    def mark_read(self, phone_number: str, displayed_message_id: int) -> dict:
         phone = normalize_phone(phone_number)
+        if displayed_message_id < 0:
+            return failure("invalid_cursor", "Displayed message id must not be negative.", state="degraded")
         try:
             row = self.db(
                 """
                 /* admin_mark_read */
                 INSERT INTO admin_inbox_state(phone_number,last_read_message_id,updated_at)
-                SELECT %s, COALESCE(MAX(id),0), NOW()
-                FROM chat_history WHERE phone_number=%s
+                VALUES (%s,%s,NOW())
                 ON CONFLICT(phone_number) DO UPDATE SET
-                    last_read_message_id=EXCLUDED.last_read_message_id,
+                    last_read_message_id=GREATEST(
+                        admin_inbox_state.last_read_message_id,
+                        EXCLUDED.last_read_message_id
+                    ),
                     updated_at=NOW()
                 RETURNING last_read_message_id
                 """,
-                (phone, phone),
+                (phone, displayed_message_id),
                 fetchone=True,
             )
             return success("inbox_marked_read", {"phone_number": phone, "last_read_message_id": int(row["last_read_message_id"] if row else 0)})
@@ -257,7 +294,7 @@ class AdminOperations:
             )
             if not row:
                 return failure("patient_not_found", "Patient was not found.", state="degraded")
-            return success("patient_loaded", dict(row))
+            return success("patient_loaded", self._apply_snapshot_state(dict(row)))
         except Exception:
             return failure("database_unavailable", "Could not load patient details.", retryable=True)
 
@@ -333,6 +370,26 @@ class AdminOperations:
                     continue
         return None
 
+    def _appointment_datetime(self, item: Any) -> dt.datetime | None:
+        if not isinstance(item, dict):
+            return None
+        date = self._appointment_date(item)
+        raw_time = next(
+            (
+                item.get(key)
+                for key in ("time", "appointment_time", "Time", "الوقت")
+                if item.get(key)
+            ),
+            None,
+        )
+        if date is None or not isinstance(raw_time, str) or not raw_time.strip():
+            return None
+        try:
+            parsed_time = dt.datetime.strptime(normalize_time(raw_time), "%I:%M %p").time()
+        except ValueError:
+            return None
+        return dt.datetime.combine(date, parsed_time, self.config.timezone)
+
     def _cache_appointments(
         self,
         phone: str,
@@ -360,33 +417,61 @@ class AdminOperations:
             ),
         )
 
+    def _mark_snapshot_status(self, phone: str, status: str) -> None:
+        """Record a failed refresh without replacing or re-dating prior good data."""
+        self.db(
+            """
+            /* admin_cache_appointments_failure */
+            INSERT INTO admin_appointment_snapshots(
+                phone_number,appointments,next_appointment,status,fetched_at
+            ) VALUES (%s,NULL,NULL,%s,NULL)
+            ON CONFLICT(phone_number) DO UPDATE SET status=EXCLUDED.status
+            """,
+            (phone, status),
+        )
+
     def patient_appointments(self, phone_number: str) -> dict:
         phone = normalize_phone(phone_number)
         result = self.booking.appointments(phone)
         if not isinstance(result, dict) or result.get("ok") is not True:
+            try:
+                self._mark_snapshot_status(phone, "unavailable")
+            except Exception:
+                pass
             return failure(
                 "scheduling_unavailable",
                 str(result.get("message") if isinstance(result, dict) else "Malformed scheduling response."),
                 retryable=True,
+                data={"snapshot_status": "unavailable"},
             )
         appointments = result.get("appointments")
         if not isinstance(appointments, list):
-            return failure("malformed_scheduling_response", "Scheduling returned malformed appointment data.", state="degraded", retryable=True)
+            try:
+                self._mark_snapshot_status(phone, "unknown")
+            except Exception:
+                pass
+            return failure(
+                "malformed_scheduling_response",
+                "Scheduling returned malformed appointment data.",
+                state="degraded",
+                retryable=True,
+                data={"snapshot_status": "unknown"},
+            )
 
-        today = self._now().date()
+        now = self._now()
         upcoming: list[Any] = []
         previous: list[Any] = []
         unknown: list[Any] = []
         for item in appointments:
-            item_date = self._appointment_date(item)
-            if item_date is None:
+            moment = self._appointment_datetime(item)
+            if moment is None:
                 unknown.append(item)
-            elif item_date >= today:
+            elif moment > now:
                 upcoming.append(item)
             else:
                 previous.append(item)
-        upcoming.sort(key=lambda item: self._appointment_date(item) or dt.date.max)
-        previous.sort(key=lambda item: self._appointment_date(item) or dt.date.min, reverse=True)
+        upcoming.sort(key=lambda item: self._appointment_datetime(item) or dt.datetime.max.replace(tzinfo=self.config.timezone))
+        previous.sort(key=lambda item: self._appointment_datetime(item) or dt.datetime.min.replace(tzinfo=self.config.timezone), reverse=True)
         next_appointment = upcoming[0] if upcoming else None
         try:
             self._cache_appointments(phone, appointments, next_appointment, "healthy")
@@ -403,7 +488,9 @@ class AdminOperations:
                 "unclassified": unknown,
                 "next_appointment": next_appointment,
                 "source": "google_apps_script",
-                "fetched_at": self._now().isoformat(),
+                "fetched_at": now.isoformat(),
+                "snapshot_status": "healthy",
+                "snapshot_freshness": "fresh",
             },
         )
 
@@ -510,14 +597,15 @@ class AdminOperations:
 
     def analytics(self, days: int = 14) -> dict:
         days = max(7, min(days, 90))
+        local_day = self._now().date()
         try:
             rows = self.db(
                 """
                 /* admin_analytics */
                 WITH dates AS (
                     SELECT generate_series(
-                        (CURRENT_DATE - (%s - 1) * INTERVAL '1 day')::date,
-                        CURRENT_DATE, INTERVAL '1 day'
+                        (%s::date - (%s - 1) * INTERVAL '1 day')::date,
+                        %s::date, INTERVAL '1 day'
                     )::date AS day
                 )
                 SELECT d.day,
@@ -531,7 +619,7 @@ class AdminOperations:
                   ON (c.created_at AT TIME ZONE 'Africa/Cairo')::date=d.day
                 GROUP BY d.day ORDER BY d.day
                 """,
-                (days,),
+                (local_day, days, local_day),
                 fetchall=True,
             )
             return success("analytics_loaded", {"days": days, "daily": [dict(x) for x in rows]})

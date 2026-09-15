@@ -228,27 +228,110 @@ class BookingService:
         except AppsScriptTemporaryError:
             return result(False, "booking_service_unavailable", "نظام الحجز غير متاح مؤقتاً ولم يتم تأكيد الموعد. حاولي مرة أخرى بعد قليل.", retryable=True)
 
-    def cancel(self, phone_number: str, date_value: str) -> dict:
+    def _target_fields(
+        self,
+        *,
+        time_value: str | None,
+        appointment_id: str | None,
+        time_key: str,
+    ) -> dict:
+        target_id = str(appointment_id or "").strip()
+        target_time = normalize_time(time_value or "")
+        if not target_id and not target_time:
+            raise ValueError("يجب تحديد وقت الموعد أو رقم الحجز لتجنب تعديل موعد آخر بالخطأ.")
+        if target_time and target_time not in self.config.slots:
+            raise ValueError("وقت الموعد المطلوب غير صالح.")
+        fields: dict[str, str] = {}
+        if target_id:
+            fields["appointment_id"] = target_id
+        if target_time:
+            fields[time_key] = target_time
+        return fields
+
+    def cancel(
+        self,
+        phone_number: str,
+        date_value: str,
+        time_value: str | None = None,
+        appointment_id: str | None = None,
+    ) -> dict:
         phone = normalize_phone(phone_number)
         try:
             date = self._validate_date(date_value)
-            data = self._request("POST", {"action": "cancel", "phone_number": phone, "date": date.isoformat()})
-            if data.get("deleted") or data.get("success") is True:
+            target = self._target_fields(
+                time_value=time_value,
+                appointment_id=appointment_id,
+                time_key="time",
+            )
+            data = self._request(
+                "POST",
+                {
+                    "action": "cancel",
+                    "phone_number": phone,
+                    "date": date.isoformat(),
+                    **target,
+                },
+            )
+            status = str(data.get("status", "")).strip().lower()
+            if (
+                data.get("deleted") is True
+                or data.get("cancelled") is True
+                or data.get("success") is True
+                or status == "cancelled"
+            ):
                 if self._on_audit:
-                    self._on_audit("appointment_cancelled", phone, date.isoformat())
-                return result(True, "cancelled", f"تم إلغاء حجز يوم {date.isoformat()} بنجاح.", date=date.isoformat())
-            return result(False, "appointment_not_found", f"لم أجد حجزاً يوم {date.isoformat()} على رقم واتسابك.", date=date.isoformat())
+                    self._on_audit("appointment_cancelled", phone, f"{date.isoformat()} {target}")
+                return result(
+                    True,
+                    "cancelled",
+                    f"تم إلغاء حجز يوم {date.isoformat()} بنجاح.",
+                    date=date.isoformat(),
+                    **target,
+                )
+            if (
+                data.get("deleted") is False
+                or data.get("cancelled") is False
+                or data.get("success") is False
+                or status in {"error", "failed", "not_found"}
+            ):
+                return result(False, "appointment_not_found", f"لم أجد حجزاً يوم {date.isoformat()} على رقم واتسابك.", date=date.isoformat())
+            return result(
+                False,
+                "cancellation_not_confirmed",
+                "نظام المواعيد لم يؤكد الإلغاء، لذلك الموعد ما زال قائماً.",
+                retryable=True,
+                date=date.isoformat(),
+                **target,
+            )
         except ValueError as exc:
             return result(False, "invalid_appointment", str(exc))
         except AppsScriptTemporaryError:
             return result(False, "booking_service_unavailable", "تعذر الإلغاء مؤقتاً ولم يتم تغيير الحجز. حاولي مرة أخرى بعد قليل.", retryable=True)
 
-    def reschedule(self, phone_number: str, old_date_value: str, new_date_value: str, new_time_value: str) -> dict:
+    def reschedule(
+        self,
+        phone_number: str,
+        old_date_value: str,
+        new_date_value: str,
+        new_time_value: str,
+        old_time_value: str | None = None,
+        appointment_id: str | None = None,
+    ) -> dict:
         phone = normalize_phone(phone_number)
         try:
             old_date = self._validate_date(old_date_value)
             new_date = self._validate_date(new_date_value)
+            target = self._target_fields(
+                time_value=old_time_value,
+                appointment_id=appointment_id,
+                time_key="old_time",
+            )
             new_slot = self._validate_slot(new_date, new_time_value)
+            if (
+                old_date == new_date
+                and target.get("old_time") == new_slot
+            ):
+                raise ValueError("الموعد الجديد يطابق الموعد الحالي.")
             availability = self._request("GET", {"date": new_date.isoformat()})
             if new_slot in self._booked_times(availability):
                 return result(False, "slot_unavailable", "الموعد الجديد اتاخد بالفعل. اختاري موعداً آخر.", date=new_date.isoformat(), time=new_slot)
@@ -256,13 +339,22 @@ class BookingService:
                 "action": "reschedule", "phone_number": phone,
                 "old_date": old_date.isoformat(), "new_date": new_date.isoformat(),
                 "new_time": new_slot, "branch": self.config.branch,
+                **target,
             })
             if data.get("status") == "error" or data.get("success") is False:
                 return result(False, "reschedule_rejected", str(data.get("message") or "تعذر تغيير الموعد."))
             if data.get("rescheduled") is True:
                 if self._on_audit:
                     self._on_audit("appointment_rescheduled", phone, f"{old_date.isoformat()} -> {new_date.isoformat()} {new_slot}")
-                return result(True, "rescheduled", f"تم تغيير الحجز إلى {new_date.isoformat()} الساعة {new_slot}.", old_date=old_date.isoformat(), date=new_date.isoformat(), time=new_slot)
+                return result(
+                    True,
+                    "rescheduled",
+                    f"تم تغيير الحجز إلى {new_date.isoformat()} الساعة {new_slot}.",
+                    old_date=old_date.isoformat(),
+                    date=new_date.isoformat(),
+                    time=new_slot,
+                    **target,
+                )
             return result(False, "reschedule_not_confirmed", "نظام المواعيد لم يؤكد تغيير الحجز، لذلك الحجز القديم ما زال كما هو.", retryable=True)
         except ValueError as exc:
             return result(False, "invalid_appointment", str(exc))

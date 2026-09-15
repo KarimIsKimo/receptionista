@@ -31,8 +31,14 @@ class FakeDB:
         self.summary_row = {}
         self.analytics_rows = []
         self.fail_health = False
+        self.calls = []
+        self.last_read_message_id = 0
 
     def __call__(self, sql, params=(), fetchone=False, fetchall=False, commit=True):
+        self.calls.append((sql, params))
+        if "admin_mark_read" in sql:
+            self.last_read_message_id = max(self.last_read_message_id, int(params[1]))
+            return {"last_read_message_id": self.last_read_message_id}
         if "admin_inbox" in sql:
             return self.inbox_rows
         if "admin_patient_detail" in sql:
@@ -43,8 +49,6 @@ class FakeDB:
             return self.summary_row
         if "admin_analytics" in sql:
             return self.analytics_rows
-        if "admin_mark_read" in sql:
-            return {"last_read_message_id": 10}
         if "admin_cache_appointments" in sql:
             return None
         if "admin_health_db" in sql:
@@ -85,7 +89,25 @@ class AdminOperationsTests(unittest.TestCase):
         }
         result = self.ops.patient_detail("2010")
         self.assertTrue(result["ok"])
-        self.assertIsNone(result["data"]["appointment_status"])
+        self.assertEqual(result["data"]["appointment_status"], "unknown")
+
+    def test_mark_read_uses_only_displayed_cursor_during_arrival_race(self):
+        # Message 11 represents a patient message arriving after the browser loaded
+        # through message 10. The server must never look up and consume that MAX(id).
+        newly_arrived_message_id = 11
+        result = self.ops.mark_read("2010", 10)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["last_read_message_id"], 10)
+        sql, params = self.db.calls[-1]
+        self.assertEqual(params, ("2010", 10))
+        self.assertNotIn("MAX(id)", sql)
+        self.assertIn("GREATEST", sql)
+        self.assertGreater(newly_arrived_message_id, result["data"]["last_read_message_id"])
+
+    def test_mark_read_cursor_never_moves_backwards(self):
+        self.db.last_read_message_id = 12
+        result = self.ops.mark_read("2010", 10)
+        self.assertEqual(result["data"]["last_read_message_id"], 12)
 
     def test_message_pagination_reverses_database_page(self):
         self.db.message_rows = [
@@ -137,24 +159,90 @@ class AdminOperationsTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["code"], "scheduling_unavailable")
 
-    def test_appointment_result_splits_future_and_previous(self):
+    def test_appointment_result_classifies_cairo_date_and_time(self):
         self.booking.appointment_result = {
             "ok": True,
             "appointments": [
-                {"date": "2026-09-10", "time": "7:00 PM"},
-                {"date": "2026-09-15", "time": "8:00 PM"},
+                {"date": "2026-09-14", "time": "5:30 PM", "case": "earlier_today"},
+                {"date": "2026-09-14", "time": "7:00 PM", "case": "later_today"},
+                {"date": "2026-09-15", "time": "8:00 PM", "case": "tomorrow"},
+                {"date": "2026-09-15", "time": "soon", "case": "malformed"},
             ],
         }
         result = self.ops.patient_appointments("2010")
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["data"]["previous"]), 1)
-        self.assertEqual(result["data"]["next_appointment"]["date"], "2026-09-15")
+        self.assertEqual(
+            [x["case"] for x in result["data"]["upcoming"]],
+            ["later_today", "tomorrow"],
+        )
+        self.assertEqual(result["data"]["unclassified"][0]["case"], "malformed")
+        self.assertEqual(result["data"]["next_appointment"]["case"], "later_today")
+
+    def test_snapshot_freshness_expires_after_ten_minutes(self):
+        self.db.inbox_rows = [
+            {
+                "phone_number": "2010",
+                "last_message_id": 10,
+                "last_message_at": NOW,
+                "appointment_status": "healthy",
+                "appointment_fetched_at": NOW - dt.timedelta(minutes=11),
+                "next_appointment": {"date": "2026-09-15", "time": "7:00 PM"},
+            }
+        ]
+        result = self.ops.inbox()
+        patient = result["data"]["patients"][0]
+        self.assertEqual(patient["appointment_status"], "stale")
+        self.assertEqual(patient["appointment_freshness"], "stale")
+
+    def test_recent_snapshot_is_fresh_and_malformed_timestamp_is_unknown(self):
+        self.assertEqual(
+            self.ops._snapshot_state("healthy", NOW - dt.timedelta(minutes=9)),
+            "healthy",
+        )
+        self.assertEqual(self.ops._snapshot_state("healthy", "not-a-time"), "unknown")
+
+    def test_booked_filter_requires_fresh_healthy_snapshot(self):
+        self.ops.inbox(state="booked")
+        sql, _ = next(
+            (sql, params) for sql, params in self.db.calls if "admin_inbox" in sql
+        )
+        self.assertIn("aps.status = 'healthy'", sql)
+        self.assertIn("INTERVAL '10 minutes'", sql)
+
+    def test_failed_refresh_marks_snapshot_unavailable_without_replacing_data(self):
+        self.booking.appointment_result = {
+            "ok": False,
+            "message": "temporary",
+        }
+        result = self.ops.patient_appointments("2010")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["data"]["snapshot_status"], "unavailable")
+        sql, params = next(
+            (sql, params)
+            for sql, params in self.db.calls
+            if "admin_cache_appointments_failure" in sql
+        )
+        self.assertIn("DO UPDATE SET status", sql)
+        self.assertNotIn("fetched_at=", sql)
+        self.assertEqual(params, ("2010", "unavailable"))
 
     def test_malformed_appointment_result_is_error(self):
         self.booking.appointment_result = {"ok": True, "appointments": {}}
         result = self.ops.patient_appointments("2010")
         self.assertFalse(result["ok"])
         self.assertEqual(result["code"], "malformed_scheduling_response")
+
+    def test_analytics_uses_cairo_day_at_utc_boundary(self):
+        boundary = dt.datetime(2026, 9, 14, 22, 30, tzinfo=dt.timezone.utc)
+        ops = AdminOperations(self.db, self.booking, now_func=lambda: boundary)
+        result = ops.analytics(14)
+        self.assertTrue(result["ok"])
+        sql, params = next(
+            (sql, params) for sql, params in self.db.calls if "admin_analytics" in sql
+        )
+        self.assertNotIn("CURRENT_DATE", sql)
+        self.assertEqual(params, (dt.date(2026, 9, 15), 14, dt.date(2026, 9, 15)))
 
     def test_health_distinguishes_unknown_and_unavailable(self):
         self.db.fail_health = True

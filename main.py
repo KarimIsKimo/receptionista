@@ -631,9 +631,14 @@ def check_patient_appointments(phone_number: str) -> dict:
     return booking_service.appointments(phone_number)
 
 
-def cancel_appointment(phone_number: str, date: str) -> dict:
+def cancel_appointment(
+    phone_number: str,
+    date: str,
+    time: str | None = None,
+    appointment_id: str | None = None,
+) -> dict:
     """Cancel a patient's appointment and return a structured result."""
-    return booking_service.cancel(phone_number, date)
+    return booking_service.cancel(phone_number, date, time, appointment_id)
 
 
 def reschedule_appointment(
@@ -641,9 +646,18 @@ def reschedule_appointment(
     old_date: str,
     new_date: str,
     new_time: str,
+    old_time: str | None = None,
+    appointment_id: str | None = None,
 ) -> dict:
     """Move an existing appointment only when Apps Script confirms the change."""
-    return booking_service.reschedule(phone_number, old_date, new_date, new_time)
+    return booking_service.reschedule(
+        phone_number,
+        old_date,
+        new_date,
+        new_time,
+        old_time,
+        appointment_id,
+    )
 
 
 def book_appointment(
@@ -837,13 +851,18 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
         """Read appointments for the current WhatsApp patient; never ask for a phone."""
         return check_patient_appointments(phone)
 
-    def cancel_my_appointment(date: str) -> dict:
-        """Cancel the current WhatsApp patient's appointment on a given date."""
-        return cancel_appointment(phone, date)
+    def cancel_my_appointment(date: str, time: str) -> dict:
+        """Cancel the current patient's exact appointment using its date and time."""
+        return cancel_appointment(phone, date, time)
 
-    def reschedule_my_appointment(old_date: str, new_date: str, new_time: str) -> dict:
-        """Reschedule the current patient's booking without requesting a phone."""
-        return reschedule_appointment(phone, old_date, new_date, new_time)
+    def reschedule_my_appointment(
+        old_date: str,
+        old_time: str,
+        new_date: str,
+        new_time: str,
+    ) -> dict:
+        """Reschedule the current patient's exact booking without requesting a phone."""
+        return reschedule_appointment(phone, old_date, new_date, new_time, old_time)
 
     def book_my_appointment(
         patient_name: str,
@@ -1136,13 +1155,20 @@ class BookReq(BaseModel):
     time: str
     area: str = Field(min_length=1, max_length=200)
 
+class ReadCursorReq(BaseModel):
+    displayed_message_id: int = Field(ge=0)
+
 class CancelReq(BaseModel):
     phone_number: str = Field(min_length=5, max_length=30)
     date: str
+    time: str | None = Field(default=None, max_length=30)
+    appointment_id: str | None = Field(default=None, max_length=200)
 
 class RescheduleReq(BaseModel):
     phone_number: str = Field(min_length=5, max_length=30)
     old_date: str
+    old_time: str | None = Field(default=None, max_length=30)
+    appointment_id: str | None = Field(default=None, max_length=200)
     new_date: str
     new_time: str
 
@@ -1247,8 +1273,12 @@ def api_inbox(
     )
 
 @app.post("/admin/api/patient/{phone_number}/read")
-def api_mark_patient_read(phone_number: str, admin: str = Depends(verify_admin)):
-    return admin_operations.mark_read(phone_number)
+def api_mark_patient_read(
+    phone_number: str,
+    req: ReadCursorReq,
+    admin: str = Depends(verify_admin),
+):
+    return admin_operations.mark_read(phone_number, req.displayed_message_id)
 
 @app.get("/admin/api/patient/{phone_number}")
 def api_patient_detail(phone_number: str, admin: str = Depends(verify_admin)):
@@ -1291,13 +1321,23 @@ def api_admin_book(req: BookReq, admin: str = Depends(verify_admin)):
 
 @app.post("/admin/api/cancel")
 def api_admin_cancel(req: CancelReq, admin: str = Depends(verify_admin)):
-    result = cancel_appointment(req.phone_number, req.date)
+    result = cancel_appointment(
+        req.phone_number,
+        req.date,
+        req.time,
+        req.appointment_id,
+    )
     if result.get("ok") is not True:
         return result
     refresh = admin_operations.patient_appointments(req.phone_number)
     return success(
         "appointment_cancelled",
-        {"date": result.get("date"), "appointments_refresh": refresh},
+        {
+            "date": result.get("date"),
+            "time": result.get("time"),
+            "appointment_id": result.get("appointment_id"),
+            "appointments_refresh": refresh,
+        },
         message=result.get("message"),
         status=result.get("message", ""),
     )
@@ -1305,7 +1345,12 @@ def api_admin_cancel(req: CancelReq, admin: str = Depends(verify_admin)):
 @app.post("/admin/api/reschedule")
 def api_admin_reschedule(req: RescheduleReq, admin: str = Depends(verify_admin)):
     result = reschedule_appointment(
-        req.phone_number, req.old_date, req.new_date, req.new_time
+        req.phone_number,
+        req.old_date,
+        req.new_date,
+        req.new_time,
+        req.old_time,
+        req.appointment_id,
     )
     if result.get("ok") is not True:
         return result
@@ -1314,6 +1359,8 @@ def api_admin_reschedule(req: RescheduleReq, admin: str = Depends(verify_admin))
         "appointment_rescheduled",
         {
             "old_date": result.get("old_date"),
+            "old_time": result.get("old_time"),
+            "appointment_id": result.get("appointment_id"),
             "date": result.get("date"),
             "time": result.get("time"),
             "appointments_refresh": refresh,

@@ -119,15 +119,58 @@ class BookingTests(unittest.TestCase):
                 self.assertTrue(answer["retryable"])
 
     def test_cancel_returns_structured_result(self):
-        answer = self.service(FakeAppsScript()).cancel("01012345678", "Thursday")
+        fake = FakeAppsScript()
+        answer = self.service(fake).cancel("01012345678", "Thursday", "7:00 PM")
         self.assertTrue(answer["ok"])
         self.assertEqual(answer["code"], "cancelled")
+        self.assertEqual(answer["time"], "7:00 PM")
+        self.assertEqual(fake.posts[0]["time"], "7:00 PM")
+
+    def test_cancel_requires_exact_time_or_stable_id(self):
+        fake = FakeAppsScript()
+        answer = self.service(fake).cancel("01012345678", "Thursday")
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["code"], "invalid_appointment")
+        self.assertEqual(fake.posts, [])
+
+    def test_cancel_can_target_stable_appointment_id(self):
+        fake = FakeAppsScript()
+        answer = self.service(fake).cancel(
+            "01012345678", "Thursday", appointment_id="booking-42"
+        )
+        self.assertTrue(answer["ok"])
+        self.assertEqual(fake.posts[0]["appointment_id"], "booking-42")
+
+    def test_ambiguous_cancel_response_never_confirms(self):
+        fake = FakeAppsScript()
+        fake.post = lambda payload: {}
+        answer = self.service(fake).cancel("01012345678", "Thursday", "7:00 PM")
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["code"], "cancellation_not_confirmed")
+        self.assertTrue(answer["retryable"])
 
     def test_reschedule_preserves_old_booking_unless_confirmed(self):
         fake = FakeAppsScript()
-        answer = self.service(fake).reschedule("01012345678", "2026-09-15", "2026-09-16", "8:00 PM")
+        answer = self.service(fake).reschedule(
+            "01012345678",
+            "2026-09-15",
+            "2026-09-16",
+            "8:00 PM",
+            "7:00 PM",
+        )
         self.assertTrue(answer["ok"])
         self.assertEqual(fake.posts[0]["action"], "reschedule")
+        self.assertEqual(fake.posts[0]["old_time"], "7:00 PM")
+        self.assertEqual(answer["old_time"], "7:00 PM")
+
+    def test_reschedule_requires_exact_original_target(self):
+        fake = FakeAppsScript()
+        answer = self.service(fake).reschedule(
+            "01012345678", "2026-09-15", "2026-09-16", "8:00 PM"
+        )
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["code"], "invalid_appointment")
+        self.assertEqual(fake.posts, [])
 
 
 if __name__ == "__main__":

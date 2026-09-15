@@ -20,6 +20,7 @@ class DashboardHtmlTests(unittest.TestCase):
         for required in (
             'id="view-inbox"', 'id="view-appointments"',
             'id="view-analytics"', 'id="view-health"',
+            'id="view-settings"',
             "clinic_closed", "unavailable", ".message.system",
         ):
             self.assertIn(required, self.html)
@@ -29,6 +30,26 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertIn('id="langBtn"', self.html)
         self.assertIn("@media(max-width:760px)", self.html)
         self.assertIn('id="backChat"', self.html)
+
+    def test_read_cursor_comes_from_displayed_messages(self):
+        self.assertIn("displayed_message_id:cursor", self.html)
+        self.assertIn("markDisplayedRead(state.messageCursor)", self.html)
+        self.assertNotIn('/read",{method:"POST"}', self.html)
+
+    def test_message_scroll_behavior_preserves_viewport(self):
+        self.assertIn("renderMessages({prepend:true})", self.html)
+        self.assertIn("else if(options.prepend)", self.html)
+        self.assertIn('id="newMessageBtn"', self.html)
+        self.assertIn("isNearBottom()", self.html)
+
+    def test_settings_and_audit_are_restored(self):
+        self.assertIn("/admin/api/settings", self.html)
+        self.assertIn("/admin/api/audit?limit=50", self.html)
+        self.assertIn('id="systemInstruction"', self.html)
+
+    def test_schedule_actions_include_exact_slot_target(self):
+        self.assertIn("time:slot.time", self.html)
+        self.assertIn("appointment_id:appointmentId(a)", self.html)
 
     def test_embedded_javascript_has_valid_syntax(self):
         node = shutil.which("node")
