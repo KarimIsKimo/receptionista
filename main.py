@@ -473,7 +473,7 @@ def update_patient_file(phone_number: str, name: str = "", preferences: str = ""
     return {"ok": True, "code": "patient_updated", "message": "تم تحديث ملف المريضة.", "patient_name": (name or "").strip()}
 
 def set_patient_preferences(phone_number: str, preferences: str) -> dict:
-    """Replace admin-managed notes exactly; Gemini memory remains append-only."""
+    """Replace long-term patient preferences exactly."""
     phone = normalize_phone(phone_number)
     db_execute(
         """
@@ -489,6 +489,37 @@ def set_patient_preferences(phone_number: str, preferences: str) -> dict:
         "code": "patient_preferences_replaced",
         "phone_number": phone,
         "preferences": preferences,
+    }
+
+def set_extracted_patient_memory(
+    phone_number: str,
+    name: str,
+    preferences: str,
+) -> dict:
+    """Persist Gemini's cleaned memory without overwriting a known patient name."""
+    phone = normalize_phone(phone_number)
+    clean_name = re.sub(r"\s+", " ", (name or "").strip())[:150]
+    clean_preferences = re.sub(r"\s+", " ", (preferences or "").strip())[:4000]
+    db_execute(
+        """
+        INSERT INTO patients(phone_number, name, preferences)
+        VALUES (%s,%s,%s)
+        ON CONFLICT(phone_number)
+        DO UPDATE SET
+            name = CASE
+                WHEN COALESCE(BTRIM(patients.name), '') = ''
+                THEN EXCLUDED.name
+                ELSE patients.name
+            END,
+            preferences = EXCLUDED.preferences,
+            updated_at = NOW()
+        """,
+        (phone, clean_name, clean_preferences),
+    )
+    return {
+        "phone_number": phone,
+        "name": clean_name,
+        "preferences": clean_preferences,
     }
 
 def set_patient_pause(phone_number: str, paused: bool):
@@ -559,6 +590,25 @@ def load_chat_history(phone_number: str, limit: int = 12):
             )
         )
     return history
+
+def load_recent_memory_conversation(phone_number: str, limit: int = 20) -> list[dict]:
+    """Load recent human-visible turns without converting staff messages to AI."""
+    rows = db_execute(
+        """
+        SELECT role, content
+        FROM chat_history
+        WHERE phone_number=%s
+          AND role IN ('user', 'model', 'staff')
+        ORDER BY id DESC
+        LIMIT %s
+        """,
+        (normalize_phone(phone_number), max(1, min(limit, 20))),
+        fetchall=True,
+    )
+    return [
+        {"role": row["role"], "content": row["content"]}
+        for row in reversed(rows)
+    ]
 
 # Atomic idempotency: INSERT succeeds for exactly one worker.
 def claim_message(message_id: str) -> bool:
@@ -818,6 +868,87 @@ def build_system_instruction(profile: dict, phone: str) -> str:
 - اعتمدي على نتائج الأدوات بصيغة JSON: ok=true يعني نجاحاً مؤكداً، وok=false يعني عدم التأكيد.
 """
 
+MEMORY_EXTRACTION_INSTRUCTION = """
+You maintain durable, non-medical receptionist memory for a clinic patient.
+Return one strict JSON object with exactly these string fields:
+{"name": "", "preferences": ""}
+
+Rewrite preferences as one clean final value. Merge useful durable facts from the
+current preferences and recent conversation without duplicating text.
+
+Keep only explicitly stated, durable receptionist information, including:
+- the patient's explicitly stated name
+- recurring services or treatment areas
+- whether they are an existing laser client
+- stable scheduling preferences
+- communication preferences
+- other useful non-medical receptionist preferences
+
+Never store old booking dates or times, completed appointment details, greetings,
+temporary questions, old prices, conversation summaries, inferred diagnoses, or
+sensitive medical information. Do not infer facts the patient did not state.
+
+If the current name is non-empty, return it unchanged. If no durable preference
+exists, return an empty preferences string. Return JSON only.
+""".strip()
+
+def extract_patient_memory_sync(phone: str, profile: dict) -> dict:
+    """Extract durable patient memory. This function never sends WhatsApp output."""
+    if gemini_client is None:
+        raise RuntimeError("Gemini client is unavailable for memory extraction")
+
+    recent_conversation = load_recent_memory_conversation(phone, 20)
+    payload = {
+        "current_name": profile.get("name") or "",
+        "current_preferences": profile.get("preferences") or "",
+        "recent_conversation": recent_conversation,
+    }
+    result = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=json.dumps(payload, ensure_ascii=False),
+        config=types.GenerateContentConfig(
+            system_instruction=MEMORY_EXTRACTION_INSTRUCTION,
+            temperature=0,
+            response_mime_type="application/json",
+            response_schema={
+                "type": "OBJECT",
+                "properties": {
+                    "name": {"type": "STRING"},
+                    "preferences": {"type": "STRING"},
+                },
+                "required": ["name", "preferences"],
+            },
+        ),
+    )
+    parsed = json.loads((result.text or "").strip())
+    if not isinstance(parsed, dict):
+        raise ValueError("Gemini memory response is not a JSON object")
+    if set(parsed) != {"name", "preferences"}:
+        raise ValueError("Gemini memory response has an invalid schema")
+    if not isinstance(parsed["name"], str) or not isinstance(parsed["preferences"], str):
+        raise ValueError("Gemini memory fields must be strings")
+
+    # Never allow a model response to replace a name already stored in Postgres.
+    extracted_name = profile.get("name") or parsed["name"]
+    return set_extracted_patient_memory(
+        phone,
+        extracted_name,
+        parsed["preferences"],
+    )
+
+async def update_patient_memory(phone: str, profile: dict) -> dict:
+    """Best-effort memory update that must never interrupt webhook processing."""
+    try:
+        memory = await asyncio.to_thread(extract_patient_memory_sync, phone, profile)
+        updated = dict(profile)
+        if not updated.get("name") and memory.get("name"):
+            updated["name"] = memory["name"]
+        updated["preferences"] = memory.get("preferences", "")
+        return updated
+    except Exception:
+        log.exception("Patient memory extraction failed for %s", phone)
+        return profile
+
 def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
     if gemini_client is None:
         return "أهلاً بحضرتك يا فندم 🌸 حصل عطل مؤقت. برجاء المحاولة بعد قليل.", []
@@ -942,11 +1073,14 @@ async def handle_ai_conversation(
 
     async with lock:
         try:
-            save_chat_turn(sender_phone, "user", user_text, message_id)
+            saved_turn = save_chat_turn(sender_phone, "user", user_text, message_id)
+            if not saved_turn:
+                raise RuntimeError("Incoming chat turn was not persisted")
+            profile = load_patient_profile(sender_phone)
+            profile = await update_patient_memory(sender_phone, profile)
             if not is_bot_globally_active():
                 log.info("Global bot off; ignoring %s", sender_phone)
                 return
-            profile = load_patient_profile(sender_phone)
         except Exception:
             log.exception("Postgres unavailable while starting conversation")
             await send_whatsapp_message(
