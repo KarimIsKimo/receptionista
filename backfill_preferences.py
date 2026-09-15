@@ -10,6 +10,9 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ["GOOGLE_API_KEY"]
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+LIMIT = int(os.getenv("LIMIT", "10"))
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 
@@ -59,17 +62,13 @@ def extract_patient_info(messages, existing_name="", existing_preferences=""):
     conversation = []
 
     for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-
         conversation.append(
-            f"{role}: {content}"
+            f"{msg['role']}: {msg['content']}"
         )
 
     chat_text = "\n".join(conversation)
 
-    # Avoid sending absurdly huge chats.
-    # Keep the latest ~30k chars for this simple version.
+    # Keep this simple and cheap for old chats.
     if len(chat_text) > 30000:
         chat_text = chat_text[-30000:]
 
@@ -81,28 +80,28 @@ Extract ONLY useful, durable information that a clinic receptionist could use la
 Existing patient name:
 {existing_name or "unknown"}
 
-Existing staff notes:
+Existing notes:
 {existing_preferences or "none"}
 
-Important rules:
+Rules:
 - Do not invent anything.
 - Do not diagnose medical conditions.
 - Do not infer sensitive medical facts.
-- Ignore greetings, temporary conversation details, and irrelevant chatter.
+- Ignore greetings and temporary conversation details.
 - Prefer explicit facts stated by the patient.
-- Keep the result short.
-- Do not repeat existing notes unless useful for context.
-- If there is no useful information, return an empty string.
+- Keep preferences short and useful.
+- If there is no useful information, return an empty preferences string.
+- If an existing patient name already exists, do not replace it.
 
-Useful examples:
-- stated patient name
-- treatment areas they ask about
+Useful information includes:
+- explicitly stated patient name
+- treatment areas mentioned
 - services they are interested in
-- preferred appointment times/days
+- preferred appointment times or days
 - communication preferences
-- other stable non-sensitive preferences
+- stable non-medical preferences
 
-Return JSON only in this format:
+Return JSON only:
 
 {{
   "name": "",
@@ -125,20 +124,13 @@ Conversation:
     text = (response.text or "").strip()
 
     if not text:
-        return {
-            "name": "",
-            "preferences": "",
-        }
+        return {"name": "", "preferences": ""}
 
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        print("Invalid JSON from Gemini:")
-        print(text)
-        return {
-            "name": "",
-            "preferences": "",
-        }
+        print("Invalid JSON:", text)
+        return {"name": "", "preferences": ""}
 
 
 def update_patient(phone_number, extracted, existing):
@@ -158,10 +150,8 @@ def update_patient(phone_number, extracted, existing):
         existing.get("preferences") if existing else ""
     ) or ""
 
-    # Preserve existing name if already present.
     final_name = existing_name or extracted_name
 
-    # Keep existing notes and append only new extracted info.
     if extracted_preferences:
         if existing_preferences:
             if extracted_preferences.lower() in existing_preferences.lower():
@@ -176,6 +166,13 @@ def update_patient(phone_number, extracted, existing):
             final_preferences = extracted_preferences
     else:
         final_preferences = existing_preferences
+
+    print("  Final name:", final_name)
+    print("  Final preferences:", final_preferences)
+
+    if DRY_RUN:
+        print("  DRY RUN - nothing written")
+        return
 
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -199,25 +196,29 @@ def update_patient(phone_number, extracted, existing):
 
         conn.commit()
 
+    print("  SAVED")
+
 
 def main():
     patients = get_patients()
-    patients = patients[:10]
 
-    print(f"Found {len(patients)} patients")
+    if LIMIT > 0:
+        patients = patients[:LIMIT]
+
+    print(f"Processing {len(patients)} patients")
+    print("DRY_RUN =", DRY_RUN)
 
     for index, patient in enumerate(patients, start=1):
         phone = patient["phone_number"]
 
-        print(
-            f"[{index}/{len(patients)}] Processing {phone}"
-        )
+        print("")
+        print(f"[{index}/{len(patients)}] {phone}")
 
         try:
             messages = get_chat_history(phone)
 
             if not messages:
-                print("  No messages, skipping")
+                print("  No messages")
                 continue
 
             existing = get_existing_patient(phone) or {}
@@ -236,14 +237,11 @@ def main():
                 existing,
             )
 
-            print("  Saved")
-
         except Exception as exc:
-            print(
-                f"  ERROR for {phone}: {exc}"
-            )
+            print("  ERROR:", exc)
 
-    print("Done")
+    print("")
+    print("Finished")
 
 
 if __name__ == "__main__":
