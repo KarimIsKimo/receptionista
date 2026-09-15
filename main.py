@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
+from receptionist.admin_ops import AdminOperations, failure, success
 from receptionist.booking import BookingService, normalize_time
 from receptionist.clinic import CLINIC, clinic_prompt
 from receptionist.dates import parse_date_expression
@@ -298,6 +299,22 @@ def init_db():
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS admin_inbox_state (
+            phone_number VARCHAR(30) PRIMARY KEY,
+            last_read_message_id BIGINT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS admin_appointment_snapshots (
+            phone_number VARCHAR(30) PRIMARY KEY,
+            appointments JSONB,
+            next_appointment JSONB,
+            status VARCHAR(20) NOT NULL DEFAULT 'unknown',
+            fetched_at TIMESTAMPTZ
+        )
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_chat_phone_created
         ON chat_history(phone_number, created_at, id)
         """,
@@ -455,6 +472,25 @@ def update_patient_file(phone_number: str, name: str = "", preferences: str = ""
     )
     return {"ok": True, "code": "patient_updated", "message": "تم تحديث ملف المريضة.", "patient_name": (name or "").strip()}
 
+def set_patient_preferences(phone_number: str, preferences: str) -> dict:
+    """Replace admin-managed notes exactly; Gemini memory remains append-only."""
+    phone = normalize_phone(phone_number)
+    db_execute(
+        """
+        INSERT INTO patients(phone_number, preferences)
+        VALUES (%s,%s)
+        ON CONFLICT(phone_number)
+        DO UPDATE SET preferences=EXCLUDED.preferences, updated_at=NOW()
+        """,
+        (phone, preferences),
+    )
+    return {
+        "ok": True,
+        "code": "patient_preferences_replaced",
+        "phone_number": phone,
+        "preferences": preferences,
+    }
+
 def set_patient_pause(phone_number: str, paused: bool):
     phone_number = normalize_phone(phone_number)
     db_execute(
@@ -491,12 +527,14 @@ def save_chat_turn(
 ):
     if not content:
         return
-    db_execute(
+    return db_execute(
         """
         INSERT INTO chat_history(phone_number, role, content, whatsapp_message_id)
         VALUES (%s,%s,%s,%s)
+        RETURNING id, role, content, whatsapp_message_id, created_at
         """,
         (normalize_phone(phone_number), role, content, whatsapp_message_id),
+        fetchone=True,
     )
 
 def load_chat_history(phone_number: str, limit: int = 12):
@@ -612,9 +650,14 @@ def check_patient_appointments(phone_number: str) -> dict:
     return booking_service.appointments(phone_number)
 
 
-def cancel_appointment(phone_number: str, date: str) -> dict:
+def cancel_appointment(
+    phone_number: str,
+    date: str,
+    time: str | None = None,
+    appointment_id: str | None = None,
+) -> dict:
     """Cancel a patient's appointment and return a structured result."""
-    return booking_service.cancel(phone_number, date)
+    return booking_service.cancel(phone_number, date, time, appointment_id)
 
 
 def reschedule_appointment(
@@ -622,9 +665,18 @@ def reschedule_appointment(
     old_date: str,
     new_date: str,
     new_time: str,
+    old_time: str | None = None,
+    appointment_id: str | None = None,
 ) -> dict:
     """Move an existing appointment only when Apps Script confirms the change."""
-    return booking_service.reschedule(phone_number, old_date, new_date, new_time)
+    return booking_service.reschedule(
+        phone_number,
+        old_date,
+        new_date,
+        new_time,
+        old_time,
+        appointment_id,
+    )
 
 
 def book_appointment(
@@ -642,7 +694,8 @@ def book_appointment(
 # WhatsApp outbound
 # ------------------------------------------------------------
 
-async def send_whatsapp_message(to: str, text: str, phone_id: str | None = None):
+async def send_whatsapp_message(to: str, text: str, phone_id: str | None = None) -> dict:
+    """Send text only when Meta returns an explicit accepted message id."""
     phone_id = phone_id or PHONE_NUMBER_ID
     url = f"https://graph.facebook.com/v21.0/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
@@ -658,12 +711,34 @@ async def send_whatsapp_message(to: str, text: str, phone_id: str | None = None)
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as c:
                 res = await c.post(url, headers=headers, json=payload)
                 if 200 <= res.status_code < 300:
-                    return True
-                log.warning("WhatsApp text %s: %s", res.status_code, res.text[:500])
+                    try:
+                        response_data = res.json()
+                    except ValueError:
+                        response_data = None
+                    messages = response_data.get("messages") if isinstance(response_data, dict) else None
+                    message_id = (
+                        messages[0].get("id")
+                        if isinstance(messages, list) and messages and isinstance(messages[0], dict)
+                        else None
+                    )
+                    if message_id:
+                        return {
+                            "ok": True,
+                            "code": "whatsapp_accepted",
+                            "message_id": message_id,
+                        }
+                    log.warning("WhatsApp returned ambiguous success: %s", res.text[:500])
+                else:
+                    log.warning("WhatsApp text %s: %s", res.status_code, res.text[:500])
         except Exception:
             log.exception("WhatsApp text attempt %s failed", attempt + 1)
         await asyncio.sleep(1.5 * (attempt + 1))
-    return False
+    return {
+        "ok": False,
+        "code": "whatsapp_delivery_unconfirmed",
+        "message": "WhatsApp did not explicitly confirm message acceptance.",
+        "retryable": True,
+    }
 
 async def send_whatsapp_image(to: str, image: dict, phone_id: str | None = None):
     phone_id = phone_id or PHONE_NUMBER_ID
@@ -700,9 +775,9 @@ async def notify_staff(phone: str, issue_summary: str):
         f"📱 رقم المريض: {phone}\n"
         f"📝 المشكلة: {issue_summary[:1000]}"
     )
-    ok = await send_whatsapp_message(STAFF_NOTIFICATION_PHONE, body)
+    delivery = await send_whatsapp_message(STAFF_NOTIFICATION_PHONE, body)
     audit("bot", "staff_notification", phone, issue_summary[:1000])
-    return ok
+    return delivery.get("ok") is True
 
 # ------------------------------------------------------------
 # Gemini
@@ -713,6 +788,8 @@ try:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception:
     log.exception("Gemini client initialization failed")
+
+admin_operations = AdminOperations(db_execute, booking_service, config=CLINIC)
 
 def build_system_instruction(profile: dict, phone: str) -> str:
     now = dt.datetime.now(CAIRO)
@@ -793,13 +870,18 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
         """Read appointments for the current WhatsApp patient; never ask for a phone."""
         return check_patient_appointments(phone)
 
-    def cancel_my_appointment(date: str) -> dict:
-        """Cancel the current WhatsApp patient's appointment on a given date."""
-        return cancel_appointment(phone, date)
+    def cancel_my_appointment(date: str, time: str) -> dict:
+        """Cancel the current patient's exact appointment using its date and time."""
+        return cancel_appointment(phone, date, time)
 
-    def reschedule_my_appointment(old_date: str, new_date: str, new_time: str) -> dict:
-        """Reschedule the current patient's booking without requesting a phone."""
-        return reschedule_appointment(phone, old_date, new_date, new_time)
+    def reschedule_my_appointment(
+        old_date: str,
+        old_time: str,
+        new_date: str,
+        new_time: str,
+    ) -> dict:
+        """Reschedule the current patient's exact booking without requesting a phone."""
+        return reschedule_appointment(phone, old_date, new_date, new_time, old_time)
 
     def book_my_appointment(
         patient_name: str,
@@ -883,16 +965,27 @@ async def handle_ai_conversation(
         for clinic_image in images:
             if not await send_whatsapp_image(sender_phone, clinic_image, phone_number_id):
                 audit("system", "whatsapp_image_failed", sender_phone, clinic_image.get("url", ""))
+                save_chat_turn(sender_phone, "system", "فشل إرسال صورة العيادة عبر واتساب.")
 
         if response_text:
-            ok = await send_whatsapp_message(sender_phone, response_text, phone_number_id)
-            if ok:
+            delivery = await send_whatsapp_message(sender_phone, response_text, phone_number_id)
+            if delivery.get("ok") is True:
                 try:
-                    save_chat_turn(sender_phone, "model", response_text)
+                    save_chat_turn(
+                        sender_phone,
+                        "model",
+                        response_text,
+                        delivery.get("message_id"),
+                    )
                 except Exception:
                     log.exception("Reply sent but chat persistence failed")
             else:
                 audit("system", "whatsapp_send_failed", sender_phone, response_text[:500])
+                save_chat_turn(
+                    sender_phone,
+                    "system",
+                    "لم يؤكد واتساب استلام رد الذكاء الاصطناعي.",
+                )
 
 
 # ------------------------------------------------------------
@@ -1081,9 +1174,22 @@ class BookReq(BaseModel):
     time: str
     area: str = Field(min_length=1, max_length=200)
 
+class ReadCursorReq(BaseModel):
+    displayed_message_id: int = Field(ge=0)
+
 class CancelReq(BaseModel):
     phone_number: str = Field(min_length=5, max_length=30)
     date: str
+    time: str | None = Field(default=None, max_length=30)
+    appointment_id: str | None = Field(default=None, max_length=200)
+
+class RescheduleReq(BaseModel):
+    phone_number: str = Field(min_length=5, max_length=30)
+    old_date: str
+    old_time: str | None = Field(default=None, max_length=30)
+    appointment_id: str | None = Field(default=None, max_length=200)
+    new_date: str
+    new_time: str
 
 class RenamePatientReq(BaseModel):
     phone_number: str = Field(min_length=5, max_length=30)
@@ -1112,88 +1218,244 @@ class PatientPreferencesReq(BaseModel):
 @app.post("/admin/api/toggle_pause")
 def api_toggle_pause(req: PauseRequest, admin: str = Depends(verify_admin)):
     phone = normalize_phone(req.phone_number)
-    set_patient_pause(phone, req.is_paused)
-    audit(admin, "patient_pause_on" if req.is_paused else "patient_pause_off", phone)
-    return {"status": "success", "is_paused": req.is_paused}
+    try:
+        set_patient_pause(phone, req.is_paused)
+        audit(admin, "patient_pause_on" if req.is_paused else "patient_pause_off", phone)
+        return success("patient_state_updated", {"phone_number": phone, "is_paused": req.is_paused}, status="success")
+    except Exception:
+        return failure("database_unavailable", "Could not update patient state.", retryable=True)
 
 @app.post("/admin/api/rename_patient")
 def api_rename_patient(req: RenamePatientReq, admin: str = Depends(verify_admin)):
     phone = normalize_phone(req.phone_number)
-    update_patient_file(phone, name=req.name)
-    audit(admin, "rename_patient", phone, req.name.strip())
-    return {"status": "success"}
+    try:
+        update_patient_file(phone, name=req.name)
+        audit(admin, "rename_patient", phone, req.name.strip())
+        return success("patient_renamed", {"phone_number": phone, "name": req.name.strip()}, status="success")
+    except Exception:
+        return failure("database_unavailable", "Could not update patient name.", retryable=True)
 
 @app.post("/admin/api/patient_tags")
 def api_patient_tags(req: PatientTagsReq, admin: str = Depends(verify_admin)):
     phone = normalize_phone(req.phone_number)
-    set_patient_tags(phone, req.tags)
-    audit(admin, "update_patient_tags", phone, json.dumps(req.tags, ensure_ascii=False))
-    return {"status": "success"}
+    try:
+        set_patient_tags(phone, req.tags)
+        audit(admin, "update_patient_tags", phone, json.dumps(req.tags, ensure_ascii=False))
+        return success("patient_tags_updated", {"phone_number": phone, "tags": req.tags}, status="success")
+    except Exception:
+        return failure("database_unavailable", "Could not update tags.", retryable=True)
 
 @app.post("/admin/api/patient_preferences")
 def api_patient_preferences(req: PatientPreferencesReq, admin: str = Depends(verify_admin)):
     phone = normalize_phone(req.phone_number)
-    update_patient_file(phone, preferences=req.preferences)
-    audit(admin, "update_patient_preferences", phone, req.preferences[:1000])
-    return {"status": "success"}
+    try:
+        set_patient_preferences(phone, req.preferences)
+        audit(admin, "update_patient_preferences", phone, req.preferences[:1000])
+        return success("patient_notes_updated", {"phone_number": phone, "preferences": req.preferences}, status="success")
+    except Exception:
+        return failure("database_unavailable", "Could not update notes.", retryable=True)
 
 @app.get("/admin/api/settings")
 def get_settings(admin: str = Depends(verify_admin)):
-    return {"instruction": get_live_instructions()}
+    return success("settings_loaded", {"instruction": get_live_instructions()})
 
 @app.post("/admin/api/settings")
 def update_settings(data: SettingsUpdate, admin: str = Depends(verify_admin)):
     if not save_live_instructions(data.instruction):
-        raise HTTPException(status_code=500, detail="Failed to save settings")
-    return {"status": "success"}
+        return failure("settings_update_failed", "Failed to save settings.", retryable=True)
+    return success("settings_updated", status="success")
 
 @app.get("/admin/api/bot_status")
 def api_get_bot_status(admin: str = Depends(verify_admin)):
-    return {"is_active": is_bot_globally_active()}
+    return success("bot_status_loaded", {"is_active": is_bot_globally_active()})
 
 @app.post("/admin/api/toggle_global_bot")
 def api_toggle_global_bot(req: GlobalBotReq, admin: str = Depends(verify_admin)):
-    set_bot_globally_active(req.is_active)
-    return {"status": "success", "is_active": req.is_active}
+    try:
+        set_bot_globally_active(req.is_active)
+        return success("global_bot_updated", {"is_active": req.is_active}, status="success")
+    except Exception:
+        return failure("database_unavailable", "Could not update global bot state.", retryable=True)
+
+@app.get("/admin/api/inbox")
+def api_inbox(
+    search: str = Query("", max_length=100),
+    state: str = Query("all", max_length=30),
+    limit: int = Query(50, ge=1, le=100),
+    before_id: int | None = Query(None, ge=1),
+    after_id: int | None = Query(None, ge=0),
+    admin: str = Depends(verify_admin),
+):
+    return admin_operations.inbox(
+        search=search, state=state, limit=limit,
+        before_id=before_id, after_id=after_id,
+    )
+
+@app.post("/admin/api/patient/{phone_number}/read")
+def api_mark_patient_read(
+    phone_number: str,
+    req: ReadCursorReq,
+    admin: str = Depends(verify_admin),
+):
+    return admin_operations.mark_read(phone_number, req.displayed_message_id)
+
+@app.get("/admin/api/inbox/metadata")
+def api_inbox_metadata(
+    phones: str = Query("", max_length=4000),
+    admin: str = Depends(verify_admin),
+):
+    return admin_operations.inbox_metadata(phones.split(","))
+
+@app.get("/admin/api/patient/{phone_number}")
+def api_patient_detail(phone_number: str, admin: str = Depends(verify_admin)):
+    return admin_operations.patient_detail(phone_number)
+
+@app.get("/admin/api/patient/{phone_number}/messages")
+def api_patient_messages(
+    phone_number: str,
+    before_id: int | None = Query(None, ge=1),
+    after_id: int | None = Query(None, ge=0),
+    limit: int = Query(60, ge=1, le=200),
+    admin: str = Depends(verify_admin),
+):
+    return admin_operations.messages(
+        phone_number, limit=limit, before_id=before_id, after_id=after_id
+    )
+
+@app.get("/admin/api/patient/{phone_number}/appointments")
+def api_patient_appointments(phone_number: str, admin: str = Depends(verify_admin)):
+    return admin_operations.patient_appointments(phone_number)
 
 @app.get("/admin/api/schedule")
 def api_get_schedule(date: str, admin: str = Depends(verify_admin)):
-    try:
-        parsed_date = parse_date(date)
-        return google_get({"date": parsed_date.isoformat()})
-    except Exception:
-        log.exception("Admin schedule read failed")
-        raise HTTPException(status_code=502, detail="Unable to read appointment schedule")
+    return admin_operations.schedule(date)
 
 @app.post("/admin/api/book")
 def api_admin_book(req: BookReq, admin: str = Depends(verify_admin)):
     result = book_appointment(
-        req.patient_name,
-        req.phone_number,
-        req.date,
-        req.time,
-        req.area,
+        req.patient_name, req.phone_number, req.date, req.time, req.area
     )
-    return {"status": result.get("message", ""), "result": result}
+    if result.get("ok") is not True:
+        return result
+    refresh = admin_operations.patient_appointments(req.phone_number)
+    return success(
+        "appointment_booked",
+        {"appointment": result.get("appointment"), "appointments_refresh": refresh},
+        message=result.get("message"),
+        status=result.get("message", ""),
+    )
 
 @app.post("/admin/api/cancel")
 def api_admin_cancel(req: CancelReq, admin: str = Depends(verify_admin)):
-    result = cancel_appointment(req.phone_number, req.date)
-    audit(admin, "appointment_cancel", normalize_phone(req.phone_number), req.date)
-    return {"status": result.get("message", ""), "result": result}
+    result = cancel_appointment(
+        req.phone_number,
+        req.date,
+        req.time,
+        req.appointment_id,
+    )
+    if result.get("ok") is not True:
+        return result
+    refresh = admin_operations.patient_appointments(req.phone_number)
+    return success(
+        "appointment_cancelled",
+        {
+            "date": result.get("date"),
+            "time": result.get("time"),
+            "appointment_id": result.get("appointment_id"),
+            "appointments_refresh": refresh,
+        },
+        message=result.get("message"),
+        status=result.get("message", ""),
+    )
+
+@app.post("/admin/api/reschedule")
+def api_admin_reschedule(req: RescheduleReq, admin: str = Depends(verify_admin)):
+    result = reschedule_appointment(
+        req.phone_number,
+        req.old_date,
+        req.new_date,
+        req.new_time,
+        req.old_time,
+        req.appointment_id,
+    )
+    if result.get("ok") is not True:
+        return result
+    refresh = admin_operations.patient_appointments(req.phone_number)
+    return success(
+        "appointment_rescheduled",
+        {
+            "old_date": result.get("old_date"),
+            "old_time": result.get("old_time"),
+            "appointment_id": result.get("appointment_id"),
+            "date": result.get("date"),
+            "time": result.get("time"),
+            "appointments_refresh": refresh,
+        },
+        message=result.get("message"),
+        status=result.get("message", ""),
+    )
 
 @app.post("/admin/api/send_message")
 async def api_send_message(req: StaffMessageReq, admin: str = Depends(verify_admin)):
     phone = normalize_phone(req.phone_number)
-    ok = await send_whatsapp_message(phone, req.message)
-    if not ok:
-        raise HTTPException(status_code=502, detail="WhatsApp message could not be sent")
-    save_chat_turn(phone, "staff", req.message)
-    if req.pause_after_send:
-        set_patient_pause(phone, True)
-    audit(admin, "staff_manual_message", phone, req.message[:1000])
-    return {"status": "success", "paused": req.pause_after_send}
+    delivery = await send_whatsapp_message(phone, req.message)
+    if delivery.get("ok") is not True:
+        try:
+            save_chat_turn(phone, "system", "لم يؤكد واتساب استلام رسالة الموظف.")
+        except Exception:
+            pass
+        return failure(
+            "whatsapp_delivery_unconfirmed",
+            "WhatsApp did not confirm message acceptance.",
+            retryable=True,
+        )
+    try:
+        row = save_chat_turn(
+            phone, "staff", req.message, delivery.get("message_id")
+        )
+        if req.pause_after_send:
+            set_patient_pause(phone, True)
+        audit(admin, "staff_manual_message", phone, req.message[:1000])
+        return success(
+            "staff_message_sent",
+            {
+                "message": dict(row) if row else {
+                    "role": "staff",
+                    "content": req.message,
+                    "whatsapp_message_id": delivery.get("message_id"),
+                },
+                "paused": req.pause_after_send,
+            },
+            status="success",
+        )
+    except Exception:
+        return failure(
+            "message_persistence_failed",
+            "WhatsApp accepted the message but it could not be saved locally.",
+            state="degraded",
+        )
 
+@app.get("/admin/api/dashboard-summary")
+def api_dashboard_summary(admin: str = Depends(verify_admin)):
+    return admin_operations.dashboard_summary()
+
+@app.get("/admin/api/analytics")
+def api_analytics(
+    days: int = Query(14, ge=7, le=90),
+    admin: str = Depends(verify_admin),
+):
+    return admin_operations.analytics(days)
+
+@app.get("/admin/api/system-health")
+def api_system_health(admin: str = Depends(verify_admin)):
+    return admin_operations.system_health(
+        global_bot_active=is_bot_globally_active(),
+        gemini_configured=bool(GEMINI_API_KEY),
+        gemini_initialized=gemini_client is not None,
+        whatsapp_configured=bool(WHATSAPP_ACCESS_TOKEN and PHONE_NUMBER_ID),
+    )
+
+# Compatibility endpoints retained while clients migrate to the structured APIs.
 @app.get("/admin/api/data")
 def get_admin_data(
     search: str = Query("", max_length=100),
@@ -1202,155 +1464,58 @@ def get_admin_data(
     include_chats: bool = Query(True),
     admin: str = Depends(verify_admin),
 ):
-    search = search.strip()
-    params = []
-    where = []
-
-    if search:
-        where.append("(active.phone_number ILIKE %s OR COALESCE(p.name,'') ILIKE %s)")
-        like = f"%{search}%"
-        params.extend([like, like])
-    if paused is not None:
-        where.append("COALESCE(p.is_paused,FALSE) = %s")
-        params.append(paused)
-
-    where_sql = "WHERE " + " AND ".join(where) if where else ""
-
-    patients = db_execute(
-        f"""
-        SELECT
-            active.phone_number,
-            COALESCE(p.name,'') AS name,
-            COALESCE(p.preferences,'') AS preferences,
-            COALESCE(p.tags,'{{}}') AS tags,
-            COALESCE(p.is_paused,FALSE) AS is_paused,
-            p.created_at,
-            p.updated_at,
-            MAX(c.created_at) AS last_msg_time,
-            MAX(c.id) AS last_msg_id,
-            (
-                SELECT ch.content FROM chat_history ch
-                WHERE ch.phone_number=active.phone_number
-                ORDER BY ch.id DESC LIMIT 1
-            ) AS last_message
-        FROM (
-            SELECT DISTINCT phone_number FROM chat_history
-            UNION
-            SELECT phone_number FROM patients
-        ) active
-        LEFT JOIN patients p ON active.phone_number=p.phone_number
-        LEFT JOIN chat_history c ON active.phone_number=c.phone_number
-        {where_sql}
-        GROUP BY active.phone_number,p.name,p.preferences,p.tags,p.is_paused,p.created_at,p.updated_at
-        ORDER BY last_msg_time DESC NULLS LAST, last_msg_id DESC NULLS LAST
-        LIMIT %s
-        """,
-        (*params, limit),
-        fetchall=True,
-    )
-
-    result = {"patients": patients}
+    state = "human" if paused is True else "ai" if paused is False else "all"
+    inbox_result = admin_operations.inbox(search=search, state=state, limit=min(limit,100))
+    if inbox_result.get("ok") is not True:
+        raise HTTPException(status_code=503, detail=inbox_result.get("message"))
+    patients = inbox_result["data"]["patients"]
+    chats = []
     if include_chats:
-        chats = db_execute(
-            """
-            SELECT id, phone_number, role, content, created_at
-            FROM chat_history
-            ORDER BY id DESC
-            LIMIT 1000
-            """,
-            fetchall=True,
-        )
-        chats.reverse()
-        result["chats"] = chats
-    else:
-        result["chats"] = []
-    return result
+        try:
+            chats = db_execute(
+                """
+                SELECT id,phone_number,role,content,created_at
+                FROM chat_history ORDER BY id DESC LIMIT 1000
+                """,
+                fetchall=True,
+            )
+            chats.reverse()
+        except Exception:
+            chats = []
+    return {"patients": patients, "chats": chats}
 
 @app.get("/admin/api/stats")
 def admin_stats(admin: str = Depends(verify_admin)):
-    row = db_execute(
-        """
-        SELECT
-          (SELECT COUNT(*) FROM patients) AS patients,
-          (SELECT COUNT(*) FROM chat_history) AS messages,
-          (SELECT COUNT(*) FROM chat_history WHERE role='user'
-             AND created_at >= NOW() - INTERVAL '24 hours') AS incoming_24h,
-          (SELECT COUNT(*) FROM chat_history WHERE role='staff'
-             AND created_at >= NOW() - INTERVAL '24 hours') AS staff_24h,
-          (SELECT COUNT(*) FROM patients WHERE is_paused) AS human_takeovers
-        """,
-        fetchone=True,
-    )
-    return {**dict(row), "bot_active": is_bot_globally_active()}
-
-@app.get("/admin/api/patient/{phone_number}")
-def admin_patient(
-    phone_number: str,
-    before_id: int | None = Query(None, ge=1),
-    after_id: int | None = Query(None, ge=1),
-    limit: int = Query(60, ge=1, le=200),
-    admin: str = Depends(verify_admin),
-):
-    """Return one page of patient chat history.
-
-    - before_id is used by the dashboard to load older messages.
-    - after_id is used by polling to fetch only genuinely new messages.
-    Keeping these directions separate prevents the UI from jumping or repeatedly
-    re-downloading the same page.
-    """
-    phone = normalize_phone(phone_number)
-    profile = load_patient_profile(phone)
-
-    if before_id is not None and after_id is not None:
-        raise HTTPException(status_code=400, detail="Use before_id or after_id, not both")
-
-    if after_id is not None:
-        rows = db_execute(
-            """
-            SELECT id, role, content, created_at
-            FROM chat_history
-            WHERE phone_number=%s AND id > %s
-            ORDER BY id ASC
-            LIMIT %s
-            """,
-            (phone, after_id, limit),
-            fetchall=True,
-        )
-        return {"patient": profile, "messages": rows, "has_more": False}
-
-    params = [phone]
-    clause = ""
-    if before_id is not None:
-        clause = " AND id < %s"
-        params.append(before_id)
-    params.append(limit + 1)
-    rows = db_execute(
-        f"""
-        SELECT id, role, content, created_at
-        FROM chat_history
-        WHERE phone_number=%s{clause}
-        ORDER BY id DESC
-        LIMIT %s
-        """,
-        tuple(params),
-        fetchall=True,
-    )
-    has_more = len(rows) > limit
-    messages = rows[:limit]
-    messages.reverse()
-    return {"patient": profile, "messages": messages, "has_more": has_more}
+    result = admin_operations.dashboard_summary()
+    if result.get("ok") is not True:
+        raise HTTPException(status_code=503, detail=result.get("message"))
+    data = result["data"]
+    return {
+        "patients": data["total_patients"],
+        "messages": data["incoming_messages_today"] + data["ai_messages_today"] + data["staff_messages_today"],
+        "incoming_24h": data["incoming_messages_today"],
+        "staff_24h": data["staff_messages_today"],
+        "human_takeovers": data["human_takeover_count"],
+        "bot_active": is_bot_globally_active(),
+    }
 
 @app.get("/admin/api/audit")
-def admin_audit(limit: int = Query(100, ge=1, le=500), admin: str = Depends(verify_admin)):
-    rows = db_execute(
-        """
-        SELECT id, actor, action, phone_number, details, created_at
-        FROM audit_log ORDER BY id DESC LIMIT %s
-        """,
-        (limit,),
-        fetchall=True,
-    )
-    return {"audit": rows}
+def admin_audit(
+    limit: int = Query(100, ge=1, le=500),
+    admin: str = Depends(verify_admin),
+):
+    try:
+        rows = db_execute(
+            """
+            SELECT id,actor,action,phone_number,details,created_at
+            FROM audit_log ORDER BY id DESC LIMIT %s
+            """,
+            (limit,),
+            fetchall=True,
+        )
+        return success("audit_loaded", {"audit": rows})
+    except Exception:
+        return failure("database_unavailable", "Could not load audit events.", retryable=True)
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_dashboard(admin: str = Depends(verify_admin)):

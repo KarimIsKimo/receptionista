@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - improve-receptionist-v1
+      - admin-dashboard-v2
 
 jobs:
   unit-tests:
