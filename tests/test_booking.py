@@ -23,8 +23,24 @@ class FakeAppsScript:
     def post(self, payload):
         self.posts.append(payload)
         if payload["action"] == "cancel":
+            phone = payload["phone_number"]
+            for index, item in enumerate(self.booked):
+                if isinstance(item, dict) and item.get("phone") == phone:
+                    self.booked.pop(index)
+                    break
             return {"deleted": True}
         if payload["action"] == "reschedule":
+            phone = payload["phone_number"]
+            self.booked = [
+                item
+                for item in self.booked
+                if not (
+                    isinstance(item, dict)
+                    and item.get("phone") == phone
+                    and item.get("time") == payload.get("old_time")
+                )
+            ]
+            self.booked.append({"phone": phone, "time": payload["new_time"]})
             return {"success": True, "rescheduled": True}
         return {"status": "success"}
 
@@ -119,7 +135,9 @@ class BookingTests(unittest.TestCase):
                 self.assertTrue(answer["retryable"])
 
     def test_cancel_returns_structured_result(self):
-        fake = FakeAppsScript()
+        fake = FakeAppsScript(
+            booked=[{"phone": "201012345678", "time": "7:00 PM"}]
+        )
         answer = self.service(fake).cancel("01012345678", "Thursday", "7:00 PM")
         self.assertTrue(answer["ok"])
         self.assertEqual(answer["code"], "cancelled")
@@ -134,7 +152,15 @@ class BookingTests(unittest.TestCase):
         self.assertEqual(fake.posts, [])
 
     def test_cancel_can_target_stable_appointment_id(self):
-        fake = FakeAppsScript()
+        fake = FakeAppsScript(
+            booked=[
+                {
+                    "phone": "201012345678",
+                    "time": "7:00 PM",
+                    "appointment_id": "booking-42",
+                }
+            ]
+        )
         answer = self.service(fake).cancel(
             "01012345678", "Thursday", appointment_id="booking-42"
         )
@@ -142,7 +168,9 @@ class BookingTests(unittest.TestCase):
         self.assertEqual(fake.posts[0]["appointment_id"], "booking-42")
 
     def test_ambiguous_cancel_response_never_confirms(self):
-        fake = FakeAppsScript()
+        fake = FakeAppsScript(
+            booked=[{"phone": "201012345678", "time": "7:00 PM"}]
+        )
         fake.post = lambda payload: {}
         answer = self.service(fake).cancel("01012345678", "Thursday", "7:00 PM")
         self.assertFalse(answer["ok"])
@@ -150,7 +178,9 @@ class BookingTests(unittest.TestCase):
         self.assertTrue(answer["retryable"])
 
     def test_reschedule_preserves_old_booking_unless_confirmed(self):
-        fake = FakeAppsScript()
+        fake = FakeAppsScript(
+            booked=[{"phone": "201012345678", "time": "7:00 PM"}]
+        )
         answer = self.service(fake).reschedule(
             "01012345678",
             "2026-09-15",
@@ -162,6 +192,70 @@ class BookingTests(unittest.TestCase):
         self.assertEqual(fake.posts[0]["action"], "reschedule")
         self.assertEqual(fake.posts[0]["old_time"], "7:00 PM")
         self.assertEqual(answer["old_time"], "7:00 PM")
+
+    def test_cancel_refuses_ambiguous_current_apps_script_contract(self):
+        fake = FakeAppsScript(
+            booked=[
+                {"phone": "201012345678", "time": "7:00 PM"},
+                {"phone": "201012345678", "time": "8:00 PM"},
+            ]
+        )
+        answer = self.service(fake).cancel(
+            "01012345678", "Thursday", "7:00 PM"
+        )
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["code"], "exact_target_not_supported")
+        self.assertTrue(answer["deployment_required"])
+        self.assertEqual(fake.posts, [])
+
+    def test_cancel_rejects_echoed_target_mismatch(self):
+        fake = FakeAppsScript(
+            booked=[{"phone": "201012345678", "time": "7:00 PM"}]
+        )
+
+        def mismatched(payload):
+            fake.posts.append(payload)
+            return {"deleted": True, "time": "8:00 PM"}
+
+        fake.post = mismatched
+        answer = self.service(fake).cancel(
+            "01012345678", "Thursday", "7:00 PM"
+        )
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["code"], "cancellation_target_mismatch")
+
+    def test_reschedule_rejects_echoed_original_target_mismatch(self):
+        fake = FakeAppsScript(
+            booked=[{"phone": "201012345678", "time": "7:00 PM"}]
+        )
+        fake.post = lambda payload: {
+            "rescheduled": True,
+            "old_time": "8:00 PM",
+        }
+        answer = self.service(fake).reschedule(
+            "01012345678",
+            "2026-09-15",
+            "2026-09-16",
+            "8:00 PM",
+            "7:00 PM",
+        )
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["code"], "reschedule_target_mismatch")
+
+    def test_current_apps_script_missing_reschedule_handler_never_confirms(self):
+        fake = FakeAppsScript(
+            booked=[{"phone": "201012345678", "time": "7:00 PM"}]
+        )
+        fake.post = lambda payload: None
+        answer = self.service(fake).reschedule(
+            "01012345678",
+            "2026-09-15",
+            "2026-09-16",
+            "8:00 PM",
+            "7:00 PM",
+        )
+        self.assertFalse(answer["ok"])
+        self.assertEqual(answer["code"], "booking_service_unavailable")
 
     def test_reschedule_requires_exact_original_target(self):
         fake = FakeAppsScript()

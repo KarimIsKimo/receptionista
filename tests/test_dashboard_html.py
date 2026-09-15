@@ -51,6 +51,27 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertIn("time:slot.time", self.html)
         self.assertIn("appointment_id:appointmentId(a)", self.html)
 
+    def test_appointment_metadata_refresh_is_independent_and_preserves_view(self):
+        self.assertIn("/admin/api/inbox/metadata?phones=", self.html)
+        self.assertIn("expireLocalAppointmentMetadata", self.html)
+        self.assertIn("now-fetchedAt>=600000", self.html)
+        self.assertIn("expireLocalAppointmentMetadata();refreshInboxMetadata()", self.html)
+        self.assertIn("scrollTop=list.scrollTop", self.html)
+        self.assertIn("list.scrollTop=scrollTop", self.html)
+        self.assertIn('state.filter==="booked"', self.html)
+        self.assertIn('patient.appointment_status==="healthy"', self.html)
+        self.assertIn("refreshAppointmentPatient", self.html)
+
+    def test_mobile_visible_patient_actions_menu_exists(self):
+        self.assertIn('id="mobileActionsBtn"', self.html)
+        self.assertIn('id="mobileActionsDialog"', self.html)
+        self.assertIn(".mobile-actions-trigger{display:grid!important}", self.html)
+        for action in (
+            'key:"toggle"', 'key:"profile"', 'key:"book"', 'key:"cancel"',
+            'key:"reschedule"', 'key:"name"', 'key:"notes"', 'key:"tags"',
+        ):
+            self.assertIn(action, self.html)
+
     def test_embedded_javascript_has_valid_syntax(self):
         node = shutil.which("node")
         if not node:

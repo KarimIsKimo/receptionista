@@ -472,6 +472,25 @@ def update_patient_file(phone_number: str, name: str = "", preferences: str = ""
     )
     return {"ok": True, "code": "patient_updated", "message": "تم تحديث ملف المريضة.", "patient_name": (name or "").strip()}
 
+def set_patient_preferences(phone_number: str, preferences: str) -> dict:
+    """Replace admin-managed notes exactly; Gemini memory remains append-only."""
+    phone = normalize_phone(phone_number)
+    db_execute(
+        """
+        INSERT INTO patients(phone_number, preferences)
+        VALUES (%s,%s)
+        ON CONFLICT(phone_number)
+        DO UPDATE SET preferences=EXCLUDED.preferences, updated_at=NOW()
+        """,
+        (phone, preferences),
+    )
+    return {
+        "ok": True,
+        "code": "patient_preferences_replaced",
+        "phone_number": phone,
+        "preferences": preferences,
+    }
+
 def set_patient_pause(phone_number: str, paused: bool):
     phone_number = normalize_phone(phone_number)
     db_execute(
@@ -1230,7 +1249,7 @@ def api_patient_tags(req: PatientTagsReq, admin: str = Depends(verify_admin)):
 def api_patient_preferences(req: PatientPreferencesReq, admin: str = Depends(verify_admin)):
     phone = normalize_phone(req.phone_number)
     try:
-        update_patient_file(phone, preferences=req.preferences)
+        set_patient_preferences(phone, req.preferences)
         audit(admin, "update_patient_preferences", phone, req.preferences[:1000])
         return success("patient_notes_updated", {"phone_number": phone, "preferences": req.preferences}, status="success")
     except Exception:
@@ -1279,6 +1298,13 @@ def api_mark_patient_read(
     admin: str = Depends(verify_admin),
 ):
     return admin_operations.mark_read(phone_number, req.displayed_message_id)
+
+@app.get("/admin/api/inbox/metadata")
+def api_inbox_metadata(
+    phones: str = Query("", max_length=4000),
+    admin: str = Depends(verify_admin),
+):
+    return admin_operations.inbox_metadata(phones.split(","))
 
 @app.get("/admin/api/patient/{phone_number}")
 def api_patient_detail(phone_number: str, admin: str = Depends(verify_admin)):

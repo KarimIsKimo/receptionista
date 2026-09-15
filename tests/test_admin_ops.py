@@ -26,6 +26,7 @@ class FakeBooking:
 class FakeDB:
     def __init__(self):
         self.inbox_rows = []
+        self.metadata_rows = []
         self.patient_row = None
         self.message_rows = []
         self.summary_row = {}
@@ -39,6 +40,8 @@ class FakeDB:
         if "admin_mark_read" in sql:
             self.last_read_message_id = max(self.last_read_message_id, int(params[1]))
             return {"last_read_message_id": self.last_read_message_id}
+        if "admin_inbox_metadata" in sql:
+            return self.metadata_rows
         if "admin_inbox" in sql:
             return self.inbox_rows
         if "admin_patient_detail" in sql:
@@ -179,6 +182,27 @@ class AdminOperationsTests(unittest.TestCase):
         self.assertEqual(result["data"]["unclassified"][0]["case"], "malformed")
         self.assertEqual(result["data"]["next_appointment"]["case"], "later_today")
 
+    def test_current_apps_script_history_strings_are_time_classified(self):
+        self.booking.appointment_result = {
+            "ok": True,
+            "appointments": [
+                "2026-09-14 الساعة 5:30 PM لمنطقة A",
+                "2026-09-14 الساعة 7:00 PM لمنطقة B",
+                "2026-09-15 الساعة 8:00 PM لمنطقة C",
+                "2026-09-15 بدون وقت صالح",
+            ],
+        }
+        result = self.ops.patient_appointments("2010")
+        self.assertEqual(result["data"]["previous"], [
+            "2026-09-14 الساعة 5:30 PM لمنطقة A"
+        ])
+        self.assertEqual(len(result["data"]["upcoming"]), 2)
+        self.assertEqual(result["data"]["next_appointment"],
+                         "2026-09-14 الساعة 7:00 PM لمنطقة B")
+        self.assertEqual(result["data"]["unclassified"], [
+            "2026-09-15 بدون وقت صالح"
+        ])
+
     def test_snapshot_freshness_expires_after_ten_minutes(self):
         self.db.inbox_rows = [
             {
@@ -195,12 +219,37 @@ class AdminOperationsTests(unittest.TestCase):
         self.assertEqual(patient["appointment_status"], "stale")
         self.assertEqual(patient["appointment_freshness"], "stale")
 
+    def test_metadata_refresh_ages_snapshot_without_new_messages(self):
+        self.db.metadata_rows = [
+            {
+                "phone_number": "2010",
+                "appointment_status": "healthy",
+                "appointment_fetched_at": NOW - dt.timedelta(minutes=11),
+                "next_appointment": {"date": "2026-09-15", "time": "7:00 PM"},
+            }
+        ]
+        result = self.ops.inbox_metadata(["2010"])
+        self.assertTrue(result["ok"])
+        patient = result["data"]["patients"][0]
+        self.assertEqual(patient["appointment_status"], "stale")
+        sql, params = next(
+            (sql, params)
+            for sql, params in self.db.calls
+            if "admin_inbox_metadata" in sql
+        )
+        self.assertNotIn("chat_history", sql)
+        self.assertEqual(params, (["2010"],))
+
     def test_recent_snapshot_is_fresh_and_malformed_timestamp_is_unknown(self):
         self.assertEqual(
             self.ops._snapshot_state("healthy", NOW - dt.timedelta(minutes=9)),
             "healthy",
         )
         self.assertEqual(self.ops._snapshot_state("healthy", "not-a-time"), "unknown")
+        self.assertEqual(
+            self.ops._snapshot_state("healthy", NOW - dt.timedelta(minutes=10)),
+            "stale",
+        )
 
     def test_booked_filter_requires_fresh_healthy_snapshot(self):
         self.ops.inbox(state="booked")

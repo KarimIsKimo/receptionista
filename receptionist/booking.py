@@ -128,18 +128,141 @@ class BookingService:
         return slot
 
     @staticmethod
-    def _booked_times(data: dict) -> set[str]:
+    def _schedule_entries(data: dict) -> list[dict]:
         booked = data.get("booked", [])
         if booked is None:
             booked = []
         if not isinstance(booked, (list, tuple)):
             raise AppsScriptTemporaryError("invalid_schedule")
-        values: set[str] = set()
+        entries: list[dict] = []
         for item in booked:
-            raw = item.get("time", "") if isinstance(item, dict) else str(item)
-            if raw:
-                values.add(normalize_time(raw))
-        return values
+            if isinstance(item, dict):
+                raw = next(
+                    (
+                        item.get(key)
+                        for key in ("time", "appointment_time", "Time", "الوقت")
+                        if item.get(key)
+                    ),
+                    None,
+                )
+                if not isinstance(raw, str) or not raw.strip():
+                    raise AppsScriptTemporaryError("invalid_schedule_item")
+                entries.append(
+                    {
+                        "raw": item,
+                        "time": normalize_time(raw),
+                        "phone": normalize_phone(
+                            str(item.get("phone") or item.get("phone_number") or "")
+                        ),
+                        "appointment_id": str(
+                            item.get("appointment_id")
+                            or item.get("booking_id")
+                            or item.get("id")
+                            or item.get("row_id")
+                            or ""
+                        ).strip(),
+                    }
+                )
+            elif isinstance(item, str) and item.strip():
+                entries.append(
+                    {
+                        "raw": item,
+                        "time": normalize_time(item),
+                        "phone": "",
+                        "appointment_id": "",
+                    }
+                )
+            else:
+                raise AppsScriptTemporaryError("invalid_schedule_item")
+        return entries
+
+    @classmethod
+    def _booked_times(cls, data: dict) -> set[str]:
+        return {entry["time"] for entry in cls._schedule_entries(data)}
+
+    @staticmethod
+    def _entry_matches_target(entry: dict, phone: str, target: dict) -> bool:
+        if entry.get("phone") != phone:
+            return False
+        target_id = target.get("appointment_id")
+        target_time = target.get("time") or target.get("old_time")
+        if target_id and entry.get("appointment_id") != target_id:
+            return False
+        if target_time and entry.get("time") != target_time:
+            return False
+        return True
+
+    @staticmethod
+    def _response_target_matches(data: dict, target: dict) -> bool:
+        """Validate identifiers when an upgraded Apps Script echoes them."""
+        echoed = data.get("target") if isinstance(data.get("target"), dict) else data
+        expected_id = target.get("appointment_id")
+        returned_id = next(
+            (
+                echoed.get(key)
+                for key in ("appointment_id", "booking_id", "id", "row_id")
+                if echoed.get(key) is not None
+            ),
+            None,
+        )
+        if expected_id and returned_id is not None and str(returned_id).strip() != str(expected_id).strip():
+            return False
+        expected_time = target.get("time") or target.get("old_time")
+        returned_time = next(
+            (
+                echoed.get(key)
+                for key in ("time", "old_time", "cancelled_time")
+                if echoed.get(key) is not None
+            ),
+            None,
+        )
+        if expected_time and returned_time is not None and normalize_time(str(returned_time)) != expected_time:
+            return False
+        return True
+
+    def _resolve_existing_target(
+        self,
+        *,
+        date: dt.date,
+        phone: str,
+        target: dict,
+    ) -> tuple[dict | None, dict | None]:
+        schedule = self._request("GET", {"date": date.isoformat()})
+        entries = self._schedule_entries(schedule)
+        patient_entries = [entry for entry in entries if entry.get("phone") == phone]
+        if (
+            target.get("appointment_id")
+            and patient_entries
+            and not any(entry.get("appointment_id") for entry in patient_entries)
+        ):
+            return None, result(
+                False,
+                "exact_target_not_supported",
+                "نسخة Apps Script الحالية لا ترجع رقم حجز ثابتاً. لم يتم تغيير أي موعد.",
+                retryable=False,
+                deployment_required=True,
+            )
+        matches = [
+            entry
+            for entry in patient_entries
+            if self._entry_matches_target(entry, phone, target)
+        ]
+        if len(patient_entries) > 1:
+            return None, result(
+                False,
+                "exact_target_not_supported",
+                "يوجد أكثر من موعد لنفس المريضة في هذا اليوم، ونسخة Apps Script الحالية لا تضمن استهداف الوقت الصحيح. لم يتم تغيير أي موعد.",
+                retryable=False,
+                deployment_required=True,
+            )
+        if len(matches) != 1:
+            return None, result(
+                False,
+                "appointment_not_found",
+                "لم أجد موعداً واحداً يطابق التاريخ والوقت/رقم الحجز المطلوب.",
+                retryable=False,
+            )
+        return matches[0], None
 
     def schedule(self, date_value: str) -> dict:
         try:
@@ -263,6 +386,13 @@ class BookingService:
                 appointment_id=appointment_id,
                 time_key="time",
             )
+            _, target_error = self._resolve_existing_target(
+                date=date,
+                phone=phone,
+                target=target,
+            )
+            if target_error:
+                return target_error
             data = self._request(
                 "POST",
                 {
@@ -279,6 +409,34 @@ class BookingService:
                 or data.get("success") is True
                 or status == "cancelled"
             ):
+                if not self._response_target_matches(data, target):
+                    return result(
+                        False,
+                        "cancellation_target_mismatch",
+                        "رد نظام المواعيد لا يطابق الموعد المطلوب، لذلك لا يمكن تأكيد الإلغاء.",
+                        retryable=False,
+                    )
+                try:
+                    after = self._request("GET", {"date": date.isoformat()})
+                    still_present = any(
+                        self._entry_matches_target(entry, phone, target)
+                        for entry in self._schedule_entries(after)
+                    )
+                except AppsScriptTemporaryError:
+                    return result(
+                        False,
+                        "cancellation_verification_unavailable",
+                        "تم إرسال الإلغاء لكن تعذر التحقق من النتيجة. حالة الموعد غير معروفة حتى التحديث.",
+                        retryable=True,
+                        state="unknown",
+                    )
+                if still_present:
+                    return result(
+                        False,
+                        "cancellation_not_verified",
+                        "نظام المواعيد ما زال يعرض الموعد، لذلك لم يتم تأكيد الإلغاء.",
+                        retryable=True,
+                    )
                 if self._on_audit:
                     self._on_audit("appointment_cancelled", phone, f"{date.isoformat()} {target}")
                 return result(
@@ -326,6 +484,13 @@ class BookingService:
                 appointment_id=appointment_id,
                 time_key="old_time",
             )
+            _, target_error = self._resolve_existing_target(
+                date=old_date,
+                phone=phone,
+                target=target,
+            )
+            if target_error:
+                return target_error
             new_slot = self._validate_slot(new_date, new_time_value)
             if (
                 old_date == new_date
@@ -344,6 +509,41 @@ class BookingService:
             if data.get("status") == "error" or data.get("success") is False:
                 return result(False, "reschedule_rejected", str(data.get("message") or "تعذر تغيير الموعد."))
             if data.get("rescheduled") is True:
+                if not self._response_target_matches(data, target):
+                    return result(
+                        False,
+                        "reschedule_target_mismatch",
+                        "رد نظام المواعيد لا يطابق الموعد القديم المطلوب، لذلك لا يمكن تأكيد التغيير.",
+                        retryable=False,
+                    )
+                try:
+                    old_after = self._request("GET", {"date": old_date.isoformat()})
+                    new_after = old_after if new_date == old_date else self._request(
+                        "GET", {"date": new_date.isoformat()}
+                    )
+                    old_still_present = any(
+                        self._entry_matches_target(entry, phone, target)
+                        for entry in self._schedule_entries(old_after)
+                    )
+                    new_present = any(
+                        entry.get("phone") == phone and entry.get("time") == new_slot
+                        for entry in self._schedule_entries(new_after)
+                    )
+                except AppsScriptTemporaryError:
+                    return result(
+                        False,
+                        "reschedule_verification_unavailable",
+                        "تم إرسال تغيير الموعد لكن تعذر التحقق من النتيجة. حالة الحجز غير معروفة حتى التحديث.",
+                        retryable=True,
+                        state="unknown",
+                    )
+                if old_still_present or not new_present:
+                    return result(
+                        False,
+                        "reschedule_not_verified",
+                        "لم يؤكد جدول المواعيد إزالة الموعد القديم وإضافة الجديد.",
+                        retryable=True,
+                    )
                 if self._on_audit:
                     self._on_audit("appointment_rescheduled", phone, f"{old_date.isoformat()} -> {new_date.isoformat()} {new_slot}")
                 return result(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from typing import Any, Callable
 
 from .booking import AppsScriptTemporaryError, normalize_phone, normalize_time
@@ -120,7 +121,7 @@ class AdminOperations:
                 return "unknown"
             if fetched.tzinfo is None:
                 fetched = fetched.replace(tzinfo=self.config.timezone)
-            if self._now() - fetched.astimezone(self.config.timezone) > APPOINTMENT_SNAPSHOT_TTL:
+            if self._now() - fetched.astimezone(self.config.timezone) >= APPOINTMENT_SNAPSHOT_TTL:
                 return "stale"
         except (TypeError, ValueError, OverflowError):
             return "unknown"
@@ -166,8 +167,8 @@ class AdminOperations:
             "unread": "COALESCE(u.unread_count,0) > 0",
             "human": "COALESCE(p.is_paused,FALSE) = TRUE",
             "ai": "COALESCE(p.is_paused,FALSE) = FALSE",
-            "booked": "aps.status = 'healthy' AND aps.fetched_at >= NOW() - INTERVAL '10 minutes' AND aps.next_appointment IS NOT NULL",
-            "no_booking": "aps.status = 'healthy' AND aps.fetched_at >= NOW() - INTERVAL '10 minutes' AND aps.next_appointment IS NULL",
+            "booked": "aps.status = 'healthy' AND aps.fetched_at > NOW() - INTERVAL '10 minutes' AND aps.next_appointment IS NOT NULL",
+            "no_booking": "aps.status = 'healthy' AND aps.fetched_at > NOW() - INTERVAL '10 minutes' AND aps.next_appointment IS NULL",
         }
         if state in filters:
             where.append(filters[state])
@@ -263,6 +264,52 @@ class AdminOperations:
             return success("inbox_marked_read", {"phone_number": phone, "last_read_message_id": int(row["last_read_message_id"] if row else 0)})
         except Exception:
             return failure("database_unavailable", "Could not update unread state.", retryable=True)
+
+    def inbox_metadata(self, phone_numbers: list[str]) -> dict:
+        """Refresh snapshot status without reloading messages or patient profiles."""
+        phones = list(
+            dict.fromkeys(
+                normalize_phone(phone)
+                for phone in phone_numbers
+                if normalize_phone(phone)
+            )
+        )[:100]
+        if not phones:
+            return success("inbox_metadata_loaded", {"patients": []})
+        try:
+            rows = self.db(
+                """
+                /* admin_inbox_metadata */
+                WITH requested AS (
+                    SELECT UNNEST(%s::text[]) AS phone_number
+                )
+                SELECT
+                    r.phone_number,
+                    aps.status AS appointment_status,
+                    aps.next_appointment,
+                    aps.fetched_at AS appointment_fetched_at
+                FROM requested r
+                LEFT JOIN admin_appointment_snapshots aps
+                  ON aps.phone_number=r.phone_number
+                """,
+                (phones,),
+                fetchall=True,
+            )
+        except Exception:
+            return failure(
+                "database_unavailable",
+                "Could not refresh inbox appointment metadata.",
+                retryable=True,
+            )
+        return success(
+            "inbox_metadata_loaded",
+            {
+                "patients": [
+                    self._apply_snapshot_state(dict(row)) for row in rows
+                ],
+                "refreshed_at": self._now().isoformat(),
+            },
+        )
 
     def patient_detail(self, phone_number: str) -> dict:
         phone = normalize_phone(phone_number)
@@ -371,17 +418,21 @@ class AdminOperations:
         return None
 
     def _appointment_datetime(self, item: Any) -> dt.datetime | None:
-        if not isinstance(item, dict):
-            return None
         date = self._appointment_date(item)
-        raw_time = next(
-            (
-                item.get(key)
-                for key in ("time", "appointment_time", "Time", "الوقت")
-                if item.get(key)
-            ),
-            None,
-        )
+        if isinstance(item, dict):
+            raw_time = next(
+                (
+                    item.get(key)
+                    for key in ("time", "appointment_time", "Time", "الوقت")
+                    if item.get(key)
+                ),
+                None,
+            )
+        elif isinstance(item, str):
+            match = re.search(r"\b(\d{1,2}:\d{1,2}\s*[AP]M)\b", item, re.IGNORECASE)
+            raw_time = match.group(1) if match else None
+        else:
+            raw_time = None
         if date is None or not isinstance(raw_time, str) or not raw_time.strip():
             return None
         try:
