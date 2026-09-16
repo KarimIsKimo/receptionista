@@ -2,7 +2,12 @@ import datetime as dt
 import unittest
 from zoneinfo import ZoneInfo
 
-from receptionist.admin_ops import AdminOperations, build_dashboard_metrics, sort_inbox_rows
+from receptionist.admin_ops import (
+    AdminOperations,
+    build_dashboard_metrics,
+    classify_conversation_origin,
+    sort_inbox_rows,
+)
 
 
 NOW = dt.datetime(2026, 9, 14, 18, 0, tzinfo=ZoneInfo("Africa/Cairo"))
@@ -34,12 +39,21 @@ class FakeDB:
         self.fail_health = False
         self.calls = []
         self.last_read_message_id = 0
+        self.latest_user_message_id = 0
 
     def __call__(self, sql, params=(), fetchone=False, fetchall=False, commit=True):
         self.calls.append((sql, params))
         if "admin_mark_read" in sql:
             self.last_read_message_id = max(self.last_read_message_id, int(params[1]))
             return {"last_read_message_id": self.last_read_message_id}
+        if "admin_mark_unread" in sql:
+            if not self.latest_user_message_id:
+                return None
+            self.last_read_message_id = max(self.latest_user_message_id - 1, 0)
+            return {
+                "last_read_message_id": self.last_read_message_id,
+                "marked_unread_message_id": self.latest_user_message_id,
+            }
         if "admin_inbox_metadata" in sql:
             return self.metadata_rows
         if "admin_inbox" in sql:
@@ -85,6 +99,43 @@ class AdminOperationsTests(unittest.TestCase):
         ]
         self.assertEqual(sort_inbox_rows(rows)[0]["phone_number"], "2")
 
+    def test_patient_origin_uses_earliest_meaningful_role(self):
+        self.db.inbox_rows = [{
+            "phone_number": "1", "last_message_id": 10,
+            "last_message_at": NOW, "first_message_role": "user",
+        }]
+        patient = self.ops.inbox()["data"]["patients"][0]
+        self.assertEqual(patient["conversation_origin"], "patient")
+        self.assertEqual(classify_conversation_origin("user"), "patient")
+
+    def test_reception_origin_uses_earliest_meaningful_role(self):
+        self.db.inbox_rows = [{
+            "phone_number": "1", "last_message_id": 10,
+            "last_message_at": NOW, "first_message_role": "staff",
+        }]
+        patient = self.ops.inbox()["data"]["patients"][0]
+        self.assertEqual(patient["conversation_origin"], "reception")
+        self.assertEqual(classify_conversation_origin("staff"), "reception")
+
+    def test_unknown_origin_when_no_meaningful_message_exists(self):
+        self.db.inbox_rows = [{
+            "phone_number": "1", "last_message_id": 10,
+            "last_message_at": NOW, "first_message_role": None,
+        }]
+        patient = self.ops.inbox()["data"]["patients"][0]
+        self.assertEqual(patient["conversation_origin"], "unknown")
+        self.assertEqual(classify_conversation_origin("model"), "unknown")
+
+    def test_origin_filters_use_earliest_user_or_staff_message(self):
+        self.ops.inbox(state="patient_initiated")
+        patient_sql, _ = self.db.calls[-1]
+        self.assertIn("o.first_role = 'user'", patient_sql)
+        self.assertIn("ORDER BY phone_number, id ASC", patient_sql)
+        self.ops.inbox(state="reception_initiated")
+        reception_sql, _ = self.db.calls[-1]
+        self.assertIn("o.first_role = 'staff'", reception_sql)
+        self.assertIn("role IN ('user', 'staff')", reception_sql)
+
     def test_patient_detail_preserves_unknown_appointment_state(self):
         self.db.patient_row = {
             "phone_number": "2010", "name": "Mona", "appointment_status": None,
@@ -111,6 +162,26 @@ class AdminOperationsTests(unittest.TestCase):
         self.db.last_read_message_id = 12
         result = self.ops.mark_read("2010", 10)
         self.assertEqual(result["data"]["last_read_message_id"], 12)
+
+    def test_mark_unread_moves_cursor_only_before_latest_patient_message(self):
+        self.db.last_read_message_id = 20
+        self.db.latest_user_message_id = 17
+        result = self.ops.mark_unread("2010")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["last_read_message_id"], 16)
+        self.assertEqual(result["data"]["marked_unread_message_id"], 17)
+        self.assertEqual(result["data"]["unread_count"], 1)
+        sql, params = self.db.calls[-1]
+        self.assertEqual(params, ("2010", "2010"))
+        self.assertIn("MAX(id)", sql)
+        self.assertIn("role='user'", sql)
+        self.assertNotIn("GREATEST(\n                        admin_inbox_state.last_read_message_id", sql)
+
+    def test_mark_unread_without_patient_messages_is_a_noop(self):
+        result = self.ops.mark_unread("2010")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["code"], "no_patient_messages")
+        self.assertEqual(result["data"]["unread_count"], 0)
 
     def test_message_pagination_reverses_database_page(self):
         self.db.message_rows = [

@@ -69,6 +69,43 @@ class DashboardHtmlTests(unittest.TestCase):
         for action in (
             'key:"toggle"', 'key:"profile"', 'key:"book"', 'key:"cancel"',
             'key:"reschedule"', 'key:"name"', 'key:"notes"', 'key:"tags"',
+            'key:"unread"',
+        ):
+            self.assertIn(action, self.html)
+
+    def test_origin_filters_badges_and_time_groups_exist(self):
+        for expected in (
+            '"patient_initiated"', '"reception_initiated"',
+            "origin-badge", "conversation_origin", "patientStarted",
+            "receptionStarted", "inboxTimeGroup", 'data-time-group=',
+            '"today"', '"yesterday"', '"older"',
+        ):
+            self.assertIn(expected, self.html)
+
+    def test_rename_updates_selected_profile_and_row_without_inbox_reload(self):
+        self.assertIn('/admin/api/rename_patient', self.html)
+        self.assertIn('await updatePatientUi({name:r.data.name})', self.html)
+        self.assertIn('scrollTop=list.scrollTop', self.html)
+        self.assertIn('list.scrollTop=scrollTop', self.html)
+        rename_handler = re.search(
+            r'if\(action==="name"\)(.*?)if\(action==="notes"\)',
+            self.html,
+        )
+        self.assertIsNotNone(rename_handler)
+        self.assertNotIn("loadInbox(true)", rename_handler.group(1))
+
+    def test_mark_unread_uses_dedicated_cursor_action(self):
+        self.assertIn('/unread",{}', self.html)
+        self.assertIn("suppressAutoReadPhone", self.html)
+        self.assertIn('data-action="unread"', self.html)
+        self.assertIn('state.suppressAutoReadPhone===state.selected', self.html)
+
+    def test_patient_controls_cover_all_requested_actions(self):
+        for action in (
+            'data-action="name"', 'data-action="notes"',
+            'data-action="tags"', 'data-action="toggle"',
+            'data-action="book"', 'data-action="cancel"',
+            'data-action="reschedule"',
         ):
             self.assertIn(action, self.html)
 
