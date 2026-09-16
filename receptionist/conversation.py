@@ -11,14 +11,32 @@ from .dates import parse_date_expression
 
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-_BOOK_WORDS = ("احجز", "حجز", "موعد", "book", "appointment")
-_CANCEL_WORDS = ("الغي", "إلغاء", "الغاء", "cancel")
-_RESCHEDULE_WORDS = (
-    "تغيير الموعد",
-    "غير الموعد",
-    "اغير الموعد",
-    "أغير الموعد",
-    "reschedule",
+_BOOK_PATTERNS = (
+    r"(?:^|\s)(?:احجز|أحجز|احجزي|أحجزي)(?:\s|$)",
+    r"(?:عايز|عايزة|محتاج|محتاجة|ممكن)\s+(?:احجز|أحجز|حجز\s+جديد)",
+    r"\b(?:book|make)\s+(?:a\s+)?(?:new\s+)?appointment\b",
+)
+_CANCEL_WORDS = (
+    "ألغي",
+    "الغي",
+    "ألغى",
+    "الغى",
+    "إلغاء",
+    "الغاء",
+    "cancel",
+)
+_RESCHEDULE_PATTERNS = (
+    r"(?:أ?غير|تغيير)\s+(?:الموعد|موعدي|الحجز|حجزي)",
+    r"(?:عايز|عايزة|محتاج|محتاجة)\s+(?:أ?غير|تغيير)",
+    r"\b(?:reschedule|change\s+(?:my\s+)?appointment)\b",
+)
+_EXISTING_APPOINTMENT_PATTERNS = (
+    r"(?:^|\s)عندي\s+(?:حجز|موعد)(?:\s|$)",
+    r"(?:^|\s)(?:حجزي|موعدي)(?:\s|$|[؟?])",
+    r"(?:الحجز|الموعد)\s+بتاعي",
+    r"(?:^|\s)(?:انا|أنا)?\s*حاجز(?:ة)?(?:\s|$)",
+    r"ممكن\s+(?:أ?عرف|اعرف)\s+(?:الحجز|الموعد)\s+بتاعي",
+    r"\bmy\s+appointment\b",
 )
 _ABANDON_WORDS = (
     "خلاص مش عايز",
@@ -74,22 +92,17 @@ _DATE_PHRASES = (
     "الأحد",
     "الاحد",
 )
-_SERVICES = (
-    ("جسم كامل", "جسم كامل"),
-    ("full body", "جسم كامل"),
-    ("اندر ارم", "أندر آرم"),
-    ("أندر آرم", "أندر آرم"),
-    ("underarm", "أندر آرم"),
-    ("بيكيني", "بيكيني"),
-    ("bikini", "بيكيني"),
-    ("ذقن", "ذقن"),
-    ("beard", "ذقن"),
-    ("وجه", "وجه"),
-    ("face", "وجه"),
-    ("رقبة", "رقبة"),
-    ("neck", "رقبة"),
-    ("بوکسر", "بوكسر"),
-    ("بوكسر", "بوكسر"),
+_AREA_PATTERNS = (
+    ("جسم كامل", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:جسم\s+كامل|full\s+body)(?![\w\u0600-\u06FF])"),
+    ("بيكيني", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:بيكيني|بكيني|bikini)(?![\w\u0600-\u06FF])"),
+    ("أندر آرم", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:[اأإ]ندر\s*[اآ]?رم|under\s*arm|underarm)(?![\w\u0600-\u06FF])"),
+    ("لاين", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:لاين|line)(?![\w\u0600-\u06FF])"),
+    ("وجه", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:وجه|face)(?![\w\u0600-\u06FF])"),
+    ("رقبة", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:رقب[هة]|neck)(?![\w\u0600-\u06FF])"),
+    ("صدر", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:صدر|chest)(?![\w\u0600-\u06FF])"),
+    ("ظهر", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:ظهر|back)(?![\w\u0600-\u06FF])"),
+    ("ذقن", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:ذقن|beard)(?![\w\u0600-\u06FF])"),
+    ("بوكسر", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:بو[كک]سر|boxer)(?![\w\u0600-\u06FF])"),
 )
 _TRIVIAL_PHRASES = {
     "hi",
@@ -110,6 +123,28 @@ _TRIVIAL_PHRASES = {
     "thanks",
     "thank you",
     "حاضر",
+}
+
+_STANDALONE_NAME_STOPWORDS = _TRIVIAL_PHRASES | {
+    "مساء",
+    "الخير",
+    "صباح",
+    "انا",
+    "أنا",
+    "عايز",
+    "عايزة",
+    "محتاج",
+    "محتاجة",
+    "ممكن",
+    "حجز",
+    "موعد",
+    "ليزر",
+    "بكرة",
+    "بكره",
+    "النهاردة",
+    "النهارده",
+    "شكرا",
+    "شكراً",
 }
 
 
@@ -133,17 +168,26 @@ def should_extract_memory(message: str) -> bool:
     if not re.search(r"[A-Za-z0-9\u0600-\u06FF]", text):
         return False
     # A bare time fragment belongs in the booking draft, not long-term memory.
-    if re.fullmatch(r"(?:الساعة\s*)?(?:بعد\s*)?[0-9٠-٩]{1,2}(?::[0-9٠-٩]{2})?\s*(?:am|pm|ص|م)?", text):
+    if re.fullmatch(
+        r"(?:(?:الساعة|الساعه|بعد)\s*)?[0-9٠-٩]{1,2}"
+        r"(?::[0-9٠-٩]{2}|\s*و\s*(?:نص|نصف|ربع))?\s*(?:am|pm|ص|م)?",
+        text,
+    ):
         return False
     return True
 
 
 def _find_intent(text: str, current: dict[str, Any]) -> str:
-    if any(word in text for word in _RESCHEDULE_WORDS):
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in _RESCHEDULE_PATTERNS):
         return "reschedule"
     if any(word in text for word in _CANCEL_WORDS):
         return "cancel"
-    if any(word in text for word in _BOOK_WORDS):
+    if any(
+        re.search(pattern, text, re.IGNORECASE)
+        for pattern in _EXISTING_APPOINTMENT_PATTERNS
+    ):
+        return "check_appointment"
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in _BOOK_PATTERNS):
         return "book"
     return str(current.get("intent") or "")
 
@@ -166,45 +210,147 @@ def _find_name(message: str) -> str:
     return ""
 
 
+def _find_standalone_name(message: str) -> str:
+    """Accept only a short, name-shaped reply while explicitly waiting for a name."""
+    candidate = re.sub(r"\s+", " ", (message or "").strip()).strip(".،,!?؟")
+    if not re.fullmatch(
+        r"(?:[A-Za-z]{2,}|[\u0600-\u06FF]{2,})(?:\s+(?:[A-Za-z]{2,}|[\u0600-\u06FF]{2,})){1,3}",
+        candidate,
+    ):
+        return ""
+    words = {word.lower() for word in candidate.split()}
+    if words & {word.lower() for word in _STANDALONE_NAME_STOPWORDS}:
+        return ""
+    if any(word in candidate.lower() for word in _CANCEL_WORDS):
+        return ""
+    if any(re.search(pattern, candidate, re.IGNORECASE) for pattern in (*_BOOK_PATTERNS, *_RESCHEDULE_PATTERNS)):
+        return ""
+    if _find_service(candidate.lower()):
+        return ""
+    return candidate
+
+
 def _find_service(text: str) -> str:
-    for token, canonical in _SERVICES:
-        if token.lower() in text:
-            return canonical
-    return ""
+    """Return every recognized area in patient order without dropping later areas."""
+    matches: list[tuple[int, str]] = []
+    for canonical, pattern in _AREA_PATTERNS:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            matches.append((match.start(), canonical))
+    ordered: list[str] = []
+    for _, canonical in sorted(matches):
+        if canonical not in ordered:
+            ordered.append(canonical)
+    return " + ".join(ordered)
 
 
 def _find_date(text: str, now: dt.datetime, config: ClinicConfig) -> str:
     normalized = text.translate(_ARABIC_DIGITS).lower()
-    absolute = re.search(r"\b(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})\b", normalized)
-    candidates = [absolute.group(0)] if absolute else []
-    candidates.extend(phrase for phrase in _DATE_PHRASES if phrase in normalized)
+    candidates: list[str] = []
+    occupied: list[tuple[int, int]] = []
+    for absolute in re.finditer(
+        r"\b(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})\b",
+        normalized,
+    ):
+        candidates.append(absolute.group(0))
+        occupied.append(absolute.span())
+    # Longest phrases win so "بعد بكرة" is not also parsed as "بكرة".
+    for phrase in sorted(_DATE_PHRASES, key=len, reverse=True):
+        for match in re.finditer(re.escape(phrase), normalized):
+            if any(match.start() < end and match.end() > start for start, end in occupied):
+                continue
+            candidates.append(phrase)
+            occupied.append(match.span())
+    parsed: set[str] = set()
     for candidate in candidates:
         try:
-            return parse_date_expression(
-                candidate,
-                now=now,
-                timezone=config.timezone,
-            ).isoformat()
+            parsed.add(
+                parse_date_expression(
+                    candidate,
+                    now=now,
+                    timezone=config.timezone,
+                ).isoformat()
+            )
         except ValueError:
             continue
-    return ""
+    return next(iter(parsed)) if len(parsed) == 1 else ""
+
+
+def _mentions_date(text: str) -> bool:
+    normalized = text.translate(_ARABIC_DIGITS).lower()
+    if re.search(
+        r"\b(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})\b",
+        normalized,
+    ):
+        return True
+    return any(phrase in normalized for phrase in _DATE_PHRASES)
+
+
+def _mentions_time(text: str, *, active_booking: bool) -> bool:
+    normalized = text.translate(_ARABIC_DIGITS).lower().strip()
+    if re.search(r"(?:الساعة|الساعه|بعد|\bat\b)\s*\d", normalized):
+        return True
+    if re.search(r"(?<!\d)\d{1,2}:\d{2}(?!\d)", normalized):
+        return True
+    if not active_booking:
+        return False
+    if re.fullmatch(
+        r"(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})",
+        normalized,
+    ):
+        return False
+    return bool(re.fullmatch(r"\d{1,2}(?!\d).*", normalized))
 
 
 def _find_time(text: str, *, active_booking: bool, config: ClinicConfig) -> str:
-    normalized = text.translate(_ARABIC_DIGITS).lower().replace("صباحاً", "am").replace("مساءً", "pm")
-    patterns = [
-        r"(?:الساعة|الساعه|بعد|at)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm|ص|م)?",
-        r"\b(\d{1,2}):(\d{2})\s*(am|pm|ص|م)?\b",
+    normalized = (
+        text.translate(_ARABIC_DIGITS)
+        .lower()
+        .replace("صباحاً", "am")
+        .replace("صباحا", "am")
+        .replace("مساءً", "pm")
+        .replace("مساء", "pm")
+    )
+    if re.search(
+        r"\d{1,2}(?::\d{2})?\s*(?:أو|او|ولا|or)\s*\d{1,2}(?::\d{2})?",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return ""
+    patterns: list[tuple[str, bool]] = [
+        (
+            r"(?:الساعة|الساعه|بعد|at)\s*(\d{1,2})(?:(?::(\d{2}))|(?:\s*(و\s*(?:نص|نصف))))?\s*(am|pm|ص|م)?(?![\d:]|\s*و)",
+            True,
+        ),
+        (
+            r"(?<![\d:])(\d{1,2}):(\d{2})\s*(am|pm|ص|م)?(?![\d:]|\s*و)",
+            False,
+        ),
     ]
     if active_booking:
-        patterns.append(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm|ص|م)?\s*$")
-    for pattern in patterns:
+        patterns.append(
+            (
+                r"^\s*(\d{1,2})(?:(?::(\d{2}))|(?:\s*(و\s*(?:نص|نصف))))?\s*(am|pm|ص|م)?\s*$",
+                True,
+            )
+        )
+    unsafe_before = r"(?:حوالي|تقريباً|تقريبا|تقريبًا)\s*$"
+    unsafe_after = (
+        r"^\s*(?:و|إلا|الا|أو|او|ولا|or\b|حوالي|تقريباً|تقريبا|تقريبًا|"
+        r"لحد|لغاية|إلى|الى|لل?ساعة|[\d:])"
+    )
+    for pattern, has_half_group in patterns:
         match = re.search(pattern, normalized, re.IGNORECASE)
         if not match:
             continue
+        if re.search(unsafe_before, normalized[: match.start()], re.IGNORECASE):
+            continue
+        if re.match(unsafe_after, normalized[match.end() :], re.IGNORECASE):
+            continue
         hour = int(match.group(1))
-        minute = int(match.group(2) or 0)
-        suffix = (match.group(3) or "").lower()
+        minute = 30 if has_half_group and match.group(3) else int(match.group(2) or 0)
+        suffix_group = 4 if has_half_group else 3
+        suffix = (match.group(suffix_group) or "").lower()
         if minute not in {0, 30}:
             continue
         if suffix in {"pm", "م"} and hour < 12:
@@ -224,14 +370,14 @@ def _find_time(text: str, *, active_booking: bool, config: ClinicConfig) -> str:
 
 def _stage(draft: dict[str, Any]) -> str:
     intent = draft.get("intent")
+    if intent == "check_appointment":
+        return "checking_appointment"
     if intent == "cancel":
         return "cancelling"
     if intent == "reschedule":
-        if not draft.get("requested_date"):
-            return "need_new_date"
-        if not draft.get("requested_time"):
-            return "need_new_time"
-        return "rescheduling"
+        # Date/time roles are deliberately left to Gemini unless old vs new is
+        # unambiguous. The current deterministic parser does not guess them.
+        return "reschedule_unclassified"
     if intent != "book":
         return "idle"
     for field, stage in (
@@ -273,17 +419,37 @@ def evolve_booking_draft(
     draft["intent"] = intent
     profile = profile or {}
     if not draft.get("patient_name"):
-        draft["patient_name"] = (profile.get("name") or _find_name(text)).strip()
+        explicit_name = _find_name(text)
+        standalone_name = ""
+        if current and current.get("stage") == "need_name":
+            standalone_name = _find_standalone_name(text)
+        draft["patient_name"] = (
+            profile.get("name") or explicit_name or standalone_name
+        ).strip()
     service = _find_service(lowered)
     if service:
         draft["service_area"] = service
-    now = now or config.now()
-    date = _find_date(lowered, now, config)
-    if date:
-        draft["requested_date"] = date
-    time = _find_time(lowered, active_booking=bool(current or intent), config=config)
-    if time:
-        draft["requested_time"] = time
+    if intent in {"check_appointment", "reschedule"}:
+        # A reschedule sentence may contain both current and desired date/time;
+        # an appointment query may mention an existing date. Neither belongs in
+        # the new-booking requested_* fields.
+        draft["requested_date"] = ""
+        draft["requested_time"] = ""
+        if intent == "check_appointment":
+            draft["service_area"] = ""
+    else:
+        now = now or config.now()
+        date = _find_date(lowered, now, config)
+        if date:
+            draft["requested_date"] = date
+        elif _mentions_date(lowered):
+            draft["requested_date"] = ""
+        active_booking = bool(current or intent)
+        time = _find_time(lowered, active_booking=active_booking, config=config)
+        if time:
+            draft["requested_time"] = time
+        elif _mentions_time(lowered, active_booking=active_booking):
+            draft["requested_time"] = ""
     draft["stage"] = _stage(draft)
     return {
         key: str(draft.get(key) or "")

@@ -319,8 +319,23 @@ def init_db():
             phone_number_id TEXT NOT NULL,
             received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             processing_started_at TIMESTAMPTZ,
+            side_effects_started_at TIMESTAMPTZ,
+            side_effects_completed_at TIMESTAMPTZ,
+            recovery_state VARCHAR(40),
             processed_at TIMESTAMPTZ
         )
+        """,
+        """
+        ALTER TABLE inbound_message_queue
+        ADD COLUMN IF NOT EXISTS side_effects_started_at TIMESTAMPTZ
+        """,
+        """
+        ALTER TABLE inbound_message_queue
+        ADD COLUMN IF NOT EXISTS side_effects_completed_at TIMESTAMPTZ
+        """,
+        """
+        ALTER TABLE inbound_message_queue
+        ADD COLUMN IF NOT EXISTS recovery_state VARCHAR(40)
         """,
         """
         CREATE TABLE IF NOT EXISTS conversation_processing_leases (
@@ -903,10 +918,15 @@ def claim_pending_batch(phone_number: str) -> list[dict]:
             UPDATE inbound_message_queue
             SET processing_started_at=NOW()
             WHERE phone_number=%s AND processed_at IS NULL
-            RETURNING message_id,phone_number,chat_history_id,phone_number_id,received_at
+            RETURNING message_id,phone_number,chat_history_id,phone_number_id,
+                      received_at,side_effects_started_at,
+                      side_effects_completed_at,recovery_state
         )
         SELECT claimed.message_id,claimed.phone_number,claimed.chat_history_id,
-               claimed.phone_number_id,claimed.received_at,history.content
+               claimed.phone_number_id,claimed.received_at,
+               claimed.side_effects_started_at,
+               claimed.side_effects_completed_at,claimed.recovery_state,
+               history.content
         FROM claimed
         JOIN chat_history history ON history.id=claimed.chat_history_id
         ORDER BY claimed.chat_history_id ASC
@@ -916,17 +936,89 @@ def claim_pending_batch(phone_number: str) -> list[dict]:
     )
     return [dict(row) for row in rows]
 
+def reserve_pending_batch_side_effects(messages: list[dict]) -> bool:
+    """Durably mark a batch before Gemini/tools/WhatsApp can cause side effects."""
+    ids = [message["message_id"] for message in messages if message.get("message_id")]
+    if not ids:
+        return False
+    rows = db_execute(
+        """
+        UPDATE inbound_message_queue
+        SET side_effects_started_at=NOW(), recovery_state='in_progress'
+        WHERE message_id=ANY(%s::text[])
+          AND processed_at IS NULL
+          AND side_effects_started_at IS NULL
+        RETURNING message_id
+        """,
+        (ids,),
+        fetchall=True,
+    )
+    return len(rows or []) == len(ids)
+
 def mark_pending_batch_processed(messages: list[dict]) -> None:
+    """Atomically record that the reserved batch finished in this process."""
     ids = [message["message_id"] for message in messages if message.get("message_id")]
     if ids:
         db_execute(
             """
             UPDATE inbound_message_queue
-            SET processed_at=NOW()
+            SET side_effects_completed_at=NOW(),
+                recovery_state='completed',
+                processed_at=NOW()
             WHERE message_id=ANY(%s::text[])
+              AND side_effects_started_at IS NOT NULL
             """,
             (ids,),
         )
+
+def suppress_uncertain_pending_batch(messages: list[dict]) -> int:
+    """Quarantine a recovered batch whose external effects may have happened.
+
+    Apps Script and Meta do not share a transaction with Postgres. Once the
+    durable pre-effect marker exists, replaying Gemini could duplicate a booking,
+    cancellation, reschedule, or patient reply. Recovery therefore favors
+    at-most-once external effects and leaves a visible system record for staff.
+    """
+    ids = [message["message_id"] for message in messages if message.get("message_id")]
+    if not ids:
+        return 0
+    phone = normalize_phone(str(messages[0].get("phone_number") or ""))
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE inbound_message_queue
+                SET recovery_state='suppressed_uncertain', processed_at=NOW()
+                WHERE message_id=ANY(%s::text[])
+                  AND processed_at IS NULL
+                  AND side_effects_started_at IS NOT NULL
+                  AND side_effects_completed_at IS NULL
+                RETURNING message_id
+                """,
+                (ids,),
+            )
+            suppressed = cur.fetchall()
+            if suppressed:
+                details = ",".join(row["message_id"] for row in suppressed)[:1000]
+                cur.execute(
+                    """
+                    INSERT INTO chat_history(phone_number,role,content)
+                    VALUES (%s,'system',%s)
+                    """,
+                    (
+                        phone,
+                        "تم إيقاف إعادة تنفيذ دفعة رسائل بعد انقطاع غير مؤكد لتجنب تكرار رد أو تغيير موعد. يلزم مراجعة المحادثة يدوياً.",
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO audit_log(actor,action,phone_number,details)
+                    VALUES ('system','inbound_recovery_suppressed',%s,%s)
+                    """,
+                    (phone, details),
+                )
+        conn.commit()
+    return len(suppressed)
 
 def list_pending_phones() -> list[str]:
     rows = db_execute(
@@ -1209,8 +1301,17 @@ def build_system_instruction(
 
 === مسودة الحجز المحفوظة ===
 {json.dumps(draft_context, ensure_ascii=False)}
-- اعتبري أي قيمة غير فارغة في المسودة معلومة مؤكدة من المحادثة الحالية.
-- لا تسألي مرة أخرى عن حقل موجود بالفعل في المسودة.
+- القيم غير الفارغة هنا لا تُسجل إلا عندما يستطيع المحلل الحتمي استخراجها
+  بشكل صريح ومحافظ ومن دون إسقاط جزء من كلام المريضة.
+- هذه القيم سياق منظم وليست تأكيداً أن حجزاً تم. تأكيد التنفيذ يأتي فقط من
+  نتيجة أداة الحجز المناسبة عندما تكون ok=true.
+- لا تسألي مرة أخرى عن قيمة غير فارغة إلا إذا ناقضتها الرسالة الحالية بوضوح.
+- القيمة الفارغة تعني أن المحلل لم يكن واثقاً؛ افهمي الرسالة الحالية أو اطلبي
+  توضيحاً ولا تخمني.
+- إذا كان intent=check_appointment فاستخدمي check_my_appointments ولا تنشئي
+  حجزاً جديداً.
+- إذا كان intent=reschedule فلا تعتبري requested_date/requested_time موعداً
+  جديداً؛ ميزي الموعد القديم والجديد صراحة من كلام المريضة ونتائج الأدوات.
 - إذا كانت الرسالة الحالية جزءاً قصيراً مثل "7"، استخدميها مع مرحلة المسودة لفهمها.
 
 === قواعد الأمان للحجز ===
@@ -1601,6 +1702,21 @@ async def process_pending_inbound(phone_number: str) -> None:
                 return
             messages = await asyncio.to_thread(claim_pending_batch, phone)
             if not messages:
+                return
+            if any(message.get("side_effects_started_at") for message in messages):
+                # A prior process crossed the durable pre-effect boundary but
+                # never recorded completion. Replaying could duplicate an Apps
+                # Script mutation or WhatsApp reply, so quarantine it instead.
+                await asyncio.to_thread(suppress_uncertain_pending_batch, messages)
+                continue
+            reserved = await asyncio.to_thread(
+                reserve_pending_batch_side_effects,
+                messages,
+            )
+            if not reserved:
+                # A concurrent/partial reservation is itself uncertain. Reload
+                # on the next scanner pass and fail closed rather than replay.
+                log.warning("Could not reserve all side effects for %s", phone)
                 return
             phone_id = str(messages[-1].get("phone_number_id") or PHONE_NUMBER_ID)
             await process_conversation_batch(phone, messages, phone_id)

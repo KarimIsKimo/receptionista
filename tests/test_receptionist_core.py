@@ -143,6 +143,8 @@ class GeminiHistoryTests(unittest.TestCase):
         self.assertIn('"patient_name": "Mona"', prompt)
         self.assertIn('"stage": "ready_to_book"', prompt)
         self.assertIn("لا تسألي مرة أخرى", prompt)
+        self.assertIn("ليست تأكيداً", prompt)
+        self.assertNotIn("معلومة مؤكدة", prompt)
 
 
 class BookingDraftTests(unittest.TestCase):
@@ -178,6 +180,132 @@ class BookingDraftTests(unittest.TestCase):
         self.assertEqual(draft["requested_date"], "2026-09-15")
         self.assertEqual(draft["requested_time"], "8:00 PM")
         self.assertEqual(draft["stage"], "ready_to_book")
+
+    def test_multiple_treatment_areas_are_preserved_without_loss(self):
+        examples = {
+            "بيكيني واندر ارم": "بيكيني + أندر آرم",
+            "بيكيني + اندر ارم + لاين": "بيكيني + أندر آرم + لاين",
+            "وجه ورقبة": "وجه + رقبة",
+            "صدر وظهر واندر ارم": "صدر + ظهر + أندر آرم",
+        }
+        for patient_words, expected in examples.items():
+            with self.subTest(patient_words=patient_words):
+                draft, action = self.evolve(
+                    None,
+                    f"عايزة احجز {patient_words}",
+                    {"name": "Mona"},
+                )
+                self.assertEqual(action, "upsert")
+                self.assertEqual(draft["service_area"], expected)
+
+    def test_egyptian_half_hour_is_parsed_without_prefix_truncation(self):
+        for message in ("عايزة احجز الساعة 7 ونص", "عايزة احجز بعد 7 ونص"):
+            with self.subTest(message=message):
+                draft, _ = self.evolve(None, message, {"name": "Mona"})
+                self.assertEqual(draft["requested_time"], "7:30 PM")
+
+    def test_unrecognized_fraction_and_alternative_times_stay_blank(self):
+        current = {
+            "intent": "book",
+            "patient_name": "Mona",
+            "service_area": "بيكيني",
+            "requested_date": "2026-09-15",
+            "requested_time": "6:00 PM",
+            "stage": "ready_to_book",
+        }
+        for message in (
+            "عايزة احجز الساعة 7 وربع",
+            "عايزة احجز الساعة 7 أو 8",
+            "عايزة احجز حوالي الساعة 7",
+            "عايزة احجز الساعة 7 ونص إلا ربع",
+            "عايزة احجز الساعة 7 لحد 8",
+        ):
+            with self.subTest(message=message):
+                draft, _ = self.evolve(current, message, {"name": "Mona"})
+                self.assertEqual(draft["requested_time"], "")
+
+    def test_multiple_candidate_dates_stay_blank(self):
+        draft, _ = self.evolve(
+            {
+                "intent": "book",
+                "patient_name": "Mona",
+                "service_area": "بيكيني",
+                "requested_date": "2026-09-15",
+                "requested_time": "7:00 PM",
+                "stage": "ready_to_book",
+            },
+            "عايزة احجز بكرة أو الخميس",
+            {"name": "Mona"},
+        )
+        self.assertEqual(draft["requested_date"], "")
+
+    def test_existing_appointment_language_never_becomes_new_booking(self):
+        examples = (
+            "عندي حجز بكرة",
+            "حجزي امتى؟",
+            "موعدي امتى؟",
+            "ممكن أعرف الحجز بتاعي؟",
+            "أنا حاجزة الخميس؟",
+        )
+        for message in examples:
+            with self.subTest(message=message):
+                draft, action = self.evolve(None, message, {"name": "Mona"})
+                self.assertEqual(action, "upsert")
+                self.assertEqual(draft["intent"], "check_appointment")
+                self.assertNotEqual(draft["intent"], "book")
+                self.assertEqual(draft["requested_date"], "")
+                self.assertEqual(draft["requested_time"], "")
+                self.assertEqual(draft["stage"], "checking_appointment")
+
+    def test_common_egyptian_cancellation_variants_are_supported(self):
+        examples = (
+            "ألغي",
+            "الغي",
+            "إلغاء",
+            "الغاء",
+            "عايزة ألغي الحجز",
+            "عايز ألغي الموعد",
+        )
+        for message in examples:
+            with self.subTest(message=message):
+                draft, action = self.evolve(None, message, {"name": "Mona"})
+                self.assertEqual(action, "upsert")
+                self.assertEqual(draft["intent"], "cancel")
+
+    def test_standalone_name_is_only_captured_while_waiting_for_name(self):
+        current = {
+            "intent": "book",
+            "patient_name": "",
+            "service_area": "بيكيني",
+            "requested_date": "2026-09-15",
+            "requested_time": "7:00 PM",
+            "stage": "need_name",
+        }
+        draft, _ = self.evolve(current, "منى أحمد")
+        self.assertEqual(draft["patient_name"], "منى أحمد")
+        self.assertEqual(draft["stage"], "ready_to_book")
+
+        for invalid in ("تمام", "123", "عايزة احجز", "أنا عايزة اعرف السعر"):
+            with self.subTest(invalid=invalid):
+                rejected, _ = self.evolve(current, invalid)
+                self.assertEqual(rejected["patient_name"], "")
+
+    def test_standalone_name_is_not_captured_outside_need_name_stage(self):
+        draft, action = self.evolve(None, "منى أحمد")
+        self.assertIsNone(draft)
+        self.assertEqual(action, "none")
+
+    def test_reschedule_with_old_and_new_times_keeps_them_unclassified(self):
+        draft, action = self.evolve(
+            None,
+            "عايزة أغير موعدي بكرة الساعة 7 للخميس الساعة 8",
+            {"name": "Mona"},
+        )
+        self.assertEqual(action, "upsert")
+        self.assertEqual(draft["intent"], "reschedule")
+        self.assertEqual(draft["requested_date"], "")
+        self.assertEqual(draft["requested_time"], "")
+        self.assertEqual(draft["stage"], "reschedule_unclassified")
 
     def test_bare_seven_uses_active_booking_stage(self):
         current = {
@@ -272,21 +400,111 @@ class ConversationBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_queue_lease_processes_ordered_batch_once(self):
         batch = [
-            {"message_id": "m1", "chat_history_id": 1, "content": "one", "phone_number_id": "pid"},
-            {"message_id": "m2", "chat_history_id": 2, "content": "two", "phone_number_id": "pid"},
+            {"message_id": "m1", "phone_number": PHONE, "chat_history_id": 1, "content": "one", "phone_number_id": "pid", "side_effects_started_at": None},
+            {"message_id": "m2", "phone_number": PHONE, "chat_history_id": 2, "content": "two", "phone_number_id": "pid", "side_effects_started_at": None},
+        ]
+        events = []
+
+        def reserve(_messages):
+            events.append("reserved")
+            return True
+
+        async def process(*_args):
+            events.append("processed")
+
+        def complete(_messages):
+            events.append("completed")
+
+        with mock.patch.object(main, "acquire_processing_lease", return_value=True), mock.patch.object(
+            main, "pending_batch_delay", side_effect=[0.0, None]
+        ), mock.patch.object(main, "refresh_processing_lease", return_value=True), mock.patch.object(
+            main, "claim_pending_batch", return_value=batch
+        ), mock.patch.object(
+            main, "reserve_pending_batch_side_effects", side_effect=reserve
+        ), mock.patch.object(
+            main, "process_conversation_batch", side_effect=process
+        ) as process_mock, mock.patch.object(
+            main, "mark_pending_batch_processed", side_effect=complete
+        ), mock.patch.object(main, "release_processing_lease"):
+            await main.process_pending_inbound(PHONE)
+
+        process_mock.assert_awaited_once_with(PHONE, batch, "pid")
+        self.assertEqual(events, ["reserved", "processed", "completed"])
+
+    async def test_recovered_uncertain_batch_is_quarantined_not_replayed(self):
+        batch = [
+            {
+                "message_id": "m1",
+                "phone_number": PHONE,
+                "chat_history_id": 1,
+                "content": "عايزة احجز",
+                "phone_number_id": "pid",
+                "side_effects_started_at": dt.datetime.now(dt.timezone.utc),
+                "side_effects_completed_at": None,
+            }
         ]
         process = mock.AsyncMock()
         with mock.patch.object(main, "acquire_processing_lease", return_value=True), mock.patch.object(
             main, "pending_batch_delay", side_effect=[0.0, None]
         ), mock.patch.object(main, "refresh_processing_lease", return_value=True), mock.patch.object(
             main, "claim_pending_batch", return_value=batch
-        ), mock.patch.object(main, "process_conversation_batch", process), mock.patch.object(
+        ), mock.patch.object(
+            main, "suppress_uncertain_pending_batch", return_value=1
+        ) as suppress, mock.patch.object(
+            main, "reserve_pending_batch_side_effects"
+        ) as reserve, mock.patch.object(
+            main, "process_conversation_batch", process
+        ), mock.patch.object(
             main, "mark_pending_batch_processed"
-        ) as marked, mock.patch.object(main, "release_processing_lease"):
+        ) as complete, mock.patch.object(main, "release_processing_lease"):
             await main.process_pending_inbound(PHONE)
 
-        process.assert_awaited_once_with(PHONE, batch, "pid")
-        marked.assert_called_once_with(batch)
+        suppress.assert_called_once_with(batch)
+        reserve.assert_not_called()
+        process.assert_not_awaited()
+        complete.assert_not_called()
+
+    async def test_crash_after_reservation_is_not_replayed_on_recovery(self):
+        fresh = [
+            {
+                "message_id": "m1",
+                "phone_number": PHONE,
+                "chat_history_id": 1,
+                "content": "عايزة احجز",
+                "phone_number_id": "pid",
+                "side_effects_started_at": None,
+                "side_effects_completed_at": None,
+            }
+        ]
+        recovered = [{**fresh[0], "side_effects_started_at": dt.datetime.now(dt.timezone.utc)}]
+        external_effects = []
+
+        async def side_effect_then_crash(*_args):
+            external_effects.append("booking_or_reply_may_have_succeeded")
+            raise RuntimeError("process crashed")
+
+        process = mock.AsyncMock(side_effect=side_effect_then_crash)
+        with mock.patch.object(main, "acquire_processing_lease", return_value=True), mock.patch.object(
+            main, "pending_batch_delay", side_effect=[0.0, 0.0, None]
+        ), mock.patch.object(main, "refresh_processing_lease", return_value=True), mock.patch.object(
+            main, "claim_pending_batch", side_effect=[fresh, recovered]
+        ), mock.patch.object(
+            main, "reserve_pending_batch_side_effects", return_value=True
+        ) as reserve, mock.patch.object(
+            main, "process_conversation_batch", process
+        ), mock.patch.object(
+            main, "suppress_uncertain_pending_batch", return_value=1
+        ) as suppress, mock.patch.object(
+            main, "mark_pending_batch_processed"
+        ) as complete, mock.patch.object(main, "release_processing_lease"):
+            await main.process_pending_inbound(PHONE)
+            await main.process_pending_inbound(PHONE)
+
+        reserve.assert_called_once_with(fresh)
+        process.assert_awaited_once_with(PHONE, fresh, "pid")
+        self.assertEqual(external_effects, ["booking_or_reply_may_have_succeeded"])
+        suppress.assert_called_once_with(recovered)
+        complete.assert_not_called()
 
     async def test_paused_patient_learns_memory_but_receives_no_ai_reply(self):
         profile = {
@@ -364,7 +582,15 @@ class ConversationBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
 class MemoryEfficiencyTests(unittest.TestCase):
     def test_trivial_messages_skip_memory_extraction(self):
-        for message in ("هاي", "تمام", "🙏", "7", "الساعة ٧"):
+        for message in (
+            "هاي",
+            "تمام",
+            "🙏",
+            "7",
+            "الساعة ٧",
+            "الساعة ٧ ونص",
+            "الساعة ٧ وربع",
+        ):
             with self.subTest(message=message):
                 self.assertFalse(should_extract_memory(message))
 
@@ -374,6 +600,80 @@ class MemoryEfficiencyTests(unittest.TestCase):
     def test_burst_combination_preserves_order_and_every_fragment(self):
         messages = [{"content": "one"}, {"content": "two"}, {"content": "three"}]
         self.assertEqual(combine_inbound_messages(messages), "one\ntwo\nthree")
+
+
+class QueuePersistenceTests(unittest.TestCase):
+    def test_side_effect_reservation_is_durable_and_all_or_nothing(self):
+        messages = [
+            {"message_id": "m1"},
+            {"message_id": "m2"},
+        ]
+        rows = [{"message_id": "m1"}, {"message_id": "m2"}]
+        with mock.patch.object(main, "db_execute", return_value=rows) as database:
+            reserved = main.reserve_pending_batch_side_effects(messages)
+
+        self.assertTrue(reserved)
+        sql, params = database.call_args.args
+        self.assertIn("side_effects_started_at=NOW()", sql)
+        self.assertIn("recovery_state='in_progress'", sql)
+        self.assertIn("side_effects_started_at IS NULL", sql)
+        self.assertEqual(params, (["m1", "m2"],))
+
+    def test_uncertain_suppression_and_staff_record_share_one_transaction(self):
+        class FakeCursor:
+            def __init__(self):
+                self.calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, sql, params=()):
+                self.calls.append((sql, params))
+
+            def fetchall(self):
+                return [{"message_id": "m1"}]
+
+        class FakeConnection:
+            def __init__(self):
+                self.cursor_instance = FakeCursor()
+                self.commits = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def cursor(self, **_kwargs):
+                return self.cursor_instance
+
+            def commit(self):
+                self.commits += 1
+
+        connection = FakeConnection()
+        messages = [
+            {
+                "message_id": "m1",
+                "phone_number": PHONE,
+                "side_effects_started_at": dt.datetime.now(dt.timezone.utc),
+            }
+        ]
+        with mock.patch.object(main, "get_db_connection", return_value=connection):
+            count = main.suppress_uncertain_pending_batch(messages)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(connection.commits, 1)
+        self.assertEqual(len(connection.cursor_instance.calls), 3)
+        update_sql = connection.cursor_instance.calls[0][0]
+        system_sql = connection.cursor_instance.calls[1][0]
+        audit_sql = connection.cursor_instance.calls[2][0]
+        self.assertIn("recovery_state='suppressed_uncertain'", update_sql)
+        self.assertIn("side_effects_completed_at IS NULL", update_sql)
+        self.assertIn("INSERT INTO chat_history", system_sql)
+        self.assertIn("INSERT INTO audit_log", audit_sql)
 
 
 class SchedulingToolStateTests(unittest.TestCase):
