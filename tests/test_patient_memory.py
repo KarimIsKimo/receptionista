@@ -121,7 +121,7 @@ class PatientMemoryWebhookTests(unittest.IsolatedAsyncioTestCase):
             events.append("bot_state")
             return True
 
-        async def generate(phone, message, current):
+        async def generate(phone, message, current, **kwargs):
             events.append("reply")
             self.assertEqual(current["preferences"], "Evenings")
             return "AI reply", []
@@ -129,6 +129,8 @@ class PatientMemoryWebhookTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(main, "get_user_lock", new=mock.AsyncMock(return_value=asyncio.Lock())), mock.patch.object(
             main, "save_chat_turn", side_effect=save_turn
         ), mock.patch.object(main, "load_patient_profile", return_value=profile), mock.patch.object(
+            main, "update_booking_draft_from_message", return_value=None
+        ), mock.patch.object(
             main, "update_patient_memory", side_effect=update_memory
         ) as memory, mock.patch.object(
             main, "is_bot_globally_active", side_effect=bot_active
@@ -140,7 +142,7 @@ class PatientMemoryWebhookTests(unittest.IsolatedAsyncioTestCase):
             new=mock.AsyncMock(return_value={"ok": True, "message_id": "reply-1"}),
         ):
             await main.handle_ai_conversation(
-                "201000000000", "Hello", "phone-id", "message-1"
+                "201000000000", "Please remember that evenings work best", "phone-id", "message-1"
             )
 
         memory.assert_awaited_once()
@@ -164,6 +166,8 @@ class PatientMemoryWebhookTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(main, "get_user_lock", new=mock.AsyncMock(return_value=asyncio.Lock())), mock.patch.object(
             main, "save_chat_turn", return_value={"id": 1}
         ), mock.patch.object(main, "load_patient_profile", return_value=profile), mock.patch.object(
+            main, "update_booking_draft_from_message", return_value=None
+        ), mock.patch.object(
             main, "update_patient_memory", side_effect=update_memory
         ) as memory, mock.patch.object(
             main, "is_bot_globally_active", return_value=True
@@ -191,6 +195,8 @@ class PatientMemoryWebhookTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(main, "get_user_lock", new=mock.AsyncMock(return_value=asyncio.Lock())), mock.patch.object(
             main, "save_chat_turn", return_value={"id": 1}
         ), mock.patch.object(main, "load_patient_profile", return_value=profile), mock.patch.object(
+            main, "update_booking_draft_from_message", return_value=None
+        ), mock.patch.object(
             main,
             "extract_patient_memory_sync",
             side_effect=RuntimeError("temporary Gemini failure"),
@@ -200,7 +206,7 @@ class PatientMemoryWebhookTests(unittest.IsolatedAsyncioTestCase):
             main, "generate_ai_reply", new=mock.AsyncMock(return_value=("AI reply", []))
         ) as generate, mock.patch.object(main, "send_whatsapp_message", send):
             await main.handle_ai_conversation(
-                "201000000000", "Hello", "phone-id", "message-3"
+                "201000000000", "Please remember that evenings work best", "phone-id", "message-3"
             )
 
         generate.assert_awaited_once()
