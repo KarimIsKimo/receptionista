@@ -56,6 +56,15 @@ def sort_inbox_rows(rows: list[dict]) -> list[dict]:
     )
 
 
+def classify_conversation_origin(first_meaningful_role: Any) -> str:
+    """Classify from the earliest patient/staff message, never the latest turn."""
+    if first_meaningful_role == "user":
+        return "patient"
+    if first_meaningful_role == "staff":
+        return "reception"
+    return "unknown"
+
+
 def build_dashboard_metrics(row: dict) -> dict:
     incoming = int(row.get("unique_incoming_patients_today") or 0)
     bookings = int(row.get("bookings_today") or 0)
@@ -86,7 +95,16 @@ def build_dashboard_metrics(row: dict) -> dict:
 
 
 class AdminOperations:
-    VALID_FILTERS = {"all", "unread", "human", "ai", "booked", "no_booking"}
+    VALID_FILTERS = {
+        "all",
+        "unread",
+        "patient_initiated",
+        "reception_initiated",
+        "human",
+        "ai",
+        "booked",
+        "no_booking",
+    }
 
     def __init__(
         self,
@@ -135,6 +153,12 @@ class AdminOperations:
         row["appointment_freshness"] = "fresh" if state == "healthy" else state
         return row
 
+    def _prepare_inbox_row(self, row: dict) -> dict:
+        row["conversation_origin"] = classify_conversation_origin(
+            row.pop("first_message_role", None)
+        )
+        return self._apply_snapshot_state(row)
+
     def inbox(
         self,
         *,
@@ -165,6 +189,8 @@ class AdminOperations:
 
         filters = {
             "unread": "COALESCE(u.unread_count,0) > 0",
+            "patient_initiated": "o.first_role = 'user'",
+            "reception_initiated": "o.first_role = 'staff'",
             "human": "COALESCE(p.is_paused,FALSE) = TRUE",
             "ai": "COALESCE(p.is_paused,FALSE) = FALSE",
             "booked": "aps.status = 'healthy' AND aps.fetched_at > NOW() - INTERVAL '10 minutes' AND aps.next_appointment IS NOT NULL",
@@ -196,6 +222,13 @@ class AdminOperations:
                     LEFT JOIN admin_inbox_state s ON s.phone_number=c.phone_number
                     WHERE c.role='user' AND c.id > COALESCE(s.last_read_message_id,0)
                     GROUP BY c.phone_number
+                ),
+                origin AS (
+                    SELECT DISTINCT ON (phone_number)
+                        phone_number, role AS first_role
+                    FROM chat_history
+                    WHERE role IN ('user', 'staff')
+                    ORDER BY phone_number, id ASC
                 )
                 SELECT
                     a.phone_number,
@@ -207,6 +240,7 @@ class AdminOperations:
                     l.content AS last_message,
                     l.created_at AS last_message_at,
                     COALESCE(u.unread_count,0) AS unread_count,
+                    o.first_role AS first_message_role,
                     aps.status AS appointment_status,
                     aps.next_appointment,
                     aps.fetched_at AS appointment_fetched_at
@@ -214,6 +248,7 @@ class AdminOperations:
                 LEFT JOIN patients p ON p.phone_number=a.phone_number
                 LEFT JOIN latest l ON l.phone_number=a.phone_number
                 LEFT JOIN unread u ON u.phone_number=a.phone_number
+                LEFT JOIN origin o ON o.phone_number=a.phone_number
                 LEFT JOIN admin_appointment_snapshots aps ON aps.phone_number=a.phone_number
                 {where_sql}
                 ORDER BY l.created_at DESC NULLS LAST, l.id DESC NULLS LAST
@@ -227,7 +262,7 @@ class AdminOperations:
 
         has_more = len(rows) > limit
         patients = sort_inbox_rows(
-            [self._apply_snapshot_state(dict(row)) for row in rows[:limit]]
+            [self._prepare_inbox_row(dict(row)) for row in rows[:limit]]
         )
         ids = [int(row.get("last_message_id") or 0) for row in patients]
         return success(
@@ -264,6 +299,49 @@ class AdminOperations:
             return success("inbox_marked_read", {"phone_number": phone, "last_read_message_id": int(row["last_read_message_id"] if row else 0)})
         except Exception:
             return failure("database_unavailable", "Could not update unread state.", retryable=True)
+
+    def mark_unread(self, phone_number: str) -> dict:
+        """Mark only the latest inbound patient message unread using the same cursor."""
+        phone = normalize_phone(phone_number)
+        try:
+            row = self.db(
+                """
+                /* admin_mark_unread */
+                WITH latest_user AS (
+                    SELECT MAX(id)::bigint AS message_id
+                    FROM chat_history
+                    WHERE phone_number=%s AND role='user'
+                )
+                INSERT INTO admin_inbox_state(phone_number,last_read_message_id,updated_at)
+                SELECT %s, GREATEST(message_id - 1, 0), NOW()
+                FROM latest_user
+                WHERE message_id IS NOT NULL
+                ON CONFLICT(phone_number) DO UPDATE SET
+                    last_read_message_id=EXCLUDED.last_read_message_id,
+                    updated_at=NOW()
+                RETURNING
+                    last_read_message_id,
+                    (SELECT message_id FROM latest_user) AS marked_unread_message_id
+                """,
+                (phone, phone),
+                fetchone=True,
+            )
+            if not row:
+                return success(
+                    "no_patient_messages",
+                    {"phone_number": phone, "unread_count": 0},
+                )
+            return success(
+                "inbox_marked_unread",
+                {
+                    "phone_number": phone,
+                    "last_read_message_id": int(row["last_read_message_id"]),
+                    "marked_unread_message_id": int(row["marked_unread_message_id"]),
+                    "unread_count": 1,
+                },
+            )
+        except Exception:
+            return failure("database_unavailable", "Could not mark conversation unread.", retryable=True)
 
     def inbox_metadata(self, phone_numbers: list[str]) -> dict:
         """Refresh snapshot status without reloading messages or patient profiles."""
@@ -325,6 +403,11 @@ class AdminOperations:
                     COALESCE(p.is_paused,FALSE) AS is_paused,
                     p.created_at,
                     MAX(c.created_at) AS last_active_at,
+                    CASE
+                        WHEN origin.first_role = 'user' THEN 'patient'
+                        WHEN origin.first_role = 'staff' THEN 'reception'
+                        ELSE 'unknown'
+                    END AS conversation_origin,
                     aps.status AS appointment_status,
                     aps.appointments,
                     aps.next_appointment,
@@ -332,9 +415,18 @@ class AdminOperations:
                 FROM (SELECT %s::varchar AS phone_number) wanted
                 LEFT JOIN patients p ON p.phone_number=wanted.phone_number
                 LEFT JOIN chat_history c ON c.phone_number=wanted.phone_number
+                LEFT JOIN LATERAL (
+                    SELECT role AS first_role
+                    FROM chat_history first_message
+                    WHERE first_message.phone_number=wanted.phone_number
+                      AND first_message.role IN ('user', 'staff')
+                    ORDER BY first_message.id ASC
+                    LIMIT 1
+                ) origin ON TRUE
                 LEFT JOIN admin_appointment_snapshots aps ON aps.phone_number=wanted.phone_number
                 GROUP BY p.name,p.tags,p.preferences,p.is_paused,p.created_at,
-                         aps.status,aps.appointments,aps.next_appointment,aps.fetched_at
+                         origin.first_role,aps.status,aps.appointments,
+                         aps.next_appointment,aps.fetched_at
                 """,
                 (phone, phone),
                 fetchone=True,

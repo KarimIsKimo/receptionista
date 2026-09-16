@@ -1362,10 +1362,13 @@ def api_toggle_pause(req: PauseRequest, admin: str = Depends(verify_admin)):
 @app.post("/admin/api/rename_patient")
 def api_rename_patient(req: RenamePatientReq, admin: str = Depends(verify_admin)):
     phone = normalize_phone(req.phone_number)
+    name = req.name.strip()
+    if not name:
+        return failure("invalid_name", "Patient name must not be blank.", state="degraded")
     try:
-        update_patient_file(phone, name=req.name)
-        audit(admin, "rename_patient", phone, req.name.strip())
-        return success("patient_renamed", {"phone_number": phone, "name": req.name.strip()}, status="success")
+        update_patient_file(phone, name=name)
+        audit(admin, "rename_patient", phone, name)
+        return success("patient_renamed", {"phone_number": phone, "name": name}, status="success")
     except Exception:
         return failure("database_unavailable", "Could not update patient name.", retryable=True)
 
@@ -1432,6 +1435,13 @@ def api_mark_patient_read(
     admin: str = Depends(verify_admin),
 ):
     return admin_operations.mark_read(phone_number, req.displayed_message_id)
+
+@app.post("/admin/api/patient/{phone_number}/unread")
+def api_mark_patient_unread(
+    phone_number: str,
+    admin: str = Depends(verify_admin),
+):
+    return admin_operations.mark_unread(phone_number)
 
 @app.get("/admin/api/inbox/metadata")
 def api_inbox_metadata(
