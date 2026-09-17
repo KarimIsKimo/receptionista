@@ -660,6 +660,41 @@ def history_content(role: str, content: str) -> types.Content:
         parts=[types.Part.from_text(text=text)],
     )
 
+def normalize_gemini_history(history: list[types.Content]) -> list[types.Content]:
+    """Return chronological, alternating Gemini turns beginning with a user."""
+    normalized: list[types.Content] = []
+    for content in history:
+        role = content.role
+        text = "\n".join(
+            str(part.text)
+            for part in (content.parts or [])
+            if getattr(part, "text", None) is not None
+        ).strip()
+        if role not in {"user", "model"} or not text:
+            continue
+        if not normalized and role != "user":
+            # A LIMIT window may cut off the user turn that preceded this model
+            # response. Do not give Gemini an orphaned assistant statement.
+            continue
+        if normalized and normalized[-1].role == role:
+            previous = "\n".join(
+                str(part.text)
+                for part in (normalized[-1].parts or [])
+                if getattr(part, "text", None) is not None
+            ).strip()
+            normalized[-1] = types.Content(
+                role=role,
+                parts=[types.Part.from_text(text=f"{previous}\n\n{text}")],
+            )
+        else:
+            normalized.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=text)],
+                )
+            )
+    return normalized
+
 def load_chat_history(
     phone_number: str,
     limit: int = 12,
@@ -684,7 +719,8 @@ def load_chat_history(
         tuple(params),
         fetchall=True,
     )
-    return [history_content(row["role"], row["content"]) for row in reversed(rows)]
+    history = [history_content(row["role"], row["content"]) for row in reversed(rows)]
+    return normalize_gemini_history(history)
 
 def load_recent_memory_conversation(phone_number: str, limit: int = 20) -> list[dict]:
     """Load recent human-visible turns without converting staff messages to AI."""
