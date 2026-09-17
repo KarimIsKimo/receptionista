@@ -1,8 +1,10 @@
+import threading
+import time
 import unittest
 
 import psycopg2
 
-from receptionist.database import DatabasePool
+from receptionist.database import DatabasePool, DatabasePoolTimeoutError
 
 
 class FakeConnection:
@@ -15,24 +17,40 @@ class FakeConnection:
 
 
 class FakePool:
-    def __init__(self, connections):
+    def __init__(self, connections, *, get_failures=0):
         self.connections = list(connections)
         self.put_calls = []
         self.closed = False
+        self.get_failures = get_failures
+        self.lock = threading.Lock()
 
     def getconn(self):
-        return self.connections.pop(0)
+        with self.lock:
+            if self.get_failures:
+                self.get_failures -= 1
+                raise psycopg2.pool.PoolError("temporary pool failure")
+            return self.connections.pop(0)
 
     def putconn(self, connection, close=False):
-        self.put_calls.append((connection, close))
+        with self.lock:
+            self.put_calls.append((connection, close))
+            if not close:
+                self.connections.append(connection)
 
     def closeall(self):
         self.closed = True
 
 
 class DatabasePoolTests(unittest.TestCase):
-    def build(self, connections):
-        fake = FakePool(connections)
+    def build(
+        self,
+        connections,
+        *,
+        max_connections=3,
+        acquire_timeout=0.5,
+        get_failures=0,
+    ):
+        fake = FakePool(connections, get_failures=get_failures)
         calls = []
 
         def factory(minimum, maximum, dsn, **kwargs):
@@ -42,7 +60,8 @@ class DatabasePoolTests(unittest.TestCase):
         database = DatabasePool(
             "postgresql://example/test",
             min_connections=1,
-            max_connections=3,
+            max_connections=max_connections,
+            acquire_timeout=acquire_timeout,
             pool_factory=factory,
             connect_kwargs={"sslmode": "require"},
         )
@@ -99,6 +118,96 @@ class DatabasePoolTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
         database.close()
+
+        self.assertTrue(pool.closed)
+
+    def test_saturated_pool_waits_until_connection_is_returned(self):
+        connection = FakeConnection()
+        database, pool, _ = self.build(
+            [connection], max_connections=1, acquire_timeout=1.0
+        )
+        first_borrowed = threading.Event()
+        release_first = threading.Event()
+        second_borrowed = threading.Event()
+
+        def first_worker():
+            with database.connection():
+                first_borrowed.set()
+                release_first.wait(1.0)
+
+        def second_worker():
+            with database.connection():
+                second_borrowed.set()
+
+        first = threading.Thread(target=first_worker)
+        second = threading.Thread(target=second_worker)
+        first.start()
+        self.assertTrue(first_borrowed.wait(0.5))
+        second.start()
+        self.assertFalse(second_borrowed.wait(0.05))
+        release_first.set()
+        first.join(1.0)
+        second.join(1.0)
+
+        self.assertTrue(second_borrowed.is_set())
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(pool.put_calls, [(connection, False), (connection, False)])
+
+    def test_saturation_timeout_is_controlled_and_does_not_oversubscribe(self):
+        connection = FakeConnection()
+        database, pool, _ = self.build(
+            [connection], max_connections=1, acquire_timeout=0.05
+        )
+
+        with database.connection():
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                DatabasePoolTimeoutError, "remained saturated"
+            ):
+                with database.connection():
+                    pass
+            elapsed = time.monotonic() - started
+
+        self.assertGreaterEqual(elapsed, 0.04)
+        self.assertEqual(pool.put_calls, [(connection, False)])
+
+    def test_acquisition_and_context_exceptions_do_not_leak_capacity(self):
+        connection = FakeConnection()
+        database, pool, _ = self.build(
+            [connection],
+            max_connections=1,
+            acquire_timeout=0.05,
+            get_failures=1,
+        )
+
+        with self.assertRaises(psycopg2.pool.PoolError):
+            with database.connection():
+                pass
+
+        with self.assertRaises(ValueError):
+            with database.connection():
+                raise ValueError("application failure")
+
+        with database.connection() as borrowed:
+            self.assertIs(borrowed, connection)
+
+        self.assertEqual(connection.rollbacks, 1)
+        self.assertEqual(pool.put_calls, [(connection, False), (connection, False)])
+
+    def test_shutdown_rejects_new_borrowers_without_leaking_permits(self):
+        database, pool, _ = self.build(
+            [FakeConnection()], max_connections=1, acquire_timeout=0.05
+        )
+        database.start()
+        database.close()
+
+        with self.assertRaisesRegex(RuntimeError, "pool is closed"):
+            with database.connection():
+                pass
+        with self.assertRaisesRegex(RuntimeError, "pool is closed"):
+            with database.connection():
+                pass
 
         self.assertTrue(pool.closed)
 
