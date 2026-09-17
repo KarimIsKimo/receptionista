@@ -12,9 +12,33 @@ class DashboardHtmlTests(unittest.TestCase):
         cls.html = pathlib.Path("static/admin.html").read_text(encoding="utf-8")
 
     def test_uses_incremental_inbox_and_message_polling(self):
-        self.assertIn("/admin/api/inbox?limit=100", self.html)
-        self.assertIn("&after_id=", self.html)
+        self.assertIn("/admin/api/inbox/updates?after_version=", self.html)
+        self.assertIn("state.cursor", self.html)
         self.assertIn("/messages?limit=100&after_id=", self.html)
+
+    def test_inbox_load_more_uses_composite_keyset_cursor(self):
+        self.assertIn('url+="&before="+encodeURIComponent(state.before)', self.html)
+        self.assertIn("state.before=r.data.next_cursor", self.html)
+        self.assertNotIn('url+="&before_id="+state.before', self.html)
+
+    def test_filtered_empty_page_keeps_load_older_until_cursor_exhaustion(self):
+        fallback = re.search(
+            r"function inboxFallbackHtml\(\)(.*?)function bindLoadOlder",
+            self.html,
+            re.S,
+        )
+        self.assertIsNotNone(fallback)
+        self.assertIn("state.before", fallback.group(1))
+        self.assertIn('id="morePatients"', fallback.group(1))
+        self.assertIn('tr("emptyInbox")', fallback.group(1))
+        self.assertIn(
+            "el.innerHTML=inboxFallbackHtml();bindLoadOlder()",
+            self.html,
+        )
+        self.assertIn(
+            "findIndex(function(x){return x.phone_number===row.phone_number})",
+            self.html,
+        )
 
     def test_required_operations_views_and_states_exist(self):
         for required in (
@@ -56,10 +80,10 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertIn("expireLocalAppointmentMetadata", self.html)
         self.assertIn("now-fetchedAt>=600000", self.html)
         self.assertIn("expireLocalAppointmentMetadata();refreshInboxMetadata()", self.html)
-        self.assertIn("scrollTop=list.scrollTop", self.html)
-        self.assertIn("list.scrollTop=scrollTop", self.html)
+        self.assertIn("scrollTop=el.scrollTop", self.html)
+        self.assertIn("el.scrollTop=scrollTop", self.html)
         self.assertIn('state.filter==="booked"', self.html)
-        self.assertIn('patient.appointment_status==="healthy"', self.html)
+        self.assertIn("snapshotIsFresh(p)", self.html)
         self.assertIn("refreshAppointmentPatient", self.html)
 
     def test_mobile_visible_patient_actions_menu_exists(self):
@@ -84,15 +108,66 @@ class DashboardHtmlTests(unittest.TestCase):
 
     def test_rename_updates_selected_profile_and_row_without_inbox_reload(self):
         self.assertIn('/admin/api/rename_patient', self.html)
-        self.assertIn('await updatePatientUi({name:r.data.name})', self.html)
-        self.assertIn('scrollTop=list.scrollTop', self.html)
-        self.assertIn('list.scrollTop=scrollTop', self.html)
+        self.assertIn('optimisticPatientUpdate(phone,{name:d.name}', self.html)
+        self.assertIn('await updatePatientUi({name:r.data.name},phone)', self.html)
+        self.assertIn('scrollTop=el.scrollTop', self.html)
+        self.assertIn('el.scrollTop=scrollTop', self.html)
         rename_handler = re.search(
             r'if\(action==="name"\)(.*?)if\(action==="notes"\)',
             self.html,
         )
         self.assertIsNotNone(rename_handler)
         self.assertNotIn("loadInbox(true)", rename_handler.group(1))
+
+    def test_conversation_renders_before_appointment_refresh(self):
+        select_handler = re.search(
+            r"async function selectPatient\(phone\)(.*?)async function refreshSelectedAppointments",
+            self.html,
+            re.S,
+        )
+        self.assertIsNotNone(select_handler)
+        code = select_handler.group(1)
+        self.assertIn("Promise.all([", code)
+        self.assertIn("renderMessages({initial:true})", code)
+        self.assertIn("refreshSelectedAppointments(phone,token)", code)
+        self.assertNotIn('"/appointments")])', code)
+
+    def test_rapid_switches_cancel_and_ignore_stale_patient_requests(self):
+        self.assertIn("state.selectionController.abort()", self.html)
+        self.assertIn("state.appointmentController.abort()", self.html)
+        self.assertIn("token!==state.selectionToken", self.html)
+        self.assertIn('e.name!=="AbortError"', self.html)
+        self.assertIn("state.profile.phone_number===selected", self.html)
+        self.assertIn("if(state.selected!==phone)return", self.html)
+
+    def test_polling_is_adaptive_hidden_aware_and_non_overlapping(self):
+        self.assertIn("state.pollingInbox", self.html)
+        self.assertIn("state.pollingMessages", self.html)
+        self.assertIn("state.loadingInbox||state.pollingInbox", self.html)
+        self.assertIn("||state.pollingMessages)return", self.html)
+        self.assertIn("function schedulePolling", self.html)
+        self.assertIn("document.hidden?30000", self.html)
+
+    def test_incremental_updates_patch_rows_without_full_list_replacement(self):
+        updater = re.search(
+            r"function patchInboxRows\(rows\)(.*?)async function loadInbox",
+            self.html,
+            re.S,
+        )
+        self.assertIsNotNone(updater)
+        code = updater.group(1)
+        self.assertIn("existing.replaceWith(fresh)", code)
+        self.assertIn("el.scrollTop=scrollTop", code)
+        self.assertNotIn("renderPatients()", code)
+
+    def test_needs_reply_new_conversation_pin_and_archive_controls_exist(self):
+        for expected in (
+            '"needs_reply"', '"archived"', 'id="newConversationBtn"',
+            "/admin/api/conversations", 'data-action="pin"',
+            'data-action="archive"', "/conversation-state",
+            "waiting_since", "last_message_role",
+        ):
+            self.assertIn(expected, self.html)
 
     def test_mark_unread_uses_dedicated_cursor_action(self):
         self.assertIn('/unread",{}', self.html)

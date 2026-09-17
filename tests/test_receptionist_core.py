@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime as dt
 import json
 import os
@@ -22,6 +23,7 @@ from receptionist.conversation import (  # noqa: E402
     evolve_booking_draft,
     should_extract_memory,
 )
+from receptionist.database import DatabasePoolTimeoutError  # noqa: E402
 
 
 NOW = dt.datetime(2026, 9, 14, 18, 0, tzinfo=ZoneInfo("Africa/Cairo"))
@@ -794,6 +796,99 @@ class ConversationBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(second_tasks.tasks), 0)
         self.assertEqual(persist.call_count, 2)
 
+    async def test_unpersisted_webhook_returns_503_then_retry_is_exactly_once(self):
+        store = {
+            "processed": set(),
+            "history": [],
+            "queue": [],
+            "commits": 0,
+        }
+
+        class Cursor:
+            def __init__(self):
+                self.result = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def execute(self, sql, params):
+                if "INSERT INTO processed_messages" in sql:
+                    message_id = params[0]
+                    if message_id in store["processed"]:
+                        self.result = None
+                    else:
+                        store["processed"].add(message_id)
+                        self.result = {"message_id": message_id}
+                elif "INSERT INTO chat_history" in sql:
+                    saved = {
+                        "id": len(store["history"]) + 1,
+                        "role": "user",
+                        "content": params[1],
+                        "whatsapp_message_id": params[2],
+                        "created_at": NOW,
+                    }
+                    store["history"].append(saved)
+                    self.result = saved
+                elif "INSERT INTO inbound_message_queue" in sql:
+                    store["queue"].append({
+                        "message_id": params[0],
+                        "phone_number": params[1],
+                        "chat_history_id": params[2],
+                    })
+                    self.result = None
+                else:
+                    raise AssertionError(sql)
+
+            def fetchone(self):
+                return self.result
+
+        class Connection:
+            def cursor(self, **_):
+                return Cursor()
+
+            def commit(self):
+                store["commits"] += 1
+
+        attempts = 0
+
+        @contextlib.contextmanager
+        def borrow():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise DatabasePoolTimeoutError("pool saturated")
+            yield Connection()
+
+        first_tasks = main.BackgroundTasks()
+        retry_tasks = main.BackgroundTasks()
+        duplicate_tasks = main.BackgroundTasks()
+        with mock.patch.object(main, "get_db_connection", side_effect=borrow), mock.patch.object(
+            main, "update_conversation_summary_for_message"
+        ):
+            first = await main.receive_message(FakeRequest(webhook_body()), first_tasks)
+            retry = await main.receive_message(FakeRequest(webhook_body()), retry_tasks)
+            duplicate = await main.receive_message(
+                FakeRequest(webhook_body()), duplicate_tasks
+            )
+
+        self.assertEqual(first.status_code, 503)
+        first_payload = json.loads(first.body)
+        self.assertEqual(first_payload["status"], "RETRY_LATER")
+        self.assertNotEqual(first_payload["status"], "EVENT_RECEIVED")
+        self.assertEqual(retry["status"], "EVENT_RECEIVED")
+        self.assertEqual(retry["scheduled"], 1)
+        self.assertEqual(duplicate["status"], "EVENT_RECEIVED")
+        self.assertEqual(duplicate["scheduled"], 0)
+        self.assertEqual(len(store["processed"]), 1)
+        self.assertEqual(len(store["history"]), 1)
+        self.assertEqual(len(store["queue"]), 1)
+        self.assertEqual(len(first_tasks.tasks), 0)
+        self.assertEqual(len(retry_tasks.tasks), 1)
+        self.assertEqual(len(duplicate_tasks.tasks), 0)
+
 
 class MemoryEfficiencyTests(unittest.TestCase):
     def test_trivial_messages_skip_memory_extraction(self):
@@ -851,6 +946,15 @@ class QueuePersistenceTests(unittest.TestCase):
             def fetchall(self):
                 return [{"message_id": "m1"}]
 
+            def fetchone(self):
+                return {
+                    "id": 99,
+                    "role": "system",
+                    "content": "recovery record",
+                    "whatsapp_message_id": None,
+                    "created_at": dt.datetime.now(dt.timezone.utc),
+                }
+
         class FakeConnection:
             def __init__(self):
                 self.cursor_instance = FakeCursor()
@@ -881,13 +985,15 @@ class QueuePersistenceTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertEqual(connection.commits, 1)
-        self.assertEqual(len(connection.cursor_instance.calls), 3)
+        self.assertEqual(len(connection.cursor_instance.calls), 4)
         update_sql = connection.cursor_instance.calls[0][0]
         system_sql = connection.cursor_instance.calls[1][0]
-        audit_sql = connection.cursor_instance.calls[2][0]
+        summary_sql = connection.cursor_instance.calls[2][0]
+        audit_sql = connection.cursor_instance.calls[3][0]
         self.assertIn("recovery_state='suppressed_uncertain'", update_sql)
         self.assertIn("side_effects_completed_at IS NULL", update_sql)
         self.assertIn("INSERT INTO chat_history", system_sql)
+        self.assertIn("conversation_summary_message", summary_sql)
         self.assertIn("INSERT INTO audit_log", audit_sql)
 
 

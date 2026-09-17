@@ -7,6 +7,8 @@ failed refresh.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime as dt
 import json
 import re
@@ -18,6 +20,56 @@ from .dates import parse_date_expression
 
 
 APPOINTMENT_SNAPSHOT_TTL = dt.timedelta(minutes=10)
+
+
+def encode_inbox_cursor(row: dict) -> str:
+    """Encode the complete stable inbox ordering key as an opaque cursor."""
+    timestamp = row.get("last_message_at")
+    if isinstance(timestamp, dt.datetime):
+        timestamp = timestamp.isoformat()
+    elif timestamp is not None:
+        timestamp = str(timestamp)
+    payload = {
+        "p": bool(row.get("is_pinned")),
+        "t": timestamp,
+        "i": int(row.get("last_message_id") or 0),
+        "n": str(row.get("phone_number") or ""),
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def decode_inbox_cursor(value: str) -> tuple[bool, str | None, int, str]:
+    """Validate and decode a cursor without trusting browser-provided values."""
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(value + padding).decode("utf-8"))
+        pinned = payload["p"]
+        timestamp = payload["t"]
+        message_id = payload["i"]
+        phone_number = payload["n"]
+        if not isinstance(pinned, bool):
+            raise ValueError
+        if timestamp is not None:
+            if not isinstance(timestamp, str):
+                raise ValueError
+            parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError
+        if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id < 0:
+            raise ValueError
+        if not isinstance(phone_number, str) or not phone_number:
+            raise ValueError
+        return pinned, timestamp, message_id, phone_number
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        json.JSONDecodeError,
+        binascii.Error,
+    ) as exc:
+        raise ValueError("Invalid inbox cursor") from exc
 
 
 def success(code: str, data: Any = None, **meta: Any) -> dict:
@@ -46,11 +98,21 @@ def failure(
 
 def sort_inbox_rows(rows: list[dict]) -> list[dict]:
     """Deterministic ordering by actual latest message, never profile update time."""
+    def activity(row: dict) -> dt.datetime:
+        value = row.get("last_message_at")
+        if not isinstance(value, dt.datetime):
+            return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt.timezone.utc)
+        return value
+
     return sorted(
         rows,
         key=lambda row: (
-            row.get("last_message_at") or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            bool(row.get("is_pinned")),
+            activity(row),
             int(row.get("last_message_id") or 0),
+            str(row.get("phone_number") or ""),
         ),
         reverse=True,
     )
@@ -104,6 +166,8 @@ class AdminOperations:
         "ai",
         "booked",
         "no_booking",
+        "needs_reply",
+        "archived",
     }
 
     def __init__(
@@ -165,93 +229,130 @@ class AdminOperations:
         search: str = "",
         state: str = "all",
         limit: int = 50,
+        before: str | None = None,
         before_id: int | None = None,
         after_id: int | None = None,
     ) -> dict:
         if state not in self.VALID_FILTERS:
             return failure("invalid_filter", "Unknown inbox filter.", state="degraded")
-        if before_id is not None and after_id is not None:
-            return failure("invalid_cursor", "Use before_id or after_id, not both.", state="degraded")
+        if sum(value is not None for value in (before, before_id, after_id)) > 1:
+            return failure(
+                "invalid_cursor",
+                "Use only one inbox pagination cursor.",
+                state="degraded",
+            )
 
         where: list[str] = []
         params: list[Any] = []
         search = search.strip()
         if search:
-            where.append("(a.phone_number ILIKE %s OR COALESCE(p.name,'') ILIKE %s)")
+            where.append(
+                "(s.phone_number ILIKE %s OR COALESCE(p.name,'') ILIKE %s "
+                "OR COALESCE(p.preferences,'') ILIKE %s "
+                "OR array_to_string(COALESCE(p.tags,'{}'), ' ') ILIKE %s)"
+            )
             term = f"%{search}%"
-            params.extend([term, term])
-        if before_id is not None:
-            where.append("COALESCE(l.id,0) < %s")
+            params.extend([term, term, term, term])
+        if before is not None:
+            try:
+                pinned, timestamp, message_id, phone_number = decode_inbox_cursor(before)
+            except ValueError:
+                return failure("invalid_cursor", "Invalid inbox cursor.", state="degraded")
+            where.append(
+                "(s.is_pinned, "
+                "COALESCE(s.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(s.last_message_id,0), s.phone_number) < "
+                "(%s::boolean, COALESCE(%s::timestamptz,'-infinity'::timestamptz), "
+                "%s::bigint, %s::text)"
+            )
+            params.extend([pinned, timestamp, message_id, phone_number])
+        elif before_id is not None:
+            # Compatibility for older dashboard clients: use the message id only
+            # to locate its complete sort key, then apply the same keyset boundary.
+            where.append(
+                "(s.is_pinned, "
+                "COALESCE(s.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(s.last_message_id,0), s.phone_number) < "
+                "(SELECT legacy.is_pinned, "
+                "COALESCE(legacy.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(legacy.last_message_id,0), legacy.phone_number "
+                "FROM conversation_summaries legacy "
+                "WHERE legacy.last_message_id=%s)"
+            )
             params.append(before_id)
-        if after_id is not None:
-            where.append("COALESCE(l.id,0) > %s")
+        elif after_id is not None:
+            where.append(
+                "(s.is_pinned, "
+                "COALESCE(s.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(s.last_message_id,0), s.phone_number) > "
+                "(SELECT legacy.is_pinned, "
+                "COALESCE(legacy.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(legacy.last_message_id,0), legacy.phone_number "
+                "FROM conversation_summaries legacy "
+                "WHERE legacy.last_message_id=%s)"
+            )
             params.append(after_id)
 
         filters = {
-            "unread": "COALESCE(u.unread_count,0) > 0",
-            "patient_initiated": "o.first_role = 'user'",
-            "reception_initiated": "o.first_role = 'staff'",
+            "unread": "s.unread_count > 0",
+            "needs_reply": "s.latest_patient_message_id > s.latest_response_message_id",
+            "patient_initiated": "s.first_meaningful_role = 'user'",
+            "reception_initiated": "s.first_meaningful_role = 'staff'",
             "human": "COALESCE(p.is_paused,FALSE) = TRUE",
             "ai": "COALESCE(p.is_paused,FALSE) = FALSE",
             "booked": "aps.status = 'healthy' AND aps.fetched_at > NOW() - INTERVAL '10 minutes' AND aps.next_appointment IS NOT NULL",
             "no_booking": "aps.status = 'healthy' AND aps.fetched_at > NOW() - INTERVAL '10 minutes' AND aps.next_appointment IS NULL",
+            "archived": "s.is_archived = TRUE",
         }
+        if state != "archived":
+            where.append("s.is_archived = FALSE")
         if state in filters:
             where.append(filters[state])
         where_sql = "WHERE " + " AND ".join(where) if where else ""
         params.append(max(1, min(limit, 100)) + 1)
 
         try:
+            # Capture the watermark before the page query. A change that commits
+            # concurrently will therefore either appear in this page or be returned
+            # by inbox_updates; it can never be skipped by an over-new cursor.
+            watermark = self.db(
+                """
+                /* admin_inbox_cursor */
+                SELECT version AS server_cursor
+                FROM conversation_summary_clock
+                WHERE id=1
+                """,
+                fetchone=True,
+            )
             rows = self.db(
                 f"""
                 /* admin_inbox */
-                WITH active AS (
-                    SELECT phone_number FROM patients
-                    UNION
-                    SELECT DISTINCT phone_number FROM chat_history
-                ),
-                latest AS (
-                    SELECT DISTINCT ON (phone_number)
-                        phone_number, id, role, content, created_at
-                    FROM chat_history
-                    ORDER BY phone_number, id DESC
-                ),
-                unread AS (
-                    SELECT c.phone_number, COUNT(*)::int AS unread_count
-                    FROM chat_history c
-                    LEFT JOIN admin_inbox_state s ON s.phone_number=c.phone_number
-                    WHERE c.role='user' AND c.id > COALESCE(s.last_read_message_id,0)
-                    GROUP BY c.phone_number
-                ),
-                origin AS (
-                    SELECT DISTINCT ON (phone_number)
-                        phone_number, role AS first_role
-                    FROM chat_history
-                    WHERE role IN ('user', 'staff')
-                    ORDER BY phone_number, id ASC
-                )
                 SELECT
-                    a.phone_number,
+                    s.phone_number,
                     COALESCE(p.name,'') AS name,
                     COALESCE(p.tags,'{{}}') AS tags,
+                    COALESCE(p.preferences,'') AS preferences,
                     COALESCE(p.is_paused,FALSE) AS is_paused,
-                    l.id AS last_message_id,
-                    l.role AS last_message_role,
-                    l.content AS last_message,
-                    l.created_at AS last_message_at,
-                    COALESCE(u.unread_count,0) AS unread_count,
-                    o.first_role AS first_message_role,
+                    s.last_message_id,
+                    s.last_message_role,
+                    s.last_message,
+                    s.last_message_at,
+                    s.unread_count,
+                    s.first_meaningful_role AS first_message_role,
+                    (s.latest_patient_message_id > s.latest_response_message_id) AS needs_reply,
+                    s.latest_patient_message_at AS waiting_since,
+                    s.is_pinned,
+                    s.is_archived,
+                    s.change_version,
                     aps.status AS appointment_status,
                     aps.next_appointment,
                     aps.fetched_at AS appointment_fetched_at
-                FROM active a
-                LEFT JOIN patients p ON p.phone_number=a.phone_number
-                LEFT JOIN latest l ON l.phone_number=a.phone_number
-                LEFT JOIN unread u ON u.phone_number=a.phone_number
-                LEFT JOIN origin o ON o.phone_number=a.phone_number
-                LEFT JOIN admin_appointment_snapshots aps ON aps.phone_number=a.phone_number
+                FROM conversation_summaries s
+                LEFT JOIN patients p ON p.phone_number=s.phone_number
+                LEFT JOIN admin_appointment_snapshots aps ON aps.phone_number=s.phone_number
                 {where_sql}
-                ORDER BY l.created_at DESC NULLS LAST, l.id DESC NULLS LAST
+                ORDER BY s.is_pinned DESC, s.last_message_at DESC NULLS LAST,
+                         s.last_message_id DESC NULLS LAST, s.phone_number DESC
                 LIMIT %s
                 """,
                 tuple(params),
@@ -264,15 +365,71 @@ class AdminOperations:
         patients = sort_inbox_rows(
             [self._prepare_inbox_row(dict(row)) for row in rows[:limit]]
         )
-        ids = [int(row.get("last_message_id") or 0) for row in patients]
+        next_cursor = encode_inbox_cursor(patients[-1]) if has_more and patients else None
+        legacy_before_id = (
+            int(patients[-1].get("last_message_id") or 0)
+            if has_more and patients
+            else None
+        )
         return success(
             "inbox_loaded",
             {
                 "patients": patients,
                 "has_more": has_more,
-                "next_before_id": min(ids) if has_more and ids else None,
-                "server_cursor": max(ids) if ids else (after_id or 0),
+                "next_cursor": next_cursor,
+                "next_before_id": legacy_before_id or None,
+                "server_cursor": int(
+                    (watermark or {}).get("server_cursor") or 0
+                ),
             },
+        )
+
+    def inbox_updates(self, *, after_version: int, limit: int = 100) -> dict:
+        """Return changed summary rows without reconstructing chat history."""
+        limit = max(1, min(limit, 200))
+        try:
+            rows = self.db(
+                """
+                /* admin_inbox_updates */
+                SELECT
+                    s.phone_number,
+                    COALESCE(p.name,'') AS name,
+                    COALESCE(p.tags,'{}') AS tags,
+                    COALESCE(p.preferences,'') AS preferences,
+                    COALESCE(p.is_paused,FALSE) AS is_paused,
+                    s.last_message_id,s.last_message_role,s.last_message,
+                    s.last_message_at,s.unread_count,
+                    s.first_meaningful_role AS first_message_role,
+                    (s.latest_patient_message_id > s.latest_response_message_id) AS needs_reply,
+                    s.latest_patient_message_at AS waiting_since,
+                    s.is_pinned,s.is_archived,s.change_version,
+                    aps.status AS appointment_status,
+                    aps.next_appointment,
+                    aps.fetched_at AS appointment_fetched_at
+                FROM conversation_summaries s
+                LEFT JOIN patients p ON p.phone_number=s.phone_number
+                LEFT JOIN admin_appointment_snapshots aps ON aps.phone_number=s.phone_number
+                WHERE s.change_version>%s
+                ORDER BY s.change_version ASC
+                LIMIT %s
+                """,
+                (after_version, limit + 1),
+                fetchall=True,
+            )
+        except Exception:
+            return failure(
+                "database_unavailable",
+                "Could not load inbox updates.",
+                retryable=True,
+            )
+        has_more = len(rows) > limit
+        patients = [self._prepare_inbox_row(dict(row)) for row in rows[:limit]]
+        cursor = max(
+            [int(row.get("change_version") or 0) for row in patients] or [after_version]
+        )
+        return success(
+            "inbox_updates_loaded",
+            {"patients": patients, "server_cursor": cursor, "has_more": has_more},
         )
 
     def mark_read(self, phone_number: str, displayed_message_id: int) -> dict:
@@ -283,20 +440,48 @@ class AdminOperations:
             row = self.db(
                 """
                 /* admin_mark_read */
-                INSERT INTO admin_inbox_state(phone_number,last_read_message_id,updated_at)
-                VALUES (%s,%s,NOW())
-                ON CONFLICT(phone_number) DO UPDATE SET
-                    last_read_message_id=GREATEST(
-                        admin_inbox_state.last_read_message_id,
-                        EXCLUDED.last_read_message_id
-                    ),
-                    updated_at=NOW()
-                RETURNING last_read_message_id
+                WITH clock AS (
+                    UPDATE conversation_summary_clock
+                    SET version=version+1
+                    WHERE id=1
+                    RETURNING version
+                ), read_state AS (
+                    INSERT INTO admin_inbox_state(phone_number,last_read_message_id,updated_at)
+                    VALUES (%s,%s,NOW())
+                    ON CONFLICT(phone_number) DO UPDATE SET
+                        last_read_message_id=GREATEST(
+                            admin_inbox_state.last_read_message_id,
+                            EXCLUDED.last_read_message_id
+                        ),
+                        updated_at=NOW()
+                    RETURNING last_read_message_id
+                ), updated AS (
+                    UPDATE conversation_summaries summary
+                    SET unread_count=(
+                            SELECT COUNT(*)::integer
+                            FROM chat_history message, read_state
+                            WHERE message.phone_number=summary.phone_number
+                              AND message.role='user'
+                              AND message.id>read_state.last_read_message_id
+                        ),
+                        change_version=clock.version,
+                        updated_at=NOW()
+                    FROM read_state, clock
+                    WHERE summary.phone_number=%s
+                    RETURNING summary.unread_count
+                )
+                SELECT read_state.last_read_message_id,
+                       COALESCE((SELECT unread_count FROM updated),0) AS unread_count
+                FROM read_state
                 """,
-                (phone, displayed_message_id),
+                (phone, displayed_message_id, phone),
                 fetchone=True,
             )
-            return success("inbox_marked_read", {"phone_number": phone, "last_read_message_id": int(row["last_read_message_id"] if row else 0)})
+            return success("inbox_marked_read", {
+                "phone_number": phone,
+                "last_read_message_id": int(row["last_read_message_id"] if row else 0),
+                "unread_count": int(row["unread_count"] if row else 0),
+            })
         except Exception:
             return failure("database_unavailable", "Could not update unread state.", retryable=True)
 
@@ -307,23 +492,38 @@ class AdminOperations:
             row = self.db(
                 """
                 /* admin_mark_unread */
-                WITH latest_user AS (
-                    SELECT MAX(id)::bigint AS message_id
-                    FROM chat_history
-                    WHERE phone_number=%s AND role='user'
+                WITH clock AS (
+                    UPDATE conversation_summary_clock
+                    SET version=version+1
+                    WHERE id=1
+                    RETURNING version
+                ), latest_user AS (
+                    SELECT latest_patient_message_id AS message_id
+                    FROM conversation_summaries
+                    WHERE phone_number=%s AND latest_patient_message_id>0
+                ), read_state AS (
+                    INSERT INTO admin_inbox_state(phone_number,last_read_message_id,updated_at)
+                    SELECT %s, GREATEST(message_id - 1, 0), NOW()
+                    FROM latest_user
+                    WHERE TRUE
+                    ON CONFLICT(phone_number) DO UPDATE SET
+                        last_read_message_id=EXCLUDED.last_read_message_id,
+                        updated_at=NOW()
+                    RETURNING last_read_message_id
+                ), updated AS (
+                    UPDATE conversation_summaries
+                    SET unread_count=1,
+                        change_version=clock.version,
+                        updated_at=NOW()
+                    FROM clock
+                    WHERE phone_number=%s AND EXISTS (SELECT 1 FROM read_state)
+                    RETURNING unread_count
                 )
-                INSERT INTO admin_inbox_state(phone_number,last_read_message_id,updated_at)
-                SELECT %s, GREATEST(message_id - 1, 0), NOW()
-                FROM latest_user
-                WHERE message_id IS NOT NULL
-                ON CONFLICT(phone_number) DO UPDATE SET
-                    last_read_message_id=EXCLUDED.last_read_message_id,
-                    updated_at=NOW()
-                RETURNING
-                    last_read_message_id,
-                    (SELECT message_id FROM latest_user) AS marked_unread_message_id
+                SELECT read_state.last_read_message_id,
+                       latest_user.message_id AS marked_unread_message_id
+                FROM read_state CROSS JOIN latest_user
                 """,
-                (phone, phone),
+                (phone, phone, phone),
                 fetchone=True,
             )
             if not row:
@@ -396,44 +596,52 @@ class AdminOperations:
                 """
                 /* admin_patient_detail */
                 SELECT
-                    %s AS phone_number,
+                    summary.phone_number,
                     COALESCE(p.name,'') AS name,
                     COALESCE(p.tags,'{}') AS tags,
                     COALESCE(p.preferences,'') AS preferences,
                     COALESCE(p.is_paused,FALSE) AS is_paused,
                     p.created_at,
-                    MAX(c.created_at) AS last_active_at,
+                    summary.last_message_at AS last_active_at,
                     CASE
-                        WHEN origin.first_role = 'user' THEN 'patient'
-                        WHEN origin.first_role = 'staff' THEN 'reception'
+                        WHEN summary.first_meaningful_role = 'user' THEN 'patient'
+                        WHEN summary.first_meaningful_role = 'staff' THEN 'reception'
                         ELSE 'unknown'
                     END AS conversation_origin,
+                    summary.unread_count,
+                    (summary.latest_patient_message_id > summary.latest_response_message_id)
+                        AS needs_reply,
+                    summary.latest_patient_message_at AS waiting_since,
+                    summary.is_pinned,
+                    summary.is_archived,
                     aps.status AS appointment_status,
                     aps.appointments,
                     aps.next_appointment,
                     aps.fetched_at AS appointment_fetched_at
-                FROM (SELECT %s::varchar AS phone_number) wanted
-                LEFT JOIN patients p ON p.phone_number=wanted.phone_number
-                LEFT JOIN chat_history c ON c.phone_number=wanted.phone_number
-                LEFT JOIN LATERAL (
-                    SELECT role AS first_role
-                    FROM chat_history first_message
-                    WHERE first_message.phone_number=wanted.phone_number
-                      AND first_message.role IN ('user', 'staff')
-                    ORDER BY first_message.id ASC
-                    LIMIT 1
-                ) origin ON TRUE
-                LEFT JOIN admin_appointment_snapshots aps ON aps.phone_number=wanted.phone_number
-                GROUP BY p.name,p.tags,p.preferences,p.is_paused,p.created_at,
-                         origin.first_role,aps.status,aps.appointments,
-                         aps.next_appointment,aps.fetched_at
+                FROM conversation_summaries summary
+                LEFT JOIN patients p ON p.phone_number=summary.phone_number
+                LEFT JOIN admin_appointment_snapshots aps
+                  ON aps.phone_number=summary.phone_number
+                WHERE summary.phone_number=%s
                 """,
-                (phone, phone),
+                (phone,),
                 fetchone=True,
             )
             if not row:
                 return failure("patient_not_found", "Patient was not found.", state="degraded")
-            return success("patient_loaded", self._apply_snapshot_state(dict(row)))
+            patient = self._apply_snapshot_state(dict(row))
+            classified = self._classify_appointments(patient.get("appointments"))
+            if patient["appointment_status"] in {"unavailable", "unknown"}:
+                # Retain the raw cached payload for diagnostics, but never expose
+                # old items in authoritative upcoming/previous UI sections.
+                classified.update(
+                    upcoming=[],
+                    previous=[],
+                    unclassified=[],
+                    next_appointment=None,
+                )
+            patient.update(classified)
+            return success("patient_loaded", patient)
         except Exception:
             return failure("database_unavailable", "Could not load patient details.", retryable=True)
 
@@ -533,6 +741,39 @@ class AdminOperations:
             return None
         return dt.datetime.combine(date, parsed_time, self.config.timezone)
 
+    def _classify_appointments(self, appointments: Any) -> dict[str, Any]:
+        """Classify a cached or live appointment list without guessing malformed times."""
+        if not isinstance(appointments, list):
+            appointments = []
+        now = self._now()
+        upcoming: list[Any] = []
+        previous: list[Any] = []
+        unknown: list[Any] = []
+        for item in appointments:
+            moment = self._appointment_datetime(item)
+            if moment is None:
+                unknown.append(item)
+            elif moment > now:
+                upcoming.append(item)
+            else:
+                previous.append(item)
+        upcoming.sort(
+            key=lambda item: self._appointment_datetime(item)
+            or dt.datetime.max.replace(tzinfo=self.config.timezone)
+        )
+        previous.sort(
+            key=lambda item: self._appointment_datetime(item)
+            or dt.datetime.min.replace(tzinfo=self.config.timezone),
+            reverse=True,
+        )
+        return {
+            "appointments": appointments,
+            "upcoming": upcoming,
+            "previous": previous,
+            "unclassified": unknown,
+            "next_appointment": upcoming[0] if upcoming else None,
+        }
+
     def _cache_appointments(
         self,
         phone: str,
@@ -543,14 +784,23 @@ class AdminOperations:
         self.db(
             """
             /* admin_cache_appointments */
-            INSERT INTO admin_appointment_snapshots(
-                phone_number,appointments,next_appointment,status,fetched_at
-            ) VALUES (%s,%s::jsonb,%s::jsonb,%s,NOW())
+            WITH snapshot AS (
+                INSERT INTO admin_appointment_snapshots(
+                    phone_number,appointments,next_appointment,status,fetched_at
+                ) VALUES (%s,%s::jsonb,%s::jsonb,%s,NOW())
+                ON CONFLICT(phone_number) DO UPDATE SET
+                    appointments=EXCLUDED.appointments,
+                    next_appointment=EXCLUDED.next_appointment,
+                    status=EXCLUDED.status,
+                    fetched_at=NOW()
+                RETURNING phone_number
+            )
+            INSERT INTO conversation_summaries(phone_number,updated_at)
+            SELECT phone_number,NOW() FROM snapshot
+            WHERE TRUE
             ON CONFLICT(phone_number) DO UPDATE SET
-                appointments=EXCLUDED.appointments,
-                next_appointment=EXCLUDED.next_appointment,
-                status=EXCLUDED.status,
-                fetched_at=NOW()
+                change_version=EXCLUDED.change_version,
+                updated_at=NOW()
             """,
             (
                 phone,
@@ -565,10 +815,19 @@ class AdminOperations:
         self.db(
             """
             /* admin_cache_appointments_failure */
-            INSERT INTO admin_appointment_snapshots(
-                phone_number,appointments,next_appointment,status,fetched_at
-            ) VALUES (%s,NULL,NULL,%s,NULL)
-            ON CONFLICT(phone_number) DO UPDATE SET status=EXCLUDED.status
+            WITH snapshot AS (
+                INSERT INTO admin_appointment_snapshots(
+                    phone_number,appointments,next_appointment,status,fetched_at
+                ) VALUES (%s,NULL,NULL,%s,NULL)
+                ON CONFLICT(phone_number) DO UPDATE SET status=EXCLUDED.status
+                RETURNING phone_number
+            )
+            INSERT INTO conversation_summaries(phone_number,updated_at)
+            SELECT phone_number,NOW() FROM snapshot
+            WHERE TRUE
+            ON CONFLICT(phone_number) DO UPDATE SET
+                change_version=EXCLUDED.change_version,
+                updated_at=NOW()
             """,
             (phone, status),
         )
@@ -602,20 +861,8 @@ class AdminOperations:
             )
 
         now = self._now()
-        upcoming: list[Any] = []
-        previous: list[Any] = []
-        unknown: list[Any] = []
-        for item in appointments:
-            moment = self._appointment_datetime(item)
-            if moment is None:
-                unknown.append(item)
-            elif moment > now:
-                upcoming.append(item)
-            else:
-                previous.append(item)
-        upcoming.sort(key=lambda item: self._appointment_datetime(item) or dt.datetime.max.replace(tzinfo=self.config.timezone))
-        previous.sort(key=lambda item: self._appointment_datetime(item) or dt.datetime.min.replace(tzinfo=self.config.timezone), reverse=True)
-        next_appointment = upcoming[0] if upcoming else None
+        classified = self._classify_appointments(appointments)
+        next_appointment = classified["next_appointment"]
         try:
             self._cache_appointments(phone, appointments, next_appointment, "healthy")
         except Exception:
@@ -625,11 +872,7 @@ class AdminOperations:
             "appointments_loaded",
             {
                 "phone_number": phone,
-                "appointments": appointments,
-                "upcoming": upcoming,
-                "previous": previous,
-                "unclassified": unknown,
-                "next_appointment": next_appointment,
+                **classified,
                 "source": "google_apps_script",
                 "fetched_at": now.isoformat(),
                 "snapshot_status": "healthy",
