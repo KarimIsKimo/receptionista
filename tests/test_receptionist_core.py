@@ -851,6 +851,15 @@ class QueuePersistenceTests(unittest.TestCase):
             def fetchall(self):
                 return [{"message_id": "m1"}]
 
+            def fetchone(self):
+                return {
+                    "id": 99,
+                    "role": "system",
+                    "content": "recovery record",
+                    "whatsapp_message_id": None,
+                    "created_at": dt.datetime.now(dt.timezone.utc),
+                }
+
         class FakeConnection:
             def __init__(self):
                 self.cursor_instance = FakeCursor()
@@ -881,13 +890,15 @@ class QueuePersistenceTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertEqual(connection.commits, 1)
-        self.assertEqual(len(connection.cursor_instance.calls), 3)
+        self.assertEqual(len(connection.cursor_instance.calls), 4)
         update_sql = connection.cursor_instance.calls[0][0]
         system_sql = connection.cursor_instance.calls[1][0]
-        audit_sql = connection.cursor_instance.calls[2][0]
+        summary_sql = connection.cursor_instance.calls[2][0]
+        audit_sql = connection.cursor_instance.calls[3][0]
         self.assertIn("recovery_state='suppressed_uncertain'", update_sql)
         self.assertIn("side_effects_completed_at IS NULL", update_sql)
         self.assertIn("INSERT INTO chat_history", system_sql)
+        self.assertIn("conversation_summary_message", summary_sql)
         self.assertIn("INSERT INTO audit_log", audit_sql)
 
 
