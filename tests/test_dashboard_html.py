@@ -16,6 +16,11 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertIn("state.cursor", self.html)
         self.assertIn("/messages?limit=100&after_id=", self.html)
 
+    def test_inbox_load_more_uses_composite_keyset_cursor(self):
+        self.assertIn('url+="&before="+encodeURIComponent(state.before)', self.html)
+        self.assertIn("state.before=r.data.next_cursor", self.html)
+        self.assertNotIn('url+="&before_id="+state.before', self.html)
+
     def test_required_operations_views_and_states_exist(self):
         for required in (
             'id="view-inbox"', 'id="view-appointments"',
