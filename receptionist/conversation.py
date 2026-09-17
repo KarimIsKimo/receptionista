@@ -26,8 +26,8 @@ _CANCEL_WORDS = (
     "cancel",
 )
 _RESCHEDULE_PATTERNS = (
-    r"(?:أ?غير|تغيير)\s+(?:الموعد|موعدي|الحجز|حجزي)",
-    r"(?:عايز|عايزة|محتاج|محتاجة)\s+(?:أ?غير|تغيير)",
+    r"(?:[اأ]?غير|تغيير)\s+(?:الموعد|موعدي|الحجز|حجزي)",
+    r"(?:عايز|عايزة|محتاج|محتاجة)\s+(?:[اأ]?غير|تغيير)",
     r"\b(?:reschedule|change\s+(?:my\s+)?appointment)\b",
 )
 _EXISTING_APPOINTMENT_PATTERNS = (
@@ -101,8 +101,18 @@ _AREA_PATTERNS = (
     ("رقبة", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:رقب[هة]|neck)(?![\w\u0600-\u06FF])"),
     ("صدر", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:صدر|chest)(?![\w\u0600-\u06FF])"),
     ("ظهر", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:ظهر|back)(?![\w\u0600-\u06FF])"),
+    ("رجلين", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:رجلين|ساقين|legs?)(?![\w\u0600-\u06FF])"),
+    ("إيدين", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:[اأإ]يدين|ذراعين|arms?)(?![\w\u0600-\u06FF])"),
     ("ذقن", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:ذقن|beard)(?![\w\u0600-\u06FF])"),
     ("بوكسر", r"(?<![\w\u0600-\u06FF])(?:و\s*)?(?:بو[كک]سر|boxer)(?![\w\u0600-\u06FF])"),
+)
+_AREA_NEGATION_PATTERN = re.compile(
+    r"(?:^|\s)(?:بدون|من\s+غير|ما\s*عدا|except|without)(?:\s|$)",
+    re.IGNORECASE,
+)
+_DRAFT_CORRECTION_PATTERN = re.compile(
+    r"(?:^|\s)(?:قصدي|بدل|غيّر|غيري|خليها|خليه|change|instead)(?:\s|$)",
+    re.IGNORECASE,
 )
 _TRIVIAL_PHRASES = {
     "hi",
@@ -178,6 +188,10 @@ def should_extract_memory(message: str) -> bool:
 
 
 def _find_intent(text: str, current: dict[str, Any]) -> str:
+    return _find_explicit_intent(text) or str(current.get("intent") or "")
+
+
+def _find_explicit_intent(text: str) -> str:
     if any(re.search(pattern, text, re.IGNORECASE) for pattern in _RESCHEDULE_PATTERNS):
         return "reschedule"
     if any(word in text for word in _CANCEL_WORDS):
@@ -189,7 +203,7 @@ def _find_intent(text: str, current: dict[str, Any]) -> str:
         return "check_appointment"
     if any(re.search(pattern, text, re.IGNORECASE) for pattern in _BOOK_PATTERNS):
         return "book"
-    return str(current.get("intent") or "")
+    return ""
 
 
 def _find_name(message: str) -> str:
@@ -231,14 +245,36 @@ def _find_standalone_name(message: str) -> str:
 
 
 def _find_service(text: str) -> str:
-    """Return every recognized area in patient order without dropping later areas."""
-    matches: list[tuple[int, str]] = []
+    """Return an area only when every coordinated part can be represented."""
+    matches: list[tuple[int, int, str]] = []
     for canonical, pattern in _AREA_PATTERNS:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            matches.append((match.start(), canonical))
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            matches.append((match.start(), match.end(), canonical))
+    if not matches or _AREA_NEGATION_PATTERN.search(text):
+        return ""
+
+    spans = [(start, end) for start, end, _ in matches]
+
+    def begins_recognized_area(position: int) -> bool:
+        while position < len(text) and text[position].isspace():
+            position += 1
+        return any(start <= position < end for start, end in spans)
+
+    # A connector leading to anything outside the vocabulary means the patient
+    # requested more than the canonical result could retain. Returning blank is
+    # safer than silently booking only the recognized subset.
+    first_area_start = min(start for start, _, _ in matches)
+    for connector in re.finditer(r"\+|\band\b|(?:^|\s)و(?=\s*[\w\u0600-\u06FF])", text, re.IGNORECASE):
+        if connector.start() < first_area_start:
+            continue
+        connector_end = connector.end()
+        if connector.group(0).lstrip().startswith("و"):
+            connector_end = connector.start() + len(connector.group(0))
+        if not begins_recognized_area(connector_end):
+            return ""
+
     ordered: list[str] = []
-    for _, canonical in sorted(matches):
+    for _, _, canonical in sorted(matches):
         if canonical not in ordered:
             ordered.append(canonical)
     return " + ".join(ordered)
@@ -406,6 +442,7 @@ def evolve_booking_draft(
         return None, "clear"
 
     draft: dict[str, Any] = dict(current or {})
+    explicit_intent = _find_explicit_intent(lowered)
     intent = _find_intent(lowered, draft)
     if not intent:
         return None, "none"
@@ -427,7 +464,14 @@ def evolve_booking_draft(
             profile.get("name") or explicit_name or standalone_name
         ).strip()
     service = _find_service(lowered)
-    if service:
+    correction = bool(_DRAFT_CORRECTION_PATTERN.search(lowered))
+    new_booking_request = explicit_intent == "book"
+    if service and (
+        not draft.get("service_area")
+        or (current and current.get("stage") == "need_service")
+        or new_booking_request
+        or correction
+    ):
         draft["service_area"] = service
     if intent in {"check_appointment", "reschedule"}:
         # A reschedule sentence may contain both current and desired date/time;
@@ -440,15 +484,27 @@ def evolve_booking_draft(
     else:
         now = now or config.now()
         date = _find_date(lowered, now, config)
-        if date:
+        may_change_date = (
+            not draft.get("requested_date")
+            or (current and current.get("stage") == "need_date")
+            or new_booking_request
+            or correction
+        )
+        if date and may_change_date:
             draft["requested_date"] = date
-        elif _mentions_date(lowered):
+        elif _mentions_date(lowered) and may_change_date:
             draft["requested_date"] = ""
         active_booking = bool(current or intent)
         time = _find_time(lowered, active_booking=active_booking, config=config)
-        if time:
+        may_change_time = (
+            not draft.get("requested_time")
+            or (current and current.get("stage") == "need_time")
+            or new_booking_request
+            or correction
+        )
+        if time and may_change_time:
             draft["requested_time"] = time
-        elif _mentions_time(lowered, active_booking=active_booking):
+        elif _mentions_time(lowered, active_booking=active_booking) and may_change_time:
             draft["requested_time"] = ""
     draft["stage"] = _stage(draft)
     return {
