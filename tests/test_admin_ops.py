@@ -6,6 +6,7 @@ from receptionist.admin_ops import (
     AdminOperations,
     build_dashboard_metrics,
     classify_conversation_origin,
+    decode_inbox_cursor,
     sort_inbox_rows,
 )
 
@@ -84,6 +85,47 @@ class FakeDB:
                 raise RuntimeError("down")
             return {"ok": 1}
         raise AssertionError(f"Unexpected SQL: {sql}")
+
+
+class PaginatedInboxDB:
+    """In-memory model of the composite keyset query used by the inbox."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.update_rows = []
+        self.server_cursor = 500
+        self.calls = []
+
+    @staticmethod
+    def key(row):
+        return (
+            bool(row.get("is_pinned")),
+            row.get("last_message_at")
+            or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+            int(row.get("last_message_id") or 0),
+            str(row.get("phone_number") or ""),
+        )
+
+    def __call__(self, sql, params=(), fetchone=False, fetchall=False, commit=True):
+        self.calls.append((sql, params))
+        if "admin_inbox_cursor" in sql:
+            return {"server_cursor": self.server_cursor}
+        if "admin_inbox_updates" in sql:
+            return [dict(row) for row in self.update_rows[: params[-1]]]
+        if "admin_inbox" not in sql:
+            raise AssertionError(sql)
+
+        rows = sort_inbox_rows([dict(row) for row in self.rows])
+        if "-infinity'::timestamptz" in sql:
+            pinned, timestamp, message_id, phone = params[:4]
+            moment = (
+                dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                if timestamp is not None
+                else dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+            )
+            cursor_key = (pinned, moment, message_id, phone)
+            rows = [row for row in rows if self.key(row) < cursor_key]
+        return rows[: params[-1]]
 
 
 class AdminOperationsTests(unittest.TestCase):
@@ -180,6 +222,136 @@ class AdminOperationsTests(unittest.TestCase):
         self.assertIn("conversation_summaries", sql)
         self.assertNotIn("chat_history", sql)
         self.assertEqual(params, (40, 101))
+
+    def test_reopened_archived_conversation_is_exposed_incrementally(self):
+        self.db.update_rows = [{
+            "phone_number": "2010",
+            "last_message_id": 10,
+            "last_message_role": "user",
+            "last_message": "hello again",
+            "last_message_at": NOW,
+            "latest_patient_message_id": 10,
+            "latest_response_message_id": 9,
+            "unread_count": 1,
+            "is_archived": False,
+            "needs_reply": True,
+            "change_version": 42,
+            "first_message_role": "user",
+        }]
+
+        result = self.ops.inbox_updates(after_version=41)
+
+        self.assertTrue(result["ok"])
+        patient = result["data"]["patients"][0]
+        self.assertFalse(patient["is_archived"])
+        self.assertTrue(patient["needs_reply"])
+        self.assertEqual(patient["unread_count"], 1)
+        sql, _ = self.db.calls[-1]
+        self.assertNotIn("s.is_archived = FALSE", sql)
+
+    def test_composite_cursor_pages_pinned_and_recent_rows_without_gaps(self):
+        rows = [{
+            "phone_number": "pinned-old",
+            "last_message_id": 100,
+            "last_message_at": NOW - dt.timedelta(days=30),
+            "last_message_role": "staff",
+            "is_pinned": True,
+            "is_archived": False,
+            "change_version": 1,
+        }]
+        rows.extend({
+            "phone_number": f"recent-{index:02d}",
+            "last_message_id": 1000 + index,
+            "last_message_at": NOW - dt.timedelta(minutes=index),
+            "last_message_role": "user",
+            "is_pinned": False,
+            "is_archived": False,
+            "change_version": index + 1,
+        } for index in range(60))
+        db = PaginatedInboxDB(rows)
+        ops = AdminOperations(db, self.booking, now_func=lambda: NOW)
+
+        first = ops.inbox(limit=50)
+        cursor = first["data"]["next_cursor"]
+        second = ops.inbox(limit=50, before=cursor)
+        phones = [
+            row["phone_number"]
+            for page in (first, second)
+            for row in page["data"]["patients"]
+        ]
+
+        self.assertEqual(phones[0], "pinned-old")
+        self.assertEqual(len(phones), 61)
+        self.assertEqual(len(set(phones)), 61)
+        self.assertEqual(set(phones), {row["phone_number"] for row in rows})
+        self.assertFalse(second["data"]["has_more"])
+        pinned, _, _, _ = decode_inbox_cursor(cursor)
+        self.assertFalse(pinned)
+        second_sql, _ = next(
+            (sql, params)
+            for sql, params in reversed(db.calls)
+            if "/* admin_inbox */" in sql
+        )
+        self.assertIn("s.is_pinned", second_sql)
+        self.assertIn("s.last_message_at", second_sql)
+        self.assertIn("s.last_message_id", second_sql)
+        self.assertIn("s.phone_number", second_sql)
+
+    def test_pin_changes_between_pages_are_deduplicated_via_incremental_rows(self):
+        rows = [{
+            "phone_number": "pinned-old",
+            "last_message_id": 100,
+            "last_message_at": NOW - dt.timedelta(days=30),
+            "last_message_role": "staff",
+            "is_pinned": True,
+            "is_archived": False,
+            "change_version": 1,
+        }]
+        rows.extend({
+            "phone_number": f"recent-{index:02d}",
+            "last_message_id": 1000 + index,
+            "last_message_at": NOW - dt.timedelta(minutes=index),
+            "last_message_role": "user",
+            "is_pinned": False,
+            "is_archived": False,
+            "change_version": index + 1,
+        } for index in range(60))
+        db = PaginatedInboxDB(rows)
+        ops = AdminOperations(db, self.booking, now_func=lambda: NOW)
+        first = ops.inbox(limit=50)
+        cursor = first["data"]["next_cursor"]
+        first_phones = {
+            row["phone_number"] for row in first["data"]["patients"]
+        }
+
+        old_pinned = next(row for row in rows if row["phone_number"] == "pinned-old")
+        newly_pinned = next(
+            row for row in rows if row["phone_number"] not in first_phones
+        )
+        old_pinned["is_pinned"] = False
+        old_pinned["change_version"] = 600
+        newly_pinned["is_pinned"] = True
+        newly_pinned["change_version"] = 601
+        db.update_rows = [old_pinned, newly_pinned]
+        updates = ops.inbox_updates(after_version=500)
+        second = ops.inbox(limit=50, before=cursor)
+
+        client_rows = {}
+        for response in (first, updates, second):
+            for row in response["data"]["patients"]:
+                client_rows[row["phone_number"]] = row
+
+        self.assertEqual(set(client_rows), {row["phone_number"] for row in rows})
+        self.assertEqual(len(client_rows), 61)
+        self.assertFalse(client_rows["pinned-old"]["is_pinned"])
+        self.assertTrue(client_rows[newly_pinned["phone_number"]]["is_pinned"])
+
+    def test_malformed_composite_cursor_is_rejected(self):
+        for cursor in ("not-a-valid-cursor", "%%%%"):
+            with self.subTest(cursor=cursor):
+                result = self.ops.inbox(before=cursor)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["code"], "invalid_cursor")
 
     def test_needs_reply_filter_is_distinct_from_unread(self):
         self.ops.inbox(state="needs_reply")
