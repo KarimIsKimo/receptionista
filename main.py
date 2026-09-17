@@ -121,11 +121,15 @@ DB_POOL_MAX_CONNECTIONS = int(
     bounded_env_float("DB_POOL_MAX_CONNECTIONS", 4.0, 2.0, 8.0)
 )
 DB_POOL_MAX_CONNECTIONS = max(DB_POOL_MIN_CONNECTIONS, DB_POOL_MAX_CONNECTIONS)
+DB_POOL_ACQUIRE_TIMEOUT_SECONDS = bounded_env_float(
+    "DB_POOL_ACQUIRE_TIMEOUT_SECONDS", 5.0, 0.1, 30.0
+)
 
 database_pool = DatabasePool(
     DATABASE_URL,
     min_connections=DB_POOL_MIN_CONNECTIONS,
     max_connections=DB_POOL_MAX_CONNECTIONS,
+    acquire_timeout=DB_POOL_ACQUIRE_TIMEOUT_SECONDS,
     connect_kwargs={
         "sslmode": "require",
         "connect_timeout": 10,
@@ -838,6 +842,9 @@ def update_conversation_summary_for_message(cur, phone: str, message: dict) -> N
                 ELSE conversation_summaries.latest_response_at END,
             unread_count=conversation_summaries.unread_count +
                 CASE WHEN EXCLUDED.last_message_role='user' THEN 1 ELSE 0 END,
+            is_archived=CASE
+                WHEN EXCLUDED.last_message_role='user' THEN FALSE
+                ELSE conversation_summaries.is_archived END,
             change_version=nextval('conversation_summary_change_seq'),
             updated_at=NOW()
         """,
@@ -2356,13 +2363,14 @@ def api_inbox(
     search: str = Query("", max_length=100),
     state: str = Query("all", max_length=30),
     limit: int = Query(50, ge=1, le=100),
+    before: str | None = Query(None, max_length=512),
     before_id: int | None = Query(None, ge=1),
     after_id: int | None = Query(None, ge=0),
     admin: str = Depends(verify_admin),
 ):
     return admin_operations.inbox(
         search=search, state=state, limit=limit,
-        before_id=before_id, after_id=after_id,
+        before=before, before_id=before_id, after_id=after_id,
     )
 
 @app.get("/admin/api/inbox/updates")
