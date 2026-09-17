@@ -24,6 +24,11 @@ from google.genai import types
 from receptionist.admin_ops import AdminOperations, failure, success
 from receptionist.booking import BookingService, normalize_time
 from receptionist.clinic import CLINIC, clinic_prompt
+from receptionist.conversation import (
+    combine_inbound_messages,
+    evolve_booking_draft,
+    should_extract_memory,
+)
 from receptionist.dates import parse_date_expression
 
 # ============================================================
@@ -93,6 +98,22 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
 STAFF_NOTIFICATION_PHONE = os.getenv(
     "STAFF_NOTIFICATION_PHONE", "201026438897"
 ).strip()
+
+def bounded_env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        return max(minimum, min(float(os.getenv(name, str(default))), maximum))
+    except (TypeError, ValueError):
+        return default
+
+MESSAGE_DEBOUNCE_SECONDS = bounded_env_float(
+    "MESSAGE_DEBOUNCE_SECONDS", 3.0, 0.25, 15.0
+)
+MESSAGE_PROCESSING_LEASE_SECONDS = bounded_env_float(
+    "MESSAGE_PROCESSING_LEASE_SECONDS", 300.0, 30.0, 900.0
+)
+BOOKING_DRAFT_TIMEOUT_MINUTES = int(
+    bounded_env_float("BOOKING_DRAFT_TIMEOUT_MINUTES", 30.0, 5.0, 240.0)
+)
 
 # Existing deployment flag is retained for compatibility.
 ENABLE_REAL_CLINIC = os.getenv("ENABLE_REAL_CLINIC", "true").strip().lower() in {
@@ -195,13 +216,15 @@ DEFAULT_SYSTEM_INSTRUCTION = """<role_definition>
 async def lifespan(app: FastAPI):
     init_db()
     cleanup_task = asyncio.create_task(cleanup_locks())
+    queue_task = asyncio.create_task(pending_queue_worker())
     log.info("Jothen receptionist started")
     try:
         yield
     finally:
         cleanup_task.cancel()
+        queue_task.cancel()
         try:
-            await cleanup_task
+            await asyncio.gather(cleanup_task, queue_task)
         except asyncio.CancelledError:
             pass
         log.info("Jothen receptionist stopped")
@@ -289,6 +312,51 @@ def init_db():
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS inbound_message_queue (
+            message_id TEXT PRIMARY KEY,
+            phone_number VARCHAR(30) NOT NULL,
+            chat_history_id BIGINT NOT NULL UNIQUE REFERENCES chat_history(id) ON DELETE CASCADE,
+            phone_number_id TEXT NOT NULL,
+            received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            processing_started_at TIMESTAMPTZ,
+            side_effects_started_at TIMESTAMPTZ,
+            side_effects_completed_at TIMESTAMPTZ,
+            recovery_state VARCHAR(40),
+            processed_at TIMESTAMPTZ
+        )
+        """,
+        """
+        ALTER TABLE inbound_message_queue
+        ADD COLUMN IF NOT EXISTS side_effects_started_at TIMESTAMPTZ
+        """,
+        """
+        ALTER TABLE inbound_message_queue
+        ADD COLUMN IF NOT EXISTS side_effects_completed_at TIMESTAMPTZ
+        """,
+        """
+        ALTER TABLE inbound_message_queue
+        ADD COLUMN IF NOT EXISTS recovery_state VARCHAR(40)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS conversation_processing_leases (
+            phone_number VARCHAR(30) PRIMARY KEY,
+            owner_token TEXT NOT NULL,
+            lease_until TIMESTAMPTZ NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS booking_drafts (
+            phone_number VARCHAR(30) PRIMARY KEY,
+            intent VARCHAR(30) NOT NULL DEFAULT '',
+            patient_name TEXT NOT NULL DEFAULT '',
+            service_area TEXT NOT NULL DEFAULT '',
+            requested_date TEXT NOT NULL DEFAULT '',
+            requested_time TEXT NOT NULL DEFAULT '',
+            stage VARCHAR(40) NOT NULL DEFAULT 'idle',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS audit_log (
             id BIGSERIAL PRIMARY KEY,
             actor TEXT NOT NULL,
@@ -317,6 +385,11 @@ def init_db():
         """
         CREATE INDEX IF NOT EXISTS idx_chat_phone_created
         ON chat_history(phone_number, created_at, id)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_inbound_queue_pending
+        ON inbound_message_queue(phone_number, received_at, chat_history_id)
+        WHERE processed_at IS NULL
         """,
         """
         CREATE INDEX IF NOT EXISTS idx_patients_updated
@@ -568,28 +641,86 @@ def save_chat_turn(
         fetchone=True,
     )
 
-def load_chat_history(phone_number: str, limit: int = 12):
+def history_content(role: str, content: str) -> types.Content:
+    """Represent non-AI records without attributing them to the Gemini model."""
+    if role == "model":
+        gemini_role = "model"
+        text = content
+    elif role == "staff":
+        gemini_role = "user"
+        text = f"[سياق: هذه رسالة أرسلها موظف استقبال بشري للمريض، وليست رسالة من المريض]\n{content}"
+    elif role == "system":
+        gemini_role = "user"
+        text = f"[سجل نظام داخلي/خطأ؛ لم يقله المريض ولا موظف الذكاء الاصطناعي]\n{content}"
+    else:
+        gemini_role = "user"
+        text = content
+    return types.Content(
+        role=gemini_role,
+        parts=[types.Part.from_text(text=text)],
+    )
+
+def normalize_gemini_history(history: list[types.Content]) -> list[types.Content]:
+    """Return chronological, alternating Gemini turns beginning with a user."""
+    normalized: list[types.Content] = []
+    for content in history:
+        role = content.role
+        text = "\n".join(
+            str(part.text)
+            for part in (content.parts or [])
+            if getattr(part, "text", None) is not None
+        ).strip()
+        if role not in {"user", "model"} or not text:
+            continue
+        if not normalized and role != "user":
+            # A LIMIT window may cut off the user turn that preceded this model
+            # response. Do not give Gemini an orphaned assistant statement.
+            continue
+        if normalized and normalized[-1].role == role:
+            previous = "\n".join(
+                str(part.text)
+                for part in (normalized[-1].parts or [])
+                if getattr(part, "text", None) is not None
+            ).strip()
+            normalized[-1] = types.Content(
+                role=role,
+                parts=[types.Part.from_text(text=f"{previous}\n\n{text}")],
+            )
+        else:
+            normalized.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=text)],
+                )
+            )
+    return normalized
+
+def load_chat_history(
+    phone_number: str,
+    limit: int = 12,
+    *,
+    before_id: int | None = None,
+):
+    params: list = [normalize_phone(phone_number)]
+    before_sql = ""
+    if before_id is not None:
+        before_sql = " AND id < %s"
+        params.append(int(before_id))
+    params.append(max(1, min(limit, 50)))
     rows = db_execute(
-        """
+        f"""
         SELECT role, content
         FROM chat_history
         WHERE phone_number=%s
+        {before_sql}
         ORDER BY id DESC
         LIMIT %s
         """,
-        (normalize_phone(phone_number), max(1, min(limit, 50))),
+        tuple(params),
         fetchall=True,
     )
-    history = []
-    for row in reversed(rows):
-        role = "user" if row["role"] == "user" else "model"
-        history.append(
-            types.Content(
-                role=role,
-                parts=[types.Part.from_text(text=row["content"])],
-            )
-        )
-    return history
+    history = [history_content(row["role"], row["content"]) for row in reversed(rows)]
+    return normalize_gemini_history(history)
 
 def load_recent_memory_conversation(phone_number: str, limit: int = 20) -> list[dict]:
     """Load recent human-visible turns without converting staff messages to AI."""
@@ -609,6 +740,336 @@ def load_recent_memory_conversation(phone_number: str, limit: int = 20) -> list[
         {"role": row["role"], "content": row["content"]}
         for row in reversed(rows)
     ]
+
+def persist_incoming_message(
+    phone_number: str,
+    content: str,
+    message_id: str,
+    phone_number_id: str,
+    *,
+    enqueue: bool = True,
+) -> dict | None:
+    """Atomically deduplicate, persist, and optionally queue an inbound message."""
+    phone = normalize_phone(phone_number)
+    if not message_id or not phone or not content:
+        return None
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO processed_messages(message_id)
+                VALUES (%s)
+                ON CONFLICT(message_id) DO NOTHING
+                RETURNING message_id
+                """,
+                (message_id,),
+            )
+            if cur.fetchone() is None:
+                conn.commit()
+                return None
+            cur.execute(
+                """
+                INSERT INTO chat_history(phone_number, role, content, whatsapp_message_id)
+                VALUES (%s,'user',%s,%s)
+                RETURNING id, role, content, whatsapp_message_id, created_at
+                """,
+                (phone, content, message_id),
+            )
+            saved = dict(cur.fetchone())
+            if enqueue:
+                cur.execute(
+                    """
+                    INSERT INTO inbound_message_queue(
+                        message_id, phone_number, chat_history_id, phone_number_id
+                    ) VALUES (%s,%s,%s,%s)
+                    """,
+                    (message_id, phone, saved["id"], phone_number_id),
+                )
+        conn.commit()
+    return saved
+
+def load_booking_draft(phone_number: str) -> dict | None:
+    phone = normalize_phone(phone_number)
+    row = db_execute(
+        """
+        SELECT phone_number,intent,patient_name,service_area,requested_date,
+               requested_time,stage,updated_at
+        FROM booking_drafts
+        WHERE phone_number=%s
+        """,
+        (phone,),
+        fetchone=True,
+    )
+    if not row:
+        return None
+    draft = dict(row)
+    updated_at = draft.get("updated_at")
+    if isinstance(updated_at, str):
+        try:
+            updated_at = dt.datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except ValueError:
+            updated_at = None
+    if isinstance(updated_at, dt.datetime):
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=dt.timezone.utc)
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+            minutes=BOOKING_DRAFT_TIMEOUT_MINUTES
+        )
+        if updated_at.astimezone(dt.timezone.utc) < cutoff:
+            clear_booking_draft(phone, "timeout")
+            return None
+    return draft
+
+def save_booking_draft(phone_number: str, draft: dict) -> dict:
+    phone = normalize_phone(phone_number)
+    clean = {
+        key: str(draft.get(key) or "").strip()
+        for key in (
+            "intent",
+            "patient_name",
+            "service_area",
+            "requested_date",
+            "requested_time",
+            "stage",
+        )
+    }
+    db_execute(
+        """
+        INSERT INTO booking_drafts(
+            phone_number,intent,patient_name,service_area,requested_date,
+            requested_time,stage,updated_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT(phone_number) DO UPDATE SET
+            intent=EXCLUDED.intent,
+            patient_name=EXCLUDED.patient_name,
+            service_area=EXCLUDED.service_area,
+            requested_date=EXCLUDED.requested_date,
+            requested_time=EXCLUDED.requested_time,
+            stage=EXCLUDED.stage,
+            updated_at=NOW()
+        """,
+        (
+            phone,
+            clean["intent"],
+            clean["patient_name"],
+            clean["service_area"],
+            clean["requested_date"],
+            clean["requested_time"],
+            clean["stage"],
+        ),
+    )
+    return {"phone_number": phone, **clean}
+
+def clear_booking_draft(phone_number: str, reason: str = "cleared") -> None:
+    phone = normalize_phone(phone_number)
+    db_execute("DELETE FROM booking_drafts WHERE phone_number=%s", (phone,))
+    audit("bot", "booking_draft_cleared", phone, reason)
+
+def update_booking_draft_from_message(
+    phone_number: str,
+    message: str,
+    profile: dict,
+) -> dict | None:
+    current = load_booking_draft(phone_number)
+    draft, action = evolve_booking_draft(current, message, profile, now=CLINIC.now())
+    if action == "clear":
+        clear_booking_draft(phone_number, "abandoned")
+        return None
+    if action == "upsert" and draft:
+        return save_booking_draft(phone_number, draft)
+    return current
+
+def acquire_processing_lease(phone_number: str, owner_token: str) -> bool:
+    row = db_execute(
+        """
+        INSERT INTO conversation_processing_leases(phone_number,owner_token,lease_until)
+        VALUES (%s,%s,NOW() + (%s * INTERVAL '1 second'))
+        ON CONFLICT(phone_number) DO UPDATE SET
+            owner_token=EXCLUDED.owner_token,
+            lease_until=EXCLUDED.lease_until
+        WHERE conversation_processing_leases.lease_until < NOW()
+        RETURNING owner_token
+        """,
+        (
+            normalize_phone(phone_number),
+            owner_token,
+            MESSAGE_PROCESSING_LEASE_SECONDS,
+        ),
+        fetchone=True,
+    )
+    return bool(row and row.get("owner_token") == owner_token)
+
+def refresh_processing_lease(phone_number: str, owner_token: str) -> bool:
+    row = db_execute(
+        """
+        UPDATE conversation_processing_leases
+        SET lease_until=NOW() + (%s * INTERVAL '1 second')
+        WHERE phone_number=%s AND owner_token=%s
+        RETURNING owner_token
+        """,
+        (
+            MESSAGE_PROCESSING_LEASE_SECONDS,
+            normalize_phone(phone_number),
+            owner_token,
+        ),
+        fetchone=True,
+    )
+    return bool(row)
+
+def release_processing_lease(phone_number: str, owner_token: str) -> None:
+    db_execute(
+        """
+        DELETE FROM conversation_processing_leases
+        WHERE phone_number=%s AND owner_token=%s
+        """,
+        (normalize_phone(phone_number), owner_token),
+    )
+
+def pending_batch_delay(phone_number: str) -> float | None:
+    row = db_execute(
+        """
+        SELECT MAX(received_at) AS latest_received_at
+        FROM inbound_message_queue
+        WHERE phone_number=%s AND processed_at IS NULL
+        """,
+        (normalize_phone(phone_number),),
+        fetchone=True,
+    )
+    latest = row.get("latest_received_at") if row else None
+    if not latest:
+        return None
+    if isinstance(latest, str):
+        latest = dt.datetime.fromisoformat(latest.replace("Z", "+00:00"))
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=dt.timezone.utc)
+    ready_at = latest.astimezone(dt.timezone.utc) + dt.timedelta(
+        seconds=MESSAGE_DEBOUNCE_SECONDS
+    )
+    return max(0.0, (ready_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
+
+def claim_pending_batch(phone_number: str) -> list[dict]:
+    rows = db_execute(
+        """
+        WITH claimed AS (
+            UPDATE inbound_message_queue
+            SET processing_started_at=NOW()
+            WHERE phone_number=%s AND processed_at IS NULL
+            RETURNING message_id,phone_number,chat_history_id,phone_number_id,
+                      received_at,side_effects_started_at,
+                      side_effects_completed_at,recovery_state
+        )
+        SELECT claimed.message_id,claimed.phone_number,claimed.chat_history_id,
+               claimed.phone_number_id,claimed.received_at,
+               claimed.side_effects_started_at,
+               claimed.side_effects_completed_at,claimed.recovery_state,
+               history.content
+        FROM claimed
+        JOIN chat_history history ON history.id=claimed.chat_history_id
+        ORDER BY claimed.chat_history_id ASC
+        """,
+        (normalize_phone(phone_number),),
+        fetchall=True,
+    )
+    return [dict(row) for row in rows]
+
+def reserve_pending_batch_side_effects(messages: list[dict]) -> bool:
+    """Durably mark a batch before Gemini/tools/WhatsApp can cause side effects."""
+    ids = [message["message_id"] for message in messages if message.get("message_id")]
+    if not ids:
+        return False
+    rows = db_execute(
+        """
+        UPDATE inbound_message_queue
+        SET side_effects_started_at=NOW(), recovery_state='in_progress'
+        WHERE message_id=ANY(%s::text[])
+          AND processed_at IS NULL
+          AND side_effects_started_at IS NULL
+        RETURNING message_id
+        """,
+        (ids,),
+        fetchall=True,
+    )
+    return len(rows or []) == len(ids)
+
+def mark_pending_batch_processed(messages: list[dict]) -> None:
+    """Atomically record that the reserved batch finished in this process."""
+    ids = [message["message_id"] for message in messages if message.get("message_id")]
+    if ids:
+        db_execute(
+            """
+            UPDATE inbound_message_queue
+            SET side_effects_completed_at=NOW(),
+                recovery_state='completed',
+                processed_at=NOW()
+            WHERE message_id=ANY(%s::text[])
+              AND side_effects_started_at IS NOT NULL
+            """,
+            (ids,),
+        )
+
+def suppress_uncertain_pending_batch(messages: list[dict]) -> int:
+    """Quarantine a recovered batch whose external effects may have happened.
+
+    Apps Script and Meta do not share a transaction with Postgres. Once the
+    durable pre-effect marker exists, replaying Gemini could duplicate a booking,
+    cancellation, reschedule, or patient reply. Recovery therefore favors
+    at-most-once external effects and leaves a visible system record for staff.
+    """
+    ids = [message["message_id"] for message in messages if message.get("message_id")]
+    if not ids:
+        return 0
+    phone = normalize_phone(str(messages[0].get("phone_number") or ""))
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                UPDATE inbound_message_queue
+                SET recovery_state='suppressed_uncertain', processed_at=NOW()
+                WHERE message_id=ANY(%s::text[])
+                  AND processed_at IS NULL
+                  AND side_effects_started_at IS NOT NULL
+                  AND side_effects_completed_at IS NULL
+                RETURNING message_id
+                """,
+                (ids,),
+            )
+            suppressed = cur.fetchall()
+            if suppressed:
+                details = ",".join(row["message_id"] for row in suppressed)[:1000]
+                cur.execute(
+                    """
+                    INSERT INTO chat_history(phone_number,role,content)
+                    VALUES (%s,'system',%s)
+                    """,
+                    (
+                        phone,
+                        "تم إيقاف إعادة تنفيذ دفعة رسائل بعد انقطاع غير مؤكد لتجنب تكرار رد أو تغيير موعد. يلزم مراجعة المحادثة يدوياً.",
+                    ),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO audit_log(actor,action,phone_number,details)
+                    VALUES ('system','inbound_recovery_suppressed',%s,%s)
+                    """,
+                    (phone, details),
+                )
+        conn.commit()
+    return len(suppressed)
+
+def list_pending_phones() -> list[str]:
+    rows = db_execute(
+        """
+        SELECT DISTINCT queue.phone_number
+        FROM inbound_message_queue queue
+        LEFT JOIN conversation_processing_leases lease
+          ON lease.phone_number=queue.phone_number AND lease.lease_until >= NOW()
+        WHERE queue.processed_at IS NULL AND lease.phone_number IS NULL
+        ORDER BY queue.phone_number
+        LIMIT 50
+        """,
+        fetchall=True,
+    )
+    return [row["phone_number"] for row in rows]
 
 # Atomic idempotency: INSERT succeeds for exactly one worker.
 def claim_message(message_id: str) -> bool:
@@ -841,10 +1302,26 @@ except Exception:
 
 admin_operations = AdminOperations(db_execute, booking_service, config=CLINIC)
 
-def build_system_instruction(profile: dict, phone: str) -> str:
+def build_system_instruction(
+    profile: dict,
+    phone: str,
+    booking_draft: dict | None = None,
+) -> str:
     now = dt.datetime.now(CAIRO)
     days = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
     today = f"{now.strftime('%Y-%m-%d')} (اليوم هو: {days[now.weekday()]})"
+
+    draft_context = {
+        key: str((booking_draft or {}).get(key) or "")
+        for key in (
+            "intent",
+            "patient_name",
+            "service_area",
+            "requested_date",
+            "requested_time",
+            "stage",
+        )
+    }
 
     return f"""
 {get_live_instructions()}
@@ -857,6 +1334,21 @@ def build_system_instruction(profile: dict, phone: str) -> str:
 - العلامات: {', '.join(profile.get('tags') or []) or 'لا يوجد'}
 - رقم الهاتف: {phone}
 - التاريخ والوقت الحالي في القاهرة: {today} {now.strftime('%I:%M %p')}
+
+=== مسودة الحجز المحفوظة ===
+{json.dumps(draft_context, ensure_ascii=False)}
+- القيم غير الفارغة هنا لا تُسجل إلا عندما يستطيع المحلل الحتمي استخراجها
+  بشكل صريح ومحافظ ومن دون إسقاط جزء من كلام المريضة.
+- هذه القيم سياق منظم وليست تأكيداً أن حجزاً تم. تأكيد التنفيذ يأتي فقط من
+  نتيجة أداة الحجز المناسبة عندما تكون ok=true.
+- لا تسألي مرة أخرى عن قيمة غير فارغة إلا إذا ناقضتها الرسالة الحالية بوضوح.
+- القيمة الفارغة تعني أن المحلل لم يكن واثقاً؛ افهمي الرسالة الحالية أو اطلبي
+  توضيحاً ولا تخمني.
+- إذا كان intent=check_appointment فاستخدمي check_my_appointments ولا تنشئي
+  حجزاً جديداً.
+- إذا كان intent=reschedule فلا تعتبري requested_date/requested_time موعداً
+  جديداً؛ ميزي الموعد القديم والجديد صراحة من كلام المريضة ونتائج الأدوات.
+- إذا كانت الرسالة الحالية جزءاً قصيراً مثل "7"، استخدميها مع مرحلة المسودة لفهمها.
 
 === قواعد الأمان للحجز ===
 - لا تخترعي توفر موعد.
@@ -949,13 +1441,20 @@ async def update_patient_memory(phone: str, profile: dict) -> dict:
         log.exception("Patient memory extraction failed for %s", phone)
         return profile
 
-def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
+def generate_ai_reply_sync(
+    phone: str,
+    user_message: str,
+    profile: dict,
+    *,
+    history_before_id: int | None = None,
+    booking_draft: dict | None = None,
+):
     if gemini_client is None:
         return "أهلاً بحضرتك يا فندم 🌸 حصل عطل مؤقت. برجاء المحاولة بعد قليل.", []
 
     queued_images = []
 
-    def send_clinic_media(media_types: list[str]) -> str:
+    def send_clinic_media(media_types: list[str]) -> dict:
         valid = [m for m in media_types if m in OFFER_IMAGES]
         for m in valid:
             if OFFER_IMAGES[m] not in queued_images:
@@ -966,7 +1465,7 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
             "media": valid,
         }
 
-    def notify_staff_tool(issue_summary: str) -> str:
+    def notify_staff_tool(issue_summary: str) -> dict:
         # Tool functions are synchronous because Gemini tool execution is synchronous.
         try:
             if STAFF_NOTIFICATION_PHONE:
@@ -1003,7 +1502,12 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
 
     def cancel_my_appointment(date: str, time: str) -> dict:
         """Cancel the current patient's exact appointment using its date and time."""
-        return cancel_appointment(phone, date, time)
+        nonlocal booking_draft
+        outcome = cancel_appointment(phone, date, time)
+        if outcome.get("ok") is True:
+            clear_booking_draft(phone, "cancelled")
+            booking_draft = None
+        return outcome
 
     def reschedule_my_appointment(
         old_date: str,
@@ -1012,16 +1516,60 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
         new_time: str,
     ) -> dict:
         """Reschedule the current patient's exact booking without requesting a phone."""
-        return reschedule_appointment(phone, old_date, new_date, new_time, old_time)
+        nonlocal booking_draft
+        outcome = reschedule_appointment(phone, old_date, new_date, new_time, old_time)
+        if outcome.get("ok") is True:
+            clear_booking_draft(phone, "rescheduled")
+            booking_draft = None
+        return outcome
 
     def book_my_appointment(
-        patient_name: str,
-        date: str,
-        time: str,
-        area: str,
+        patient_name: str = "",
+        date: str = "",
+        time: str = "",
+        area: str = "",
     ) -> dict:
         """Book the current WhatsApp patient; their phone is already known."""
-        return book_appointment(patient_name, phone, date, time, area)
+        nonlocal booking_draft
+        draft = dict(booking_draft or {})
+        values = {
+            "patient_name": patient_name.strip()
+            or str(draft.get("patient_name") or profile.get("name") or "").strip(),
+            "date": date.strip() or str(draft.get("requested_date") or "").strip(),
+            "time": time.strip() or str(draft.get("requested_time") or "").strip(),
+            "area": area.strip() or str(draft.get("service_area") or "").strip(),
+        }
+        missing = [key for key, value in values.items() if not value]
+        if missing:
+            return {
+                "ok": False,
+                "code": "missing_booking_fields",
+                "message": "بيانات الحجز غير مكتملة.",
+                "missing": missing,
+            }
+        outcome = book_appointment(
+            values["patient_name"],
+            phone,
+            values["date"],
+            values["time"],
+            values["area"],
+        )
+        if outcome.get("ok") is True:
+            clear_booking_draft(phone, "booked")
+            booking_draft = None
+        elif outcome.get("code") == "slot_unavailable":
+            draft.update(
+                {
+                    "patient_name": values["patient_name"],
+                    "requested_date": values["date"],
+                    "requested_time": "",
+                    "service_area": values["area"],
+                    "intent": "book",
+                    "stage": "need_time",
+                }
+            )
+            booking_draft = save_booking_draft(phone, draft)
+        return outcome
 
     def remember_patient_details(
         patient_name: str = "",
@@ -1033,9 +1581,15 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
     try:
         chat = gemini_client.chats.create(
             model=GEMINI_MODEL,
-            history=load_chat_history(phone, 12),
+            # The inbound turn has already been persisted. Exclude the complete
+            # current burst and then pass its combined text exactly once below.
+            history=load_chat_history(phone, 12, before_id=history_before_id),
             config=types.GenerateContentConfig(
-                system_instruction=build_system_instruction(profile, phone),
+                system_instruction=build_system_instruction(
+                    profile,
+                    phone,
+                    booking_draft,
+                ),
                 temperature=0.1,
                 tools=[
                     check_schedule,
@@ -1055,12 +1609,180 @@ def generate_ai_reply_sync(phone: str, user_message: str, profile: dict):
         log.exception("Gemini generation failed")
         return "حصل عطل مؤقت في خدمة الرد. حاولي تبعتي رسالتك مرة تانية بعد شوية، ومفيش أي حجز اتأكد من الرسالة دي.", []
 
-async def generate_ai_reply(phone: str, message: str, profile: dict):
-    return await asyncio.to_thread(generate_ai_reply_sync, phone, message, profile)
+async def generate_ai_reply(
+    phone: str,
+    message: str,
+    profile: dict,
+    *,
+    history_before_id: int | None = None,
+    booking_draft: dict | None = None,
+):
+    return await asyncio.to_thread(
+        generate_ai_reply_sync,
+        phone,
+        message,
+        profile,
+        history_before_id=history_before_id,
+        booking_draft=booking_draft,
+    )
 
 # ------------------------------------------------------------
 # Conversation handling
 # ------------------------------------------------------------
+
+async def process_conversation_batch(
+    sender_phone: str,
+    messages: list[dict],
+    phone_number_id: str,
+) -> None:
+    """Process one ordered, persisted burst as a single receptionist turn."""
+    sender_phone = normalize_phone(sender_phone)
+    user_text = combine_inbound_messages(messages)
+    if not user_text:
+        return
+    history_ids = [
+        int(message["chat_history_id"])
+        for message in messages
+        if message.get("chat_history_id") is not None
+    ]
+    history_before_id = min(history_ids) if history_ids else None
+
+    try:
+        profile = load_patient_profile(sender_phone)
+        try:
+            booking_draft = update_booking_draft_from_message(
+                sender_phone,
+                user_text,
+                profile,
+            )
+        except Exception:
+            # Draft state improves determinism but must not become a new single
+            # point of failure for ordinary reception conversations.
+            log.exception("Booking draft update failed for %s", sender_phone)
+            booking_draft = None
+        # Memory learning deliberately occurs before both global and per-patient
+        # pause checks so human-takeover conversations can still teach the CRM.
+        if should_extract_memory(user_text):
+            profile = await update_patient_memory(sender_phone, profile)
+        if not ENABLE_REAL_CLINIC or not is_bot_globally_active():
+            log.info("Bot replies disabled; stored message from %s", sender_phone)
+            return
+    except Exception:
+        log.exception("Postgres unavailable while starting conversation")
+        await send_whatsapp_message(
+            sender_phone,
+            "حصل عطل مؤقت في النظام ومفيش أي حجز اتأكد. حاولي مرة تانية بعد شوية.",
+            phone_number_id,
+        )
+        return
+
+    if profile.get("is_paused"):
+        log.info("Human takeover active for %s", sender_phone)
+        return
+
+    response_text, images = await generate_ai_reply(
+        sender_phone,
+        user_text,
+        profile,
+        history_before_id=history_before_id,
+        booking_draft=booking_draft,
+    )
+
+    for clinic_image in images:
+        if not await send_whatsapp_image(sender_phone, clinic_image, phone_number_id):
+            audit("system", "whatsapp_image_failed", sender_phone, clinic_image.get("url", ""))
+            save_chat_turn(sender_phone, "system", "فشل إرسال صورة العيادة عبر واتساب.")
+
+    if response_text:
+        delivery = await send_whatsapp_message(sender_phone, response_text, phone_number_id)
+        if delivery.get("ok") is True:
+            try:
+                save_chat_turn(
+                    sender_phone,
+                    "model",
+                    response_text,
+                    delivery.get("message_id"),
+                )
+            except Exception:
+                log.exception("Reply sent but chat persistence failed")
+        else:
+            audit("system", "whatsapp_send_failed", sender_phone, response_text[:500])
+            save_chat_turn(
+                sender_phone,
+                "system",
+                "لم يؤكد واتساب استلام رد الذكاء الاصطناعي.",
+            )
+
+
+async def process_pending_inbound(phone_number: str) -> None:
+    """Debounce and process a phone's queue under a cross-worker DB lease."""
+    phone = normalize_phone(phone_number)
+    owner_token = secrets.token_urlsafe(24)
+    try:
+        acquired = await asyncio.to_thread(acquire_processing_lease, phone, owner_token)
+    except Exception:
+        log.exception("Could not acquire conversation lease for %s", phone)
+        return
+    if not acquired:
+        return
+    try:
+        while True:
+            delay = await asyncio.to_thread(pending_batch_delay, phone)
+            if delay is None:
+                return
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+            if not await asyncio.to_thread(refresh_processing_lease, phone, owner_token):
+                log.warning("Conversation lease expired before processing %s", phone)
+                return
+            messages = await asyncio.to_thread(claim_pending_batch, phone)
+            if not messages:
+                return
+            if any(message.get("side_effects_started_at") for message in messages):
+                # A prior process crossed the durable pre-effect boundary but
+                # never recorded completion. Replaying could duplicate an Apps
+                # Script mutation or WhatsApp reply, so quarantine it instead.
+                await asyncio.to_thread(suppress_uncertain_pending_batch, messages)
+                continue
+            reserved = await asyncio.to_thread(
+                reserve_pending_batch_side_effects,
+                messages,
+            )
+            if not reserved:
+                # A concurrent/partial reservation is itself uncertain. Reload
+                # on the next scanner pass and fail closed rather than replay.
+                log.warning("Could not reserve all side effects for %s", phone)
+                return
+            phone_id = str(messages[-1].get("phone_number_id") or PHONE_NUMBER_ID)
+            await process_conversation_batch(phone, messages, phone_id)
+            await asyncio.to_thread(mark_pending_batch_processed, messages)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Leave the batch unprocessed. The lifecycle scanner will retry after
+        # this worker releases its lease; no inbound message is discarded.
+        log.exception("Queued conversation processing failed for %s", phone)
+    finally:
+        try:
+            await asyncio.to_thread(release_processing_lease, phone, owner_token)
+        except Exception:
+            log.exception("Could not release conversation lease for %s", phone)
+
+
+async def pending_queue_worker() -> None:
+    """Recover queue work after process restarts and across Render workers."""
+    while True:
+        try:
+            phones = await asyncio.to_thread(list_pending_phones)
+            if phones:
+                await asyncio.gather(*(process_pending_inbound(phone) for phone in phones))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Pending inbound queue scan failed")
+        await asyncio.sleep(1.0)
+
 
 async def handle_ai_conversation(
     sender_phone: str,
@@ -1068,58 +1790,25 @@ async def handle_ai_conversation(
     phone_number_id: str,
     message_id: str | None = None,
 ):
+    """Compatibility path for direct callers; webhooks use the durable queue."""
     sender_phone = normalize_phone(sender_phone)
     lock = await get_user_lock(sender_phone)
-
     async with lock:
-        try:
-            saved_turn = save_chat_turn(sender_phone, "user", user_text, message_id)
-            if not saved_turn:
-                raise RuntimeError("Incoming chat turn was not persisted")
-            profile = load_patient_profile(sender_phone)
-            profile = await update_patient_memory(sender_phone, profile)
-            if not is_bot_globally_active():
-                log.info("Global bot off; ignoring %s", sender_phone)
-                return
-        except Exception:
-            log.exception("Postgres unavailable while starting conversation")
-            await send_whatsapp_message(
-                sender_phone,
-                "حصل عطل مؤقت في النظام ومفيش أي حجز اتأكد. حاولي مرة تانية بعد شوية.",
-                phone_number_id,
-            )
-            return
-
-        if profile.get("is_paused"):
-            log.info("Human takeover active for %s", sender_phone)
-            return
-
-        response_text, images = await generate_ai_reply(sender_phone, user_text, profile)
-
-        for clinic_image in images:
-            if not await send_whatsapp_image(sender_phone, clinic_image, phone_number_id):
-                audit("system", "whatsapp_image_failed", sender_phone, clinic_image.get("url", ""))
-                save_chat_turn(sender_phone, "system", "فشل إرسال صورة العيادة عبر واتساب.")
-
-        if response_text:
-            delivery = await send_whatsapp_message(sender_phone, response_text, phone_number_id)
-            if delivery.get("ok") is True:
-                try:
-                    save_chat_turn(
-                        sender_phone,
-                        "model",
-                        response_text,
-                        delivery.get("message_id"),
-                    )
-                except Exception:
-                    log.exception("Reply sent but chat persistence failed")
-            else:
-                audit("system", "whatsapp_send_failed", sender_phone, response_text[:500])
-                save_chat_turn(
-                    sender_phone,
-                    "system",
-                    "لم يؤكد واتساب استلام رد الذكاء الاصطناعي.",
-                )
+        saved_turn = save_chat_turn(sender_phone, "user", user_text, message_id)
+        if not saved_turn:
+            raise RuntimeError("Incoming chat turn was not persisted")
+        await process_conversation_batch(
+            sender_phone,
+            [
+                {
+                    "message_id": message_id,
+                    "chat_history_id": saved_turn.get("id"),
+                    "content": user_text,
+                    "phone_number_id": phone_number_id,
+                }
+            ],
+            phone_number_id,
+        )
 
 
 # ------------------------------------------------------------
@@ -1211,15 +1900,12 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                 target_phone_id = value.get("metadata", {}).get(
                     "phone_number_id",
                     PHONE_NUMBER_ID,
-                )
+                ) or PHONE_NUMBER_ID
 
                 # Patient messages.
                 if field != "smb_message_echoes":
                     for message in value.get("messages", []) or []:
                         message_id = message.get("id")
-                        if not claim_message(message_id):
-                            continue
-
                         sender = normalize_phone(message.get("from", ""))
                         if not sender or is_blocked(sender):
                             continue
@@ -1227,18 +1913,19 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                         text = extract_text_message(message)
                         if not text:
                             continue
-
-                        if ENABLE_REAL_CLINIC:
-                            background_tasks.add_task(
-                                handle_ai_conversation,
-                                sender,
-                                text,
-                                target_phone_id,
-                                message_id,
-                            )
-                            scheduled += 1
-                        else:
-                            log.info("ENABLE_REAL_CLINIC is off; message stored but not answered: %s", sender)
+                        saved = persist_incoming_message(
+                            sender,
+                            text,
+                            message_id,
+                            target_phone_id,
+                        )
+                        if not saved:
+                            continue
+                        # Queue processing still runs when replies are disabled:
+                        # memory and booking-draft learning are internal and must
+                        # continue during operational/human takeover pauses.
+                        background_tasks.add_task(process_pending_inbound, sender)
+                        scheduled += 1
 
                 # Staff/manual messages echoed by Meta.
                 echoes = (
