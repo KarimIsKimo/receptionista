@@ -139,7 +139,7 @@
   function waitingLabel(value){if(!value)return "";var minutes=Math.max(0,Math.floor((Date.now()-new Date(value).getTime())/60000));if(minutes<60)return tr("waiting")+" "+minutes+"m";if(minutes<1440)return tr("waiting")+" "+Math.floor(minutes/60)+"h";return tr("waiting")+" "+Math.floor(minutes/1440)+"d"}
   function snapshotIsFresh(p){if(p.appointment_status!=="healthy")return false;var fetched=new Date(p.appointment_fetched_at||"").getTime();return Number.isFinite(fetched)&&Date.now()-fetched<600000}
   function patientMatchesView(p){var term=state.search.toLocaleLowerCase(),hay=[p.phone_number,p.name,p.preferences].concat(p.tags||[]).join(" ").toLocaleLowerCase();if(term&&hay.indexOf(term)<0)return false;if(state.filter!=="archived"&&p.is_archived)return false;if(state.filter==="archived")return !!p.is_archived;if(state.filter==="unread")return (p.unread_count||0)>0;if(state.filter==="needs_reply")return !!p.needs_reply;if(state.filter==="patient_initiated")return p.conversation_origin==="patient";if(state.filter==="reception_initiated")return p.conversation_origin==="reception";if(state.filter==="human")return !!p.is_paused;if(state.filter==="ai")return !p.is_paused;if(state.filter==="booked")return snapshotIsFresh(p)&&!!p.next_appointment;if(state.filter==="no_booking")return snapshotIsFresh(p)&&!p.next_appointment;return true}
-  function sortPatients(){state.patients.sort(function(a,b){return Number(!!b.is_pinned)-Number(!!a.is_pinned)||new Date(b.last_message_at||0)-new Date(a.last_message_at||0)||(b.last_message_id||0)-(a.last_message_id||0)})}
+  function sortPatients(){state.patients.sort(function(a,b){return Number(!!b.is_pinned)-Number(!!a.is_pinned)||new Date(b.last_message_at||0)-new Date(a.last_message_at||0)||(b.last_message_id||0)-(a.last_message_id||0)||String(b.phone_number||"").localeCompare(String(a.phone_number||""))})}
   function patientCardHtml(p){
     var tags=(p.tags||[]).slice(0,2).map(function(x){return '<span class="tag">'+esc(x)+"</span>"}).join("");
     var origin=p.conversation_origin||"unknown";
@@ -162,13 +162,13 @@
     state.loadingInbox=true;
     if(reset){state.patients=[];state.cursor=0;state.before=null;q("patientList").innerHTML='<div class="empty"><div class="loader"></div></div>'}
     var url="/admin/api/inbox?limit=50&state="+encodeURIComponent(state.filter)+"&search="+encodeURIComponent(state.search);
-    if(more&&state.before)url+="&before_id="+state.before;
+    if(more&&state.before)url+="&before="+encodeURIComponent(state.before);
     try{
       var r=await api(url,{signal:signal});
       if(token!==state.inboxLoadToken)return;
       var rows=r.data.patients||[];
       if(more){rows.forEach(function(row){var index=state.patients.findIndex(function(x){return x.phone_number===row.phone_number});if(index<0)state.patients.push(row);else state.patients[index]=Object.assign({},state.patients[index],row)})}else state.patients=rows;
-      state.cursor=Math.max(state.cursor,r.data.server_cursor||0);state.before=r.data.next_before_id;renderPatients();
+      state.cursor=Math.max(state.cursor,r.data.server_cursor||0);state.before=r.data.next_cursor;renderPatients();
     }catch(e){if(e.name!=="AbortError"&&token===state.inboxLoadToken)q("patientList").innerHTML='<div class="empty"><div class="notice error">'+esc(e.message)+"</div></div>"}
     finally{if(token===state.inboxLoadToken)state.loadingInbox=false}
   }
