@@ -318,8 +318,9 @@ class AdminOperations:
             watermark = self.db(
                 """
                 /* admin_inbox_cursor */
-                SELECT CASE WHEN is_called THEN last_value ELSE 0 END AS server_cursor
-                FROM conversation_summary_change_seq
+                SELECT version AS server_cursor
+                FROM conversation_summary_clock
+                WHERE id=1
                 """,
                 fetchone=True,
             )
@@ -439,7 +440,12 @@ class AdminOperations:
             row = self.db(
                 """
                 /* admin_mark_read */
-                WITH read_state AS (
+                WITH clock AS (
+                    UPDATE conversation_summary_clock
+                    SET version=version+1
+                    WHERE id=1
+                    RETURNING version
+                ), read_state AS (
                     INSERT INTO admin_inbox_state(phone_number,last_read_message_id,updated_at)
                     VALUES (%s,%s,NOW())
                     ON CONFLICT(phone_number) DO UPDATE SET
@@ -458,9 +464,9 @@ class AdminOperations:
                               AND message.role='user'
                               AND message.id>read_state.last_read_message_id
                         ),
-                        change_version=nextval('conversation_summary_change_seq'),
+                        change_version=clock.version,
                         updated_at=NOW()
-                    FROM read_state
+                    FROM read_state, clock
                     WHERE summary.phone_number=%s
                     RETURNING summary.unread_count
                 )
@@ -486,7 +492,12 @@ class AdminOperations:
             row = self.db(
                 """
                 /* admin_mark_unread */
-                WITH latest_user AS (
+                WITH clock AS (
+                    UPDATE conversation_summary_clock
+                    SET version=version+1
+                    WHERE id=1
+                    RETURNING version
+                ), latest_user AS (
                     SELECT latest_patient_message_id AS message_id
                     FROM conversation_summaries
                     WHERE phone_number=%s AND latest_patient_message_id>0
@@ -502,8 +513,9 @@ class AdminOperations:
                 ), updated AS (
                     UPDATE conversation_summaries
                     SET unread_count=1,
-                        change_version=nextval('conversation_summary_change_seq'),
+                        change_version=clock.version,
                         updated_at=NOW()
+                    FROM clock
                     WHERE phone_number=%s AND EXISTS (SELECT 1 FROM read_state)
                     RETURNING unread_count
                 )
@@ -787,7 +799,7 @@ class AdminOperations:
             SELECT phone_number,NOW() FROM snapshot
             WHERE TRUE
             ON CONFLICT(phone_number) DO UPDATE SET
-                change_version=nextval('conversation_summary_change_seq'),
+                change_version=EXCLUDED.change_version,
                 updated_at=NOW()
             """,
             (
@@ -814,7 +826,7 @@ class AdminOperations:
             SELECT phone_number,NOW() FROM snapshot
             WHERE TRUE
             ON CONFLICT(phone_number) DO UPDATE SET
-                change_version=nextval('conversation_summary_change_seq'),
+                change_version=EXCLUDED.change_version,
                 updated_at=NOW()
             """,
             (phone, status),
