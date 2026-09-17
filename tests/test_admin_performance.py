@@ -2,6 +2,8 @@ import contextlib
 import datetime as dt
 import inspect
 import os
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -55,7 +57,7 @@ class SummaryCursor:
         assert "latest_patient_message_id" in sql
         assert "latest_response_message_id" in sql
         assert "is_archived=CASE" in sql
-        assert "change_version=nextval" in sql
+        assert "change_version=EXCLUDED.change_version" in sql
 
 
 class SaveCursor:
@@ -238,6 +240,119 @@ class AdminPerformanceTests(unittest.TestCase):
         self.assertIn("idx_chat_user_phone_id", schema)
         self.assertIn("idx_chat_origin_phone_id", schema)
         self.assertIn("idx_conversation_summary_changes", schema)
+        self.assertIn("CREATE TABLE IF NOT EXISTS conversation_summary_clock", schema)
+        self.assertIn("CREATE OR REPLACE FUNCTION next_conversation_summary_version", schema)
+        self.assertIn("SET version=version+1", schema)
+        self.assertIn("change_version,updated_at", schema)
+        self.assertIn("COALESCE(unread.count,0),0,NOW()", schema)
+        self.assertNotIn("conversation_summary_change_seq", schema)
+        self.assertNotIn("nextval(", schema)
+
+    def test_every_inbox_mutation_uses_the_transactional_clock(self):
+        sources = "\n".join(
+            inspect.getsource(target)
+            for target in (
+                main.update_patient_file,
+                main.set_patient_preferences,
+                main.set_extracted_patient_memory,
+                main.set_patient_pause,
+                main.set_patient_tags,
+                main.touch_conversation_summary,
+                main.update_conversation_summary_for_message,
+                main.api_create_conversation,
+                main.api_conversation_state,
+                main.AdminOperations.mark_read,
+                main.AdminOperations.mark_unread,
+                main.AdminOperations._cache_appointments,
+                main.AdminOperations._mark_snapshot_status,
+            )
+        )
+        self.assertNotIn("nextval(", sources)
+        self.assertNotIn("conversation_summary_change_seq", sources)
+        self.assertIn("change_version=EXCLUDED.change_version", sources)
+        for target in (
+            main.update_patient_file,
+            main.set_patient_preferences,
+            main.set_extracted_patient_memory,
+            main.set_patient_pause,
+            main.set_patient_tags,
+        ):
+            source = inspect.getsource(target)
+            self.assertIn("WITH patient AS", source)
+            self.assertIn("INSERT INTO conversation_summaries", source)
+        for target in (
+            main.AdminOperations.mark_read,
+            main.AdminOperations.mark_unread,
+        ):
+            source = inspect.getsource(target)
+            self.assertIn("UPDATE conversation_summary_clock", source)
+            self.assertIn("change_version=clock.version", source)
+        for target in (
+            main.AdminOperations._cache_appointments,
+            main.AdminOperations._mark_snapshot_status,
+        ):
+            self.assertIn(
+                "change_version=EXCLUDED.change_version",
+                inspect.getsource(target),
+            )
+
+    def test_transactional_clock_allocation_is_commit_order_serialized(self):
+        class ClockRow:
+            def __init__(self):
+                self.version = 0
+                self.committed = 0
+                self.row_lock = threading.Lock()
+
+            @contextlib.contextmanager
+            def transaction(self):
+                with self.row_lock:
+                    self.version += 1
+                    allocated = self.version
+                    yield allocated
+                    self.committed = allocated
+
+        clock = ClockRow()
+        first_allocated = threading.Event()
+        allow_first_commit = threading.Event()
+        second_allocated = threading.Event()
+        allow_second_commit = threading.Event()
+        observations = []
+
+        def first_transaction():
+            with clock.transaction() as version:
+                observations.append(("first_allocated", version))
+                first_allocated.set()
+                allow_first_commit.wait(1)
+            observations.append(("first_committed", clock.committed))
+
+        def second_transaction():
+            first_allocated.wait(1)
+            with clock.transaction() as version:
+                observations.append(("second_allocated", version))
+                second_allocated.set()
+                allow_second_commit.wait(1)
+            observations.append(("second_committed", clock.committed))
+
+        first = threading.Thread(target=first_transaction)
+        second = threading.Thread(target=second_transaction)
+        first.start()
+        second.start()
+        self.assertTrue(first_allocated.wait(0.5))
+        time.sleep(0.03)
+        self.assertFalse(second_allocated.is_set())
+        self.assertEqual(clock.committed, 0)
+
+        allow_first_commit.set()
+        self.assertTrue(second_allocated.wait(0.5))
+        self.assertEqual(clock.committed, 1)
+        self.assertIn(("second_allocated", 2), observations)
+        allow_second_commit.set()
+        first.join(1)
+        second.join(1)
+
+        self.assertEqual(clock.committed, 2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
 
     def test_pool_is_closed_by_application_lifespan(self):
         source = inspect.getsource(main.lifespan)
