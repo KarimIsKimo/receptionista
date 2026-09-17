@@ -111,7 +111,15 @@ _AREA_NEGATION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DRAFT_CORRECTION_PATTERN = re.compile(
-    r"(?:^|\s)(?:قصدي|بدل|غيّر|غيري|خليها|خليه|change|instead)(?:\s|$)",
+    r"^\s*(?:لا|لأ|قصدي|بدل(?:ها)?|غيّر|غيري|خليها|خليه|change(?:\s+it)?(?:\s+to)?|instead)(?:\s|$)",
+    re.IGNORECASE,
+)
+_PRICE_QUESTION_PATTERN = re.compile(
+    r"(?:بكام|سعر|كام\s+(?:السعر|تكلف)|price|cost)",
+    re.IGNORECASE,
+)
+_AREA_HINT_PATTERN = re.compile(
+    r"(?:جسم|منطق[هة]|رجل|ساق|[اأإ]يد|ذراع|بطن|كتف|body|area|leg|arm)",
     re.IGNORECASE,
 )
 _TRIVIAL_PHRASES = {
@@ -278,6 +286,37 @@ def _find_service(text: str) -> str:
         if canonical not in ordered:
             ordered.append(canonical)
     return " + ".join(ordered)
+
+
+def _correction_targets(text: str, *, active_booking: bool) -> set[str]:
+    """Identify only clearly targeted booking-field corrections.
+
+    A leading Egyptian correction cue is insufficient on its own: pricing and
+    other negative questions must not erase draft state. The remainder must
+    identify a date, time, or treatment-area value.
+    """
+    cue = _DRAFT_CORRECTION_PATTERN.match(text)
+    if not cue:
+        return set()
+    remainder = text[cue.end() :].strip()
+    if not remainder or _PRICE_QUESTION_PATTERN.search(remainder):
+        return set()
+
+    targets: set[str] = set()
+    if _mentions_date(remainder):
+        targets.add("requested_date")
+    if (
+        _mentions_time(remainder, active_booking=active_booking)
+        or re.search(r"(?:^|\s)(?:الساعة|الساعه|at)(?:\s|$)", remainder)
+    ):
+        targets.add("requested_time")
+    if (
+        _find_service(remainder)
+        or any(re.search(pattern, remainder, re.IGNORECASE) for _, pattern in _AREA_PATTERNS)
+        or _AREA_HINT_PATTERN.search(remainder)
+    ):
+        targets.add("service_area")
+    return targets
 
 
 def _find_date(text: str, now: dt.datetime, config: ClinicConfig) -> str:
@@ -463,14 +502,20 @@ def evolve_booking_draft(
         draft["patient_name"] = (
             profile.get("name") or explicit_name or standalone_name
         ).strip()
+    active_booking = bool(current or intent)
+    correction_targets = _correction_targets(
+        lowered,
+        active_booking=active_booking,
+    )
     service = _find_service(lowered)
-    correction = bool(_DRAFT_CORRECTION_PATTERN.search(lowered))
     new_booking_request = explicit_intent == "book"
-    if service and (
+    if "service_area" in correction_targets:
+        # A clearly targeted but lossy replacement invalidates the old value.
+        draft["service_area"] = service
+    elif service and (
         not draft.get("service_area")
         or (current and current.get("stage") == "need_service")
         or new_booking_request
-        or correction
     ):
         draft["service_area"] = service
     if intent in {"check_appointment", "reschedule"}:
@@ -488,19 +533,18 @@ def evolve_booking_draft(
             not draft.get("requested_date")
             or (current and current.get("stage") == "need_date")
             or new_booking_request
-            or correction
+            or "requested_date" in correction_targets
         )
         if date and may_change_date:
             draft["requested_date"] = date
         elif _mentions_date(lowered) and may_change_date:
             draft["requested_date"] = ""
-        active_booking = bool(current or intent)
         time = _find_time(lowered, active_booking=active_booking, config=config)
         may_change_time = (
             not draft.get("requested_time")
             or (current and current.get("stage") == "need_time")
             or new_booking_request
-            or correction
+            or "requested_time" in correction_targets
         )
         if time and may_change_time:
             draft["requested_time"] = time
