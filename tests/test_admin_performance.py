@@ -32,6 +32,7 @@ class SummaryCursor:
                 "latest_patient_message_id": 0,
                 "latest_response_message_id": 0,
                 "unread_count": 0,
+                "is_archived": False,
             },
         )
         state.update(
@@ -45,6 +46,7 @@ class SummaryCursor:
         if role == "user":
             state["latest_patient_message_id"] = message_id
             state["unread_count"] += 1
+            state["is_archived"] = False
         if role in {"model", "staff"}:
             state["latest_response_message_id"] = message_id
 
@@ -52,6 +54,7 @@ class SummaryCursor:
         assert "conversation_summary_message" in sql
         assert "latest_patient_message_id" in sql
         assert "latest_response_message_id" in sql
+        assert "is_archived=CASE" in sql
         assert "change_version=nextval" in sql
 
 
@@ -163,6 +166,58 @@ class AdminPerformanceTests(unittest.TestCase):
 
         self.assertEqual(saved["id"], 91)
         self.assertEqual(events, ["message", "summary", "commit"])
+
+    def test_inbound_patient_message_reopens_archived_summary_transactionally(self):
+        cursor = SummaryCursor()
+        cursor.rows["2010"] = {
+            "first_meaningful_role": "user",
+            "latest_patient_message_id": 5,
+            "latest_response_message_id": 9,
+            "unread_count": 0,
+            "is_archived": True,
+        }
+
+        main.update_conversation_summary_for_message(
+            cursor,
+            "2010",
+            {
+                "id": 10,
+                "role": "user",
+                "content": "hello again",
+                "created_at": dt.datetime.now(dt.timezone.utc),
+            },
+        )
+
+        state = cursor.rows["2010"]
+        self.assertFalse(state["is_archived"])
+        self.assertGreater(
+            state["latest_patient_message_id"],
+            state["latest_response_message_id"],
+        )
+        self.assertEqual(state["unread_count"], 1)
+
+    def test_non_patient_messages_do_not_reopen_archived_summary(self):
+        for role in ("model", "system", "staff"):
+            with self.subTest(role=role):
+                cursor = SummaryCursor()
+                cursor.rows["2010"] = {
+                    "first_meaningful_role": "user",
+                    "latest_patient_message_id": 5,
+                    "latest_response_message_id": 5,
+                    "unread_count": 0,
+                    "is_archived": True,
+                }
+                main.update_conversation_summary_for_message(
+                    cursor,
+                    "2010",
+                    {
+                        "id": 10,
+                        "role": role,
+                        "content": "internal/outbound",
+                        "created_at": dt.datetime.now(dt.timezone.utc),
+                    },
+                )
+                self.assertTrue(cursor.rows["2010"]["is_archived"])
 
     def test_schema_backfill_is_idempotent_and_indexes_match_access_paths(self):
         connection = InitConnection()
