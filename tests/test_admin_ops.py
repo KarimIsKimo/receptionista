@@ -116,6 +116,15 @@ class PaginatedInboxDB:
             raise AssertionError(sql)
 
         rows = sort_inbox_rows([dict(row) for row in self.rows])
+        if sql.count(
+            "s.latest_patient_message_id > s.latest_response_message_id"
+        ) > 1:
+            rows = [
+                row
+                for row in rows
+                if int(row.get("latest_patient_message_id") or 0)
+                > int(row.get("latest_response_message_id") or 0)
+            ]
         if "-infinity'::timestamptz" in sql:
             pinned, timestamp, message_id, phone = params[:4]
             moment = (
@@ -151,6 +160,8 @@ class AdminOperationsTests(unittest.TestCase):
         self.assertEqual(result["data"]["patients"], [])
         self.assertEqual(result["data"]["server_cursor"], 87)
         self.assertIn("admin_inbox_cursor", self.db.calls[-2][0])
+        self.assertIn("FROM conversation_summary_clock", self.db.calls[-2][0])
+        self.assertNotIn("conversation_summary_change_seq", self.db.calls[-2][0])
         self.assertIn("admin_inbox", self.db.calls[-1][0])
 
     def test_sort_tie_breaks_on_message_id(self):
@@ -346,6 +357,70 @@ class AdminOperationsTests(unittest.TestCase):
         self.assertFalse(client_rows["pinned-old"]["is_pinned"])
         self.assertTrue(client_rows[newly_pinned["phone_number"]]["is_pinned"])
 
+    def test_resolved_first_needs_reply_page_keeps_older_page_reachable(self):
+        rows = [{
+            "phone_number": f"needs-reply-{index:02d}",
+            "last_message_id": 2000 + index,
+            "last_message_at": NOW - dt.timedelta(minutes=index),
+            "last_message_role": "user",
+            "latest_patient_message_id": 2000 + index,
+            "latest_response_message_id": 0,
+            "needs_reply": True,
+            "is_pinned": False,
+            "is_archived": False,
+            "change_version": index + 1,
+        } for index in range(61)]
+        db = PaginatedInboxDB(rows)
+        ops = AdminOperations(db, self.booking, now_func=lambda: NOW)
+
+        first = ops.inbox(state="needs_reply", limit=50)
+        self.assertEqual(len(first["data"]["patients"]), 50)
+        self.assertIsNotNone(first["data"]["next_cursor"])
+
+        first_phones = {
+            row["phone_number"] for row in first["data"]["patients"]
+        }
+        resolved_updates = []
+        for row in rows:
+            if row["phone_number"] in first_phones:
+                row["latest_response_message_id"] = row["latest_patient_message_id"]
+                row["needs_reply"] = False
+                row["change_version"] += 1000
+                resolved_updates.append(row)
+        db.update_rows = resolved_updates
+        updates = ops.inbox_updates(after_version=500, limit=100)
+
+        client_rows = {
+            row["phone_number"]: row for row in first["data"]["patients"]
+        }
+        for row in updates["data"]["patients"]:
+            client_rows[row["phone_number"]] = row
+        self.assertEqual(
+            [row for row in client_rows.values() if row.get("needs_reply")],
+            [],
+        )
+
+        second = ops.inbox(
+            state="needs_reply",
+            limit=50,
+            before=first["data"]["next_cursor"],
+        )
+        second_phones = [
+            row["phone_number"] for row in second["data"]["patients"]
+        ]
+        self.assertEqual(len(second_phones), 11)
+        self.assertTrue(first_phones.isdisjoint(second_phones))
+        self.assertEqual(len(set(second_phones)), 11)
+        self.assertFalse(second["data"]["has_more"])
+        self.assertIsNone(second["data"]["next_cursor"])
+
+        for row in rows:
+            row["latest_response_message_id"] = row["latest_patient_message_id"]
+        exhausted = ops.inbox(state="needs_reply", limit=50)
+        self.assertEqual(exhausted["data"]["patients"], [])
+        self.assertFalse(exhausted["data"]["has_more"])
+        self.assertIsNone(exhausted["data"]["next_cursor"])
+
     def test_malformed_composite_cursor_is_rejected(self):
         for cursor in ("not-a-valid-cursor", "%%%%"):
             with self.subTest(cursor=cursor):
@@ -414,6 +489,8 @@ class AdminOperationsTests(unittest.TestCase):
         self.assertEqual(params, ("2010", 10, "2010"))
         self.assertNotIn("MAX(id)", sql)
         self.assertIn("GREATEST", sql)
+        self.assertIn("UPDATE conversation_summary_clock", sql)
+        self.assertIn("change_version=clock.version", sql)
         self.assertGreater(newly_arrived_message_id, result["data"]["last_read_message_id"])
         self.assertEqual(result["data"]["unread_count"], 1)
 
@@ -430,6 +507,9 @@ class AdminOperationsTests(unittest.TestCase):
         self.assertEqual(result["data"]["last_read_message_id"], 16)
         self.assertEqual(result["data"]["marked_unread_message_id"], 17)
         self.assertEqual(result["data"]["unread_count"], 1)
+        sql, _ = self.db.calls[-1]
+        self.assertIn("UPDATE conversation_summary_clock", sql)
+        self.assertIn("change_version=clock.version", sql)
         sql, params = self.db.calls[-1]
         self.assertEqual(params, ("2010", "2010", "2010"))
         self.assertNotIn("MAX(id)", sql)
