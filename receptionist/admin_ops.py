@@ -7,6 +7,8 @@ failed refresh.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime as dt
 import json
 import re
@@ -18,6 +20,56 @@ from .dates import parse_date_expression
 
 
 APPOINTMENT_SNAPSHOT_TTL = dt.timedelta(minutes=10)
+
+
+def encode_inbox_cursor(row: dict) -> str:
+    """Encode the complete stable inbox ordering key as an opaque cursor."""
+    timestamp = row.get("last_message_at")
+    if isinstance(timestamp, dt.datetime):
+        timestamp = timestamp.isoformat()
+    elif timestamp is not None:
+        timestamp = str(timestamp)
+    payload = {
+        "p": bool(row.get("is_pinned")),
+        "t": timestamp,
+        "i": int(row.get("last_message_id") or 0),
+        "n": str(row.get("phone_number") or ""),
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def decode_inbox_cursor(value: str) -> tuple[bool, str | None, int, str]:
+    """Validate and decode a cursor without trusting browser-provided values."""
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(value + padding).decode("utf-8"))
+        pinned = payload["p"]
+        timestamp = payload["t"]
+        message_id = payload["i"]
+        phone_number = payload["n"]
+        if not isinstance(pinned, bool):
+            raise ValueError
+        if timestamp is not None:
+            if not isinstance(timestamp, str):
+                raise ValueError
+            parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError
+        if not isinstance(message_id, int) or isinstance(message_id, bool) or message_id < 0:
+            raise ValueError
+        if not isinstance(phone_number, str) or not phone_number:
+            raise ValueError
+        return pinned, timestamp, message_id, phone_number
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        UnicodeError,
+        json.JSONDecodeError,
+        binascii.Error,
+    ) as exc:
+        raise ValueError("Invalid inbox cursor") from exc
 
 
 def success(code: str, data: Any = None, **meta: Any) -> dict:
@@ -60,6 +112,7 @@ def sort_inbox_rows(rows: list[dict]) -> list[dict]:
             bool(row.get("is_pinned")),
             activity(row),
             int(row.get("last_message_id") or 0),
+            str(row.get("phone_number") or ""),
         ),
         reverse=True,
     )
@@ -176,13 +229,18 @@ class AdminOperations:
         search: str = "",
         state: str = "all",
         limit: int = 50,
+        before: str | None = None,
         before_id: int | None = None,
         after_id: int | None = None,
     ) -> dict:
         if state not in self.VALID_FILTERS:
             return failure("invalid_filter", "Unknown inbox filter.", state="degraded")
-        if before_id is not None and after_id is not None:
-            return failure("invalid_cursor", "Use before_id or after_id, not both.", state="degraded")
+        if sum(value is not None for value in (before, before_id, after_id)) > 1:
+            return failure(
+                "invalid_cursor",
+                "Use only one inbox pagination cursor.",
+                state="degraded",
+            )
 
         where: list[str] = []
         params: list[Any] = []
@@ -195,11 +253,44 @@ class AdminOperations:
             )
             term = f"%{search}%"
             params.extend([term, term, term, term])
-        if before_id is not None:
-            where.append("COALESCE(s.last_message_id,0) < %s")
+        if before is not None:
+            try:
+                pinned, timestamp, message_id, phone_number = decode_inbox_cursor(before)
+            except ValueError:
+                return failure("invalid_cursor", "Invalid inbox cursor.", state="degraded")
+            where.append(
+                "(s.is_pinned, "
+                "COALESCE(s.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(s.last_message_id,0), s.phone_number) < "
+                "(%s::boolean, COALESCE(%s::timestamptz,'-infinity'::timestamptz), "
+                "%s::bigint, %s::text)"
+            )
+            params.extend([pinned, timestamp, message_id, phone_number])
+        elif before_id is not None:
+            # Compatibility for older dashboard clients: use the message id only
+            # to locate its complete sort key, then apply the same keyset boundary.
+            where.append(
+                "(s.is_pinned, "
+                "COALESCE(s.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(s.last_message_id,0), s.phone_number) < "
+                "(SELECT legacy.is_pinned, "
+                "COALESCE(legacy.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(legacy.last_message_id,0), legacy.phone_number "
+                "FROM conversation_summaries legacy "
+                "WHERE legacy.last_message_id=%s)"
+            )
             params.append(before_id)
-        if after_id is not None:
-            where.append("COALESCE(s.last_message_id,0) > %s")
+        elif after_id is not None:
+            where.append(
+                "(s.is_pinned, "
+                "COALESCE(s.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(s.last_message_id,0), s.phone_number) > "
+                "(SELECT legacy.is_pinned, "
+                "COALESCE(legacy.last_message_at,'-infinity'::timestamptz), "
+                "COALESCE(legacy.last_message_id,0), legacy.phone_number "
+                "FROM conversation_summaries legacy "
+                "WHERE legacy.last_message_id=%s)"
+            )
             params.append(after_id)
 
         filters = {
@@ -260,7 +351,7 @@ class AdminOperations:
                 LEFT JOIN admin_appointment_snapshots aps ON aps.phone_number=s.phone_number
                 {where_sql}
                 ORDER BY s.is_pinned DESC, s.last_message_at DESC NULLS LAST,
-                         s.last_message_id DESC NULLS LAST
+                         s.last_message_id DESC NULLS LAST, s.phone_number DESC
                 LIMIT %s
                 """,
                 tuple(params),
@@ -273,13 +364,19 @@ class AdminOperations:
         patients = sort_inbox_rows(
             [self._prepare_inbox_row(dict(row)) for row in rows[:limit]]
         )
-        ids = [int(row.get("last_message_id") or 0) for row in patients]
+        next_cursor = encode_inbox_cursor(patients[-1]) if has_more and patients else None
+        legacy_before_id = (
+            int(patients[-1].get("last_message_id") or 0)
+            if has_more and patients
+            else None
+        )
         return success(
             "inbox_loaded",
             {
                 "patients": patients,
                 "has_more": has_more,
-                "next_before_id": min(ids) if has_more and ids else None,
+                "next_cursor": next_cursor,
+                "next_before_id": legacy_before_id or None,
                 "server_cursor": int(
                     (watermark or {}).get("server_cursor") or 0
                 ),
