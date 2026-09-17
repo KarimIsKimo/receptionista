@@ -198,6 +198,56 @@ class BookingDraftTests(unittest.TestCase):
                 self.assertEqual(action, "upsert")
                 self.assertEqual(draft["service_area"], expected)
 
+    def test_unrecognized_area_parts_are_never_silently_discarded(self):
+        examples = (
+            ("بيكيني ورجلين", "بيكيني + رجلين"),
+            ("اندر ارم وايدين", "أندر آرم + إيدين"),
+            ("بيكيني ومنطقة غير موجودة في parser", ""),
+        )
+        for patient_words, expected in examples:
+            with self.subTest(patient_words=patient_words):
+                draft, _ = self.evolve(
+                    None,
+                    f"عايزة احجز {patient_words}",
+                    {"name": "Mona"},
+                )
+                self.assertEqual(draft["service_area"], expected)
+
+    def test_negated_area_expression_is_not_reversed_by_canonicalization(self):
+        draft, _ = self.evolve(
+            None,
+            "عايزة احجز جسم كامل بدون بطن وظهر",
+            {"name": "Mona"},
+        )
+        self.assertEqual(draft["service_area"], "")
+        self.assertNotEqual(draft["service_area"], "جسم كامل + ظهر")
+
+    def test_unrelated_price_question_does_not_overwrite_ready_service(self):
+        current = {
+            "intent": "book",
+            "patient_name": "Mona",
+            "service_area": "بيكيني",
+            "requested_date": "2026-09-15",
+            "requested_time": "7:00 PM",
+            "stage": "ready_to_book",
+        }
+        draft, _ = self.evolve(current, "طب الاندر ارم بكام؟", {"name": "Mona"})
+        self.assertEqual(draft["service_area"], "بيكيني")
+        self.assertEqual(draft["stage"], "ready_to_book")
+
+    def test_service_fragment_still_fills_need_service_stage(self):
+        current = {
+            "intent": "book",
+            "patient_name": "Mona",
+            "service_area": "",
+            "requested_date": "2026-09-15",
+            "requested_time": "7:00 PM",
+            "stage": "need_service",
+        }
+        draft, _ = self.evolve(current, "بيكيني", {"name": "Mona"})
+        self.assertEqual(draft["service_area"], "بيكيني")
+        self.assertEqual(draft["stage"], "ready_to_book")
+
     def test_egyptian_half_hour_is_parsed_without_prefix_truncation(self):
         for message in ("عايزة احجز الساعة 7 ونص", "عايزة احجز بعد 7 ونص"):
             with self.subTest(message=message):
@@ -306,6 +356,23 @@ class BookingDraftTests(unittest.TestCase):
         self.assertEqual(draft["requested_date"], "")
         self.assertEqual(draft["requested_time"], "")
         self.assertEqual(draft["stage"], "reschedule_unclassified")
+
+    def test_plain_alif_reschedule_overrides_active_booking_draft(self):
+        current = {
+            "intent": "book",
+            "patient_name": "Mona",
+            "service_area": "بيكيني",
+            "requested_date": "2026-09-15",
+            "requested_time": "7:00 PM",
+            "stage": "ready_to_book",
+        }
+        for message in ("اغير موعدي", "عايزة اغير موعدي", "عايز اغير الحجز"):
+            with self.subTest(message=message):
+                draft, _ = self.evolve(current, message, {"name": "Mona"})
+                self.assertEqual(draft["intent"], "reschedule")
+                self.assertEqual(draft["requested_date"], "")
+                self.assertEqual(draft["requested_time"], "")
+                self.assertEqual(draft["stage"], "reschedule_unclassified")
 
     def test_bare_seven_uses_active_booking_stage(self):
         current = {
