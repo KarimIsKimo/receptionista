@@ -21,6 +21,25 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertIn("state.before=r.data.next_cursor", self.html)
         self.assertNotIn('url+="&before_id="+state.before', self.html)
 
+    def test_filtered_empty_page_keeps_load_older_until_cursor_exhaustion(self):
+        fallback = re.search(
+            r"function inboxFallbackHtml\(\)(.*?)function bindLoadOlder",
+            self.html,
+            re.S,
+        )
+        self.assertIsNotNone(fallback)
+        self.assertIn("state.before", fallback.group(1))
+        self.assertIn('id="morePatients"', fallback.group(1))
+        self.assertIn('tr("emptyInbox")', fallback.group(1))
+        self.assertIn(
+            "el.innerHTML=inboxFallbackHtml();bindLoadOlder()",
+            self.html,
+        )
+        self.assertIn(
+            "findIndex(function(x){return x.phone_number===row.phone_number})",
+            self.html,
+        )
+
     def test_required_operations_views_and_states_exist(self):
         for required in (
             'id="view-inbox"', 'id="view-appointments"',
