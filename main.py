@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Request, Response, BackgroundTasks, Depends, HTTPException, status, Query
-from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
@@ -395,7 +395,27 @@ def init_db():
         )
         """,
         """
-        CREATE SEQUENCE IF NOT EXISTS conversation_summary_change_seq
+        CREATE TABLE IF NOT EXISTS conversation_summary_clock (
+            id SMALLINT PRIMARY KEY CHECK (id = 1),
+            version BIGINT NOT NULL DEFAULT 0
+        )
+        """,
+        """
+        INSERT INTO conversation_summary_clock(id,version)
+        VALUES (1,0)
+        ON CONFLICT(id) DO NOTHING
+        """,
+        """
+        CREATE OR REPLACE FUNCTION next_conversation_summary_version()
+        RETURNS BIGINT
+        LANGUAGE SQL
+        VOLATILE
+        AS $$
+            UPDATE conversation_summary_clock
+            SET version=version+1
+            WHERE id=1
+            RETURNING version
+        $$
         """,
         """
         CREATE TABLE IF NOT EXISTS conversation_summaries (
@@ -412,9 +432,22 @@ def init_db():
             unread_count INTEGER NOT NULL DEFAULT 0,
             is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
             is_archived BOOLEAN NOT NULL DEFAULT FALSE,
-            change_version BIGINT NOT NULL DEFAULT nextval('conversation_summary_change_seq'),
+            change_version BIGINT NOT NULL DEFAULT next_conversation_summary_version(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
+        """,
+        """
+        ALTER TABLE conversation_summaries
+        ALTER COLUMN change_version
+        SET DEFAULT next_conversation_summary_version()
+        """,
+        """
+        UPDATE conversation_summary_clock
+        SET version=GREATEST(
+            version,
+            COALESCE((SELECT MAX(change_version) FROM conversation_summaries),0)
+        )
+        WHERE id=1
         """,
         """
         CREATE TABLE IF NOT EXISTS admin_appointment_snapshots (
@@ -469,7 +502,8 @@ def init_db():
         INSERT INTO conversation_summaries(
             phone_number,last_message_id,last_message_role,last_message,last_message_at,
             first_meaningful_role,latest_patient_message_id,latest_patient_message_at,
-            latest_response_message_id,latest_response_at,unread_count,updated_at
+            latest_response_message_id,latest_response_at,unread_count,
+            change_version,updated_at
         )
         SELECT
             active.phone_number,
@@ -477,7 +511,7 @@ def init_db():
             origin.role,
             COALESCE(patient_message.id,0),patient_message.created_at,
             COALESCE(response_message.id,0),response_message.created_at,
-            COALESCE(unread.count,0),NOW()
+            COALESCE(unread.count,0),0,NOW()
         FROM (
             SELECT phone_number FROM patients
             UNION
@@ -663,21 +697,29 @@ def update_patient_file(phone_number: str, name: str = "", preferences: str = ""
     phone_number = normalize_phone(phone_number)
     db_execute(
         """
-        INSERT INTO patients(phone_number, name, preferences)
-        VALUES (%s,%s,%s)
-        ON CONFLICT(phone_number)
-        DO UPDATE SET
-            name = CASE WHEN EXCLUDED.name <> '' THEN EXCLUDED.name ELSE patients.name END,
-            preferences = CASE
-                WHEN EXCLUDED.preferences = '' THEN patients.preferences
-                WHEN patients.preferences = '' THEN EXCLUDED.preferences
-                ELSE patients.preferences || ' | ' || EXCLUDED.preferences
-            END,
-            updated_at = NOW()
+        WITH patient AS (
+            INSERT INTO patients(phone_number, name, preferences)
+            VALUES (%s,%s,%s)
+            ON CONFLICT(phone_number)
+            DO UPDATE SET
+                name = CASE WHEN EXCLUDED.name <> '' THEN EXCLUDED.name ELSE patients.name END,
+                preferences = CASE
+                    WHEN EXCLUDED.preferences = '' THEN patients.preferences
+                    WHEN patients.preferences = '' THEN EXCLUDED.preferences
+                    ELSE patients.preferences || ' | ' || EXCLUDED.preferences
+                END,
+                updated_at = NOW()
+            RETURNING phone_number
+        )
+        INSERT INTO conversation_summaries(phone_number,updated_at)
+        SELECT phone_number,NOW() FROM patient
+        WHERE TRUE
+        ON CONFLICT(phone_number) DO UPDATE SET
+            change_version=EXCLUDED.change_version,
+            updated_at=NOW()
         """,
         (phone_number, (name or "").strip(), (preferences or "").strip()),
     )
-    touch_conversation_summary(phone_number)
     return {"ok": True, "code": "patient_updated", "message": "تم تحديث ملف المريضة.", "patient_name": (name or "").strip()}
 
 def set_patient_preferences(phone_number: str, preferences: str) -> dict:
@@ -696,7 +738,7 @@ def set_patient_preferences(phone_number: str, preferences: str) -> dict:
         SELECT phone_number,NOW() FROM patient
         WHERE TRUE
         ON CONFLICT(phone_number) DO UPDATE SET
-            change_version=nextval('conversation_summary_change_seq'),
+            change_version=EXCLUDED.change_version,
             updated_at=NOW()
         """,
         (phone, preferences),
@@ -719,21 +761,29 @@ def set_extracted_patient_memory(
     clean_preferences = re.sub(r"\s+", " ", (preferences or "").strip())[:4000]
     db_execute(
         """
-        INSERT INTO patients(phone_number, name, preferences)
-        VALUES (%s,%s,%s)
-        ON CONFLICT(phone_number)
-        DO UPDATE SET
-            name = CASE
-                WHEN COALESCE(BTRIM(patients.name), '') = ''
-                THEN EXCLUDED.name
-                ELSE patients.name
-            END,
-            preferences = EXCLUDED.preferences,
-            updated_at = NOW()
+        WITH patient AS (
+            INSERT INTO patients(phone_number, name, preferences)
+            VALUES (%s,%s,%s)
+            ON CONFLICT(phone_number)
+            DO UPDATE SET
+                name = CASE
+                    WHEN COALESCE(BTRIM(patients.name), '') = ''
+                    THEN EXCLUDED.name
+                    ELSE patients.name
+                END,
+                preferences = EXCLUDED.preferences,
+                updated_at = NOW()
+            RETURNING phone_number
+        )
+        INSERT INTO conversation_summaries(phone_number,updated_at)
+        SELECT phone_number,NOW() FROM patient
+        WHERE TRUE
+        ON CONFLICT(phone_number) DO UPDATE SET
+            change_version=EXCLUDED.change_version,
+            updated_at=NOW()
         """,
         (phone, clean_name, clean_preferences),
     )
-    touch_conversation_summary(phone)
     return {
         "phone_number": phone,
         "name": clean_name,
@@ -744,14 +794,22 @@ def set_patient_pause(phone_number: str, paused: bool):
     phone_number = normalize_phone(phone_number)
     db_execute(
         """
-        INSERT INTO patients(phone_number, is_paused)
-        VALUES (%s,%s)
-        ON CONFLICT(phone_number)
-        DO UPDATE SET is_paused=EXCLUDED.is_paused, updated_at=NOW()
+        WITH patient AS (
+            INSERT INTO patients(phone_number, is_paused)
+            VALUES (%s,%s)
+            ON CONFLICT(phone_number)
+            DO UPDATE SET is_paused=EXCLUDED.is_paused, updated_at=NOW()
+            RETURNING phone_number
+        )
+        INSERT INTO conversation_summaries(phone_number,updated_at)
+        SELECT phone_number,NOW() FROM patient
+        WHERE TRUE
+        ON CONFLICT(phone_number) DO UPDATE SET
+            change_version=EXCLUDED.change_version,
+            updated_at=NOW()
         """,
         (phone_number, paused),
     )
-    touch_conversation_summary(phone_number)
 
 def set_patient_tags(phone_number: str, tags: list[str]):
     clean = []
@@ -761,14 +819,22 @@ def set_patient_tags(phone_number: str, tags: list[str]):
             clean.append(tag)
     db_execute(
         """
-        INSERT INTO patients(phone_number, tags)
-        VALUES (%s,%s)
-        ON CONFLICT(phone_number)
-        DO UPDATE SET tags=EXCLUDED.tags, updated_at=NOW()
+        WITH patient AS (
+            INSERT INTO patients(phone_number, tags)
+            VALUES (%s,%s)
+            ON CONFLICT(phone_number)
+            DO UPDATE SET tags=EXCLUDED.tags, updated_at=NOW()
+            RETURNING phone_number
+        )
+        INSERT INTO conversation_summaries(phone_number,updated_at)
+        SELECT phone_number,NOW() FROM patient
+        WHERE TRUE
+        ON CONFLICT(phone_number) DO UPDATE SET
+            change_version=EXCLUDED.change_version,
+            updated_at=NOW()
         """,
         (normalize_phone(phone_number), clean),
     )
-    touch_conversation_summary(phone_number)
 
 def touch_conversation_summary(phone_number: str) -> None:
     """Advance the inbox state cursor after a profile-only change."""
@@ -779,7 +845,7 @@ def touch_conversation_summary(phone_number: str) -> None:
         INSERT INTO conversation_summaries(phone_number,updated_at)
         VALUES (%s,NOW())
         ON CONFLICT(phone_number) DO UPDATE SET
-            change_version=nextval('conversation_summary_change_seq'),
+            change_version=EXCLUDED.change_version,
             updated_at=NOW()
         """,
         (phone,),
@@ -845,7 +911,7 @@ def update_conversation_summary_for_message(cur, phone: str, message: dict) -> N
             is_archived=CASE
                 WHEN EXCLUDED.last_message_role='user' THEN FALSE
                 ELSE conversation_summaries.is_archived END,
-            change_version=nextval('conversation_summary_change_seq'),
+            change_version=EXCLUDED.change_version,
             updated_at=NOW()
         """,
         (
@@ -2162,12 +2228,25 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                         text = extract_text_message(message)
                         if not text:
                             continue
-                        saved = persist_incoming_message(
-                            sender,
-                            text,
-                            message_id,
-                            target_phone_id,
-                        )
+                        try:
+                            saved = persist_incoming_message(
+                                sender,
+                                text,
+                                message_id,
+                                target_phone_id,
+                            )
+                        except Exception:
+                            log.exception(
+                                "Inbound WhatsApp message was not durably persisted"
+                            )
+                            return JSONResponse(
+                                status_code=503,
+                                content={
+                                    "status": "RETRY_LATER",
+                                    "retryable": True,
+                                    "scheduled": scheduled,
+                                },
+                            )
                         if not saved:
                             continue
                         # Queue processing still runs when replies are disabled:
@@ -2410,7 +2489,7 @@ def api_create_conversation(
                 WHERE TRUE
                 ON CONFLICT(phone_number) DO UPDATE SET
                     is_archived=FALSE,
-                    change_version=nextval('conversation_summary_change_seq'),
+                    change_version=EXCLUDED.change_version,
                     updated_at=NOW()
                 RETURNING phone_number,change_version
             )
@@ -2443,7 +2522,7 @@ def api_conversation_state(
             ON CONFLICT(phone_number) DO UPDATE SET
                 is_pinned=COALESCE(%s,conversation_summaries.is_pinned),
                 is_archived=COALESCE(%s,conversation_summaries.is_archived),
-                change_version=nextval('conversation_summary_change_seq'),
+                change_version=EXCLUDED.change_version,
                 updated_at=NOW()
             RETURNING phone_number,is_pinned,is_archived,change_version
             """,
