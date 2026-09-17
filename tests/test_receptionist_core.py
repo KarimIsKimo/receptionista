@@ -62,6 +62,22 @@ def webhook_body(message_id="wamid-1", text="عايزة أحجز ليزر"):
 
 
 class GeminiHistoryTests(unittest.TestCase):
+    def load_history(self, chronological_rows, *, before_id=None):
+        with mock.patch.object(
+            main,
+            "db_execute",
+            return_value=list(reversed(chronological_rows)),
+        ):
+            return main.load_chat_history(PHONE, 12, before_id=before_id)
+
+    def assert_valid_history(self, history):
+        if history:
+            self.assertEqual(history[0].role, "user")
+        self.assertTrue(all(item.role in {"user", "model"} for item in history))
+        self.assertTrue(
+            all(left.role != right.role for left, right in zip(history, history[1:]))
+        )
+
     def test_current_persisted_turn_is_sent_to_gemini_exactly_once(self):
         current = "عايزة أحجز بكرة"
 
@@ -106,8 +122,89 @@ class GeminiHistoryTests(unittest.TestCase):
             content.parts[0].text for content in captured["history"]
         )
         self.assertNotIn(current, history_text)
+        self.assert_valid_history(captured["history"])
         self.assertEqual(chat.sent, [current])
         self.assertEqual(reply, "تمام")
+
+    def test_history_window_drops_orphaned_leading_model_turn(self):
+        history = self.load_history(
+            [
+                {"role": "model", "content": "Orphaned AI reply"},
+                {"role": "user", "content": "Patient question"},
+                {"role": "model", "content": "AI answer"},
+            ]
+        )
+
+        self.assertEqual([item.role for item in history], ["user", "model"])
+        self.assertNotIn("Orphaned AI reply", history[0].parts[0].text)
+        self.assert_valid_history(history)
+
+    def test_patient_staff_patient_turns_merge_with_staff_provenance(self):
+        history = self.load_history(
+            [
+                {"role": "user", "content": "Patient one"},
+                {"role": "staff", "content": "Human receptionist reply"},
+                {"role": "user", "content": "Patient two"},
+            ]
+        )
+
+        self.assertEqual([item.role for item in history], ["user"])
+        text = history[0].parts[0].text
+        self.assertIn("Patient one", text)
+        self.assertIn("موظف استقبال بشري", text)
+        self.assertIn("Human receptionist reply", text)
+        self.assertIn("Patient two", text)
+        self.assert_valid_history(history)
+
+    def test_staff_then_patient_begins_as_one_labeled_user_turn(self):
+        history = self.load_history(
+            [
+                {"role": "staff", "content": "Staff context"},
+                {"role": "user", "content": "Patient response"},
+            ]
+        )
+
+        self.assertEqual([item.role for item in history], ["user"])
+        self.assertIn("موظف استقبال بشري", history[0].parts[0].text)
+        self.assertIn("Patient response", history[0].parts[0].text)
+        self.assert_valid_history(history)
+
+    def test_system_record_between_turns_keeps_label_and_valid_structure(self):
+        history = self.load_history(
+            [
+                {"role": "user", "content": "First question"},
+                {"role": "model", "content": "First answer"},
+                {"role": "system", "content": "Delivery failed"},
+                {"role": "user", "content": "Second question"},
+                {"role": "model", "content": "Second answer"},
+            ]
+        )
+
+        self.assertEqual(
+            [item.role for item in history],
+            ["user", "model", "user", "model"],
+        )
+        context = history[2].parts[0].text
+        self.assertIn("سجل نظام داخلي/خطأ", context)
+        self.assertIn("Delivery failed", context)
+        self.assertIn("Second question", context)
+        self.assert_valid_history(history)
+
+    def test_adjacent_model_turns_are_merged_in_chronological_order(self):
+        history = self.load_history(
+            [
+                {"role": "user", "content": "Question"},
+                {"role": "model", "content": "Answer part one"},
+                {"role": "model", "content": "Answer part two"},
+            ]
+        )
+
+        self.assertEqual([item.role for item in history], ["user", "model"])
+        self.assertLess(
+            history[1].parts[0].text.index("Answer part one"),
+            history[1].parts[0].text.index("Answer part two"),
+        )
+        self.assert_valid_history(history)
 
     def test_staff_and_system_records_never_masquerade_as_model(self):
         user = main.history_content("user", "Patient message")
@@ -234,6 +331,57 @@ class BookingDraftTests(unittest.TestCase):
         draft, _ = self.evolve(current, "طب الاندر ارم بكام؟", {"name": "Mona"})
         self.assertEqual(draft["service_area"], "بيكيني")
         self.assertEqual(draft["stage"], "ready_to_book")
+
+    def test_egyptian_no_corrections_update_service_time_and_date(self):
+        current = {
+            "intent": "book",
+            "patient_name": "Mona",
+            "service_area": "بيكيني",
+            "requested_date": "2026-09-15",
+            "requested_time": "7:00 PM",
+            "stage": "ready_to_book",
+        }
+        examples = (
+            ("لا اندر ارم", "service_area", "أندر آرم"),
+            ("لأ اندر ارم", "service_area", "أندر آرم"),
+            ("لا الساعة 8", "requested_time", "8:00 PM"),
+            ("لأ الساعة 8", "requested_time", "8:00 PM"),
+            ("لا الخميس", "requested_date", "2026-09-17"),
+        )
+        for message, field, expected in examples:
+            with self.subTest(message=message):
+                draft, _ = self.evolve(current, message, {"name": "Mona"})
+                self.assertEqual(draft[field], expected)
+
+    def test_lossy_service_correction_clears_stale_value(self):
+        current = {
+            "intent": "book",
+            "patient_name": "Mona",
+            "service_area": "بيكيني",
+            "requested_date": "2026-09-15",
+            "requested_time": "7:00 PM",
+            "stage": "ready_to_book",
+        }
+        for message in (
+            "خليها رجل كامل",
+            "خليها جسم كامل بدون بطن وظهر",
+        ):
+            with self.subTest(message=message):
+                draft, _ = self.evolve(current, message, {"name": "Mona"})
+                self.assertEqual(draft["service_area"], "")
+                self.assertEqual(draft["stage"], "need_service")
+
+    def test_unrelated_negative_price_question_is_not_a_correction(self):
+        current = {
+            "intent": "book",
+            "patient_name": "Mona",
+            "service_area": "بيكيني",
+            "requested_date": "2026-09-15",
+            "requested_time": "7:00 PM",
+            "stage": "ready_to_book",
+        }
+        draft, _ = self.evolve(current, "لا الاندر ارم بكام؟", {"name": "Mona"})
+        self.assertEqual(draft["service_area"], "بيكيني")
 
     def test_service_fragment_still_fills_need_service_stage(self):
         current = {
