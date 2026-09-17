@@ -11,7 +11,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
-import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Request, Response, BackgroundTasks, Depends, HTTPException, status, Query
 from fastapi.responses import PlainTextResponse, HTMLResponse
@@ -29,6 +28,7 @@ from receptionist.conversation import (
     evolve_booking_draft,
     should_extract_memory,
 )
+from receptionist.database import DatabasePool
 from receptionist.dates import parse_date_expression
 
 # ============================================================
@@ -113,6 +113,24 @@ MESSAGE_PROCESSING_LEASE_SECONDS = bounded_env_float(
 )
 BOOKING_DRAFT_TIMEOUT_MINUTES = int(
     bounded_env_float("BOOKING_DRAFT_TIMEOUT_MINUTES", 30.0, 5.0, 240.0)
+)
+DB_POOL_MIN_CONNECTIONS = int(
+    bounded_env_float("DB_POOL_MIN_CONNECTIONS", 1.0, 1.0, 4.0)
+)
+DB_POOL_MAX_CONNECTIONS = int(
+    bounded_env_float("DB_POOL_MAX_CONNECTIONS", 4.0, 2.0, 8.0)
+)
+DB_POOL_MAX_CONNECTIONS = max(DB_POOL_MIN_CONNECTIONS, DB_POOL_MAX_CONNECTIONS)
+
+database_pool = DatabasePool(
+    DATABASE_URL,
+    min_connections=DB_POOL_MIN_CONNECTIONS,
+    max_connections=DB_POOL_MAX_CONNECTIONS,
+    connect_kwargs={
+        "sslmode": "require",
+        "connect_timeout": 10,
+        "application_name": "jothen-receptionist",
+    },
 )
 
 # Existing deployment flag is retained for compatibility.
@@ -214,20 +232,24 @@ DEFAULT_SYSTEM_INSTRUCTION = """<role_definition>
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    cleanup_task = asyncio.create_task(cleanup_locks())
-    queue_task = asyncio.create_task(pending_queue_worker())
-    log.info("Jothen receptionist started")
+    database_pool.start()
     try:
-        yield
-    finally:
-        cleanup_task.cancel()
-        queue_task.cancel()
+        init_db()
+        cleanup_task = asyncio.create_task(cleanup_locks())
+        queue_task = asyncio.create_task(pending_queue_worker())
+        log.info("Jothen receptionist started")
         try:
-            await asyncio.gather(cleanup_task, queue_task)
-        except asyncio.CancelledError:
-            pass
-        log.info("Jothen receptionist stopped")
+            yield
+        finally:
+            cleanup_task.cancel()
+            queue_task.cancel()
+            try:
+                await asyncio.gather(cleanup_task, queue_task)
+            except asyncio.CancelledError:
+                pass
+            log.info("Jothen receptionist stopped")
+    finally:
+        database_pool.close()
 
 app = FastAPI(
     title="Jothen Clinic AI Receptionist",
@@ -245,12 +267,7 @@ lock_last_used: dict[str, dt.datetime] = {}
 lock_guard = asyncio.Lock()
 
 def get_db_connection():
-    return psycopg2.connect(
-        DATABASE_URL,
-        sslmode="require",
-        connect_timeout=10,
-        application_name="jothen-receptionist",
-    )
+    return database_pool.connection()
 
 def init_db():
     statements = [
@@ -374,6 +391,28 @@ def init_db():
         )
         """,
         """
+        CREATE SEQUENCE IF NOT EXISTS conversation_summary_change_seq
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS conversation_summaries (
+            phone_number VARCHAR(30) PRIMARY KEY,
+            last_message_id BIGINT,
+            last_message_role VARCHAR(20),
+            last_message TEXT,
+            last_message_at TIMESTAMPTZ,
+            first_meaningful_role VARCHAR(20),
+            latest_patient_message_id BIGINT NOT NULL DEFAULT 0,
+            latest_patient_message_at TIMESTAMPTZ,
+            latest_response_message_id BIGINT NOT NULL DEFAULT 0,
+            latest_response_at TIMESTAMPTZ,
+            unread_count INTEGER NOT NULL DEFAULT 0,
+            is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+            is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+            change_version BIGINT NOT NULL DEFAULT nextval('conversation_summary_change_seq'),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS admin_appointment_snapshots (
             phone_number VARCHAR(30) PRIMARY KEY,
             appointments JSONB,
@@ -387,6 +426,20 @@ def init_db():
         ON chat_history(phone_number, created_at, id)
         """,
         """
+        CREATE INDEX IF NOT EXISTS idx_chat_phone_id_desc
+        ON chat_history(phone_number, id DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_chat_user_phone_id
+        ON chat_history(phone_number, id)
+        WHERE role='user'
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_chat_origin_phone_id
+        ON chat_history(phone_number, id)
+        WHERE role IN ('user','staff')
+        """,
+        """
         CREATE INDEX IF NOT EXISTS idx_inbound_queue_pending
         ON inbound_message_queue(phone_number, received_at, chat_history_id)
         WHERE processed_at IS NULL
@@ -398,6 +451,83 @@ def init_db():
         """
         CREATE INDEX IF NOT EXISTS idx_audit_created
         ON audit_log(created_at DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_conversation_summary_activity
+        ON conversation_summaries(is_archived, is_pinned DESC, last_message_at DESC, last_message_id DESC)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_conversation_summary_changes
+        ON conversation_summaries(change_version)
+        """,
+        """
+        /* conversation_summary_backfill */
+        INSERT INTO conversation_summaries(
+            phone_number,last_message_id,last_message_role,last_message,last_message_at,
+            first_meaningful_role,latest_patient_message_id,latest_patient_message_at,
+            latest_response_message_id,latest_response_at,unread_count,updated_at
+        )
+        SELECT
+            active.phone_number,
+            latest.id,latest.role,latest.content,latest.created_at,
+            origin.role,
+            COALESCE(patient_message.id,0),patient_message.created_at,
+            COALESCE(response_message.id,0),response_message.created_at,
+            COALESCE(unread.count,0),NOW()
+        FROM (
+            SELECT phone_number FROM patients
+            UNION
+            SELECT DISTINCT phone_number FROM chat_history
+        ) active
+        JOIN (
+            SELECT 1 AS enabled
+            WHERE NOT EXISTS (
+                SELECT 1 FROM clinic_settings
+                WHERE key='conversation_summary_backfill_v1'
+            )
+        ) migration ON TRUE
+        LEFT JOIN conversation_summaries existing
+          ON existing.phone_number=active.phone_number
+        LEFT JOIN LATERAL (
+            SELECT id,role,content,created_at
+            FROM chat_history
+            WHERE phone_number=active.phone_number
+            ORDER BY id DESC LIMIT 1
+        ) latest ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT role
+            FROM chat_history
+            WHERE phone_number=active.phone_number AND role IN ('user','staff')
+            ORDER BY id ASC LIMIT 1
+        ) origin ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT id,created_at
+            FROM chat_history
+            WHERE phone_number=active.phone_number AND role='user'
+            ORDER BY id DESC LIMIT 1
+        ) patient_message ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT id,created_at
+            FROM chat_history
+            WHERE phone_number=active.phone_number AND role IN ('model','staff')
+            ORDER BY id DESC LIMIT 1
+        ) response_message ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*)::integer AS count
+            FROM chat_history messages
+            LEFT JOIN admin_inbox_state state
+              ON state.phone_number=messages.phone_number
+            WHERE messages.phone_number=active.phone_number
+              AND messages.role='user'
+              AND messages.id>COALESCE(state.last_read_message_id,0)
+        ) unread ON TRUE
+        WHERE existing.phone_number IS NULL
+        ON CONFLICT(phone_number) DO NOTHING
+        """,
+        """
+        INSERT INTO clinic_settings(key,content)
+        VALUES ('conversation_summary_backfill_v1','complete')
+        ON CONFLICT(key) DO NOTHING
         """,
     ]
     with get_db_connection() as conn:
@@ -543,6 +673,7 @@ def update_patient_file(phone_number: str, name: str = "", preferences: str = ""
         """,
         (phone_number, (name or "").strip(), (preferences or "").strip()),
     )
+    touch_conversation_summary(phone_number)
     return {"ok": True, "code": "patient_updated", "message": "تم تحديث ملف المريضة.", "patient_name": (name or "").strip()}
 
 def set_patient_preferences(phone_number: str, preferences: str) -> dict:
@@ -550,10 +681,19 @@ def set_patient_preferences(phone_number: str, preferences: str) -> dict:
     phone = normalize_phone(phone_number)
     db_execute(
         """
-        INSERT INTO patients(phone_number, preferences)
-        VALUES (%s,%s)
-        ON CONFLICT(phone_number)
-        DO UPDATE SET preferences=EXCLUDED.preferences, updated_at=NOW()
+        WITH patient AS (
+            INSERT INTO patients(phone_number, preferences)
+            VALUES (%s,%s)
+            ON CONFLICT(phone_number)
+            DO UPDATE SET preferences=EXCLUDED.preferences, updated_at=NOW()
+            RETURNING phone_number
+        )
+        INSERT INTO conversation_summaries(phone_number,updated_at)
+        SELECT phone_number,NOW() FROM patient
+        WHERE TRUE
+        ON CONFLICT(phone_number) DO UPDATE SET
+            change_version=nextval('conversation_summary_change_seq'),
+            updated_at=NOW()
         """,
         (phone, preferences),
     )
@@ -589,6 +729,7 @@ def set_extracted_patient_memory(
         """,
         (phone, clean_name, clean_preferences),
     )
+    touch_conversation_summary(phone)
     return {
         "phone_number": phone,
         "name": clean_name,
@@ -606,6 +747,7 @@ def set_patient_pause(phone_number: str, paused: bool):
         """,
         (phone_number, paused),
     )
+    touch_conversation_summary(phone_number)
 
 def set_patient_tags(phone_number: str, tags: list[str]):
     clean = []
@@ -622,6 +764,89 @@ def set_patient_tags(phone_number: str, tags: list[str]):
         """,
         (normalize_phone(phone_number), clean),
     )
+    touch_conversation_summary(phone_number)
+
+def touch_conversation_summary(phone_number: str) -> None:
+    """Advance the inbox state cursor after a profile-only change."""
+    phone = normalize_phone(phone_number)
+    db_execute(
+        """
+        /* conversation_summary_touch */
+        INSERT INTO conversation_summaries(phone_number,updated_at)
+        VALUES (%s,NOW())
+        ON CONFLICT(phone_number) DO UPDATE SET
+            change_version=nextval('conversation_summary_change_seq'),
+            updated_at=NOW()
+        """,
+        (phone,),
+    )
+
+def update_conversation_summary_for_message(cur, phone: str, message: dict) -> None:
+    """Update inbox state in the same transaction as a new chat record."""
+    role = str(message.get("role") or "system")
+    message_id = int(message["id"])
+    created_at = message.get("created_at")
+    cur.execute(
+        """
+        /* conversation_summary_message */
+        INSERT INTO conversation_summaries(
+            phone_number,last_message_id,last_message_role,last_message,last_message_at,
+            first_meaningful_role,latest_patient_message_id,latest_patient_message_at,
+            latest_response_message_id,latest_response_at,unread_count,updated_at
+        ) VALUES (
+            %s,%s,%s,%s,%s,
+            CASE WHEN %s IN ('user','staff') THEN %s ELSE NULL END,
+            CASE WHEN %s='user' THEN %s ELSE 0 END,
+            CASE WHEN %s='user' THEN %s ELSE NULL END,
+            CASE WHEN %s IN ('model','staff') THEN %s ELSE 0 END,
+            CASE WHEN %s IN ('model','staff') THEN %s ELSE NULL END,
+            CASE WHEN %s='user' THEN 1 ELSE 0 END,
+            NOW()
+        )
+        ON CONFLICT(phone_number) DO UPDATE SET
+            last_message_id=CASE
+                WHEN EXCLUDED.last_message_id>=COALESCE(conversation_summaries.last_message_id,0)
+                THEN EXCLUDED.last_message_id ELSE conversation_summaries.last_message_id END,
+            last_message_role=CASE
+                WHEN EXCLUDED.last_message_id>=COALESCE(conversation_summaries.last_message_id,0)
+                THEN EXCLUDED.last_message_role ELSE conversation_summaries.last_message_role END,
+            last_message=CASE
+                WHEN EXCLUDED.last_message_id>=COALESCE(conversation_summaries.last_message_id,0)
+                THEN EXCLUDED.last_message ELSE conversation_summaries.last_message END,
+            last_message_at=CASE
+                WHEN EXCLUDED.last_message_id>=COALESCE(conversation_summaries.last_message_id,0)
+                THEN EXCLUDED.last_message_at ELSE conversation_summaries.last_message_at END,
+            first_meaningful_role=COALESCE(
+                conversation_summaries.first_meaningful_role,
+                EXCLUDED.first_meaningful_role
+            ),
+            latest_patient_message_id=GREATEST(
+                conversation_summaries.latest_patient_message_id,
+                EXCLUDED.latest_patient_message_id
+            ),
+            latest_patient_message_at=CASE
+                WHEN EXCLUDED.latest_patient_message_id>conversation_summaries.latest_patient_message_id
+                THEN EXCLUDED.latest_patient_message_at
+                ELSE conversation_summaries.latest_patient_message_at END,
+            latest_response_message_id=GREATEST(
+                conversation_summaries.latest_response_message_id,
+                EXCLUDED.latest_response_message_id
+            ),
+            latest_response_at=CASE
+                WHEN EXCLUDED.latest_response_message_id>conversation_summaries.latest_response_message_id
+                THEN EXCLUDED.latest_response_at
+                ELSE conversation_summaries.latest_response_at END,
+            unread_count=conversation_summaries.unread_count +
+                CASE WHEN EXCLUDED.last_message_role='user' THEN 1 ELSE 0 END,
+            change_version=nextval('conversation_summary_change_seq'),
+            updated_at=NOW()
+        """,
+        (
+            phone,message_id,role,message.get("content") or "",created_at,
+            role,role,role,message_id,role,created_at,
+            role,message_id,role,created_at,role,
+        ),
+    )
 
 def save_chat_turn(
     phone_number: str,
@@ -631,15 +856,22 @@ def save_chat_turn(
 ):
     if not content:
         return
-    return db_execute(
-        """
-        INSERT INTO chat_history(phone_number, role, content, whatsapp_message_id)
-        VALUES (%s,%s,%s,%s)
-        RETURNING id, role, content, whatsapp_message_id, created_at
-        """,
-        (normalize_phone(phone_number), role, content, whatsapp_message_id),
-        fetchone=True,
-    )
+    phone = normalize_phone(phone_number)
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO chat_history(phone_number, role, content, whatsapp_message_id)
+                VALUES (%s,%s,%s,%s)
+                RETURNING id, role, content, whatsapp_message_id, created_at
+                """,
+                (phone, role, content, whatsapp_message_id),
+            )
+            saved = dict(cur.fetchone())
+            saved["phone_number"] = phone
+            update_conversation_summary_for_message(cur, phone, saved)
+        conn.commit()
+    return saved
 
 def history_content(role: str, content: str) -> types.Content:
     """Represent non-AI records without attributing them to the Gemini model."""
@@ -776,6 +1008,8 @@ def persist_incoming_message(
                 (phone, content, message_id),
             )
             saved = dict(cur.fetchone())
+            saved["phone_number"] = phone
+            update_conversation_summary_for_message(cur, phone, saved)
             if enqueue:
                 cur.execute(
                     """
@@ -1040,11 +1274,19 @@ def suppress_uncertain_pending_batch(messages: list[dict]) -> int:
                     """
                     INSERT INTO chat_history(phone_number,role,content)
                     VALUES (%s,'system',%s)
+                    RETURNING id,role,content,whatsapp_message_id,created_at
                     """,
                     (
                         phone,
                         "تم إيقاف إعادة تنفيذ دفعة رسائل بعد انقطاع غير مؤكد لتجنب تكرار رد أو تغيير موعد. يلزم مراجعة المحادثة يدوياً.",
                     ),
+                )
+                saved_system_record = dict(cur.fetchone())
+                saved_system_record["phone_number"] = phone
+                update_conversation_summary_for_message(
+                    cur,
+                    phone,
+                    saved_system_record,
                 )
                 cur.execute(
                     """
@@ -2032,6 +2274,14 @@ class PatientPreferencesReq(BaseModel):
     phone_number: str = Field(min_length=5, max_length=30)
     preferences: str = Field(default="", max_length=10000)
 
+class NewConversationReq(BaseModel):
+    phone_number: str = Field(min_length=5, max_length=30)
+    name: str = Field(default="", max_length=200)
+
+class ConversationStateReq(BaseModel):
+    is_pinned: bool | None = None
+    is_archived: bool | None = None
+
 # ------------------------------------------------------------
 # Admin API
 # ------------------------------------------------------------
@@ -2114,6 +2364,92 @@ def api_inbox(
         search=search, state=state, limit=limit,
         before_id=before_id, after_id=after_id,
     )
+
+@app.get("/admin/api/inbox/updates")
+def api_inbox_updates(
+    after_version: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=200),
+    admin: str = Depends(verify_admin),
+):
+    return admin_operations.inbox_updates(
+        after_version=after_version,
+        limit=limit,
+    )
+
+@app.post("/admin/api/conversations")
+def api_create_conversation(
+    req: NewConversationReq,
+    admin: str = Depends(verify_admin),
+):
+    phone = normalize_phone(req.phone_number)
+    name = req.name.strip()
+    if len(phone) < 5:
+        return failure("invalid_phone", "A valid WhatsApp phone number is required.", state="degraded")
+    try:
+        row = db_execute(
+            """
+            /* admin_create_conversation */
+            WITH patient AS (
+                INSERT INTO patients(phone_number,name,updated_at)
+                VALUES (%s,%s,NOW())
+                ON CONFLICT(phone_number) DO UPDATE SET
+                    name=CASE WHEN EXCLUDED.name<>'' THEN EXCLUDED.name ELSE patients.name END,
+                    updated_at=NOW()
+                RETURNING phone_number,name
+            ), summary AS (
+                INSERT INTO conversation_summaries(phone_number,updated_at)
+                SELECT phone_number,NOW() FROM patient
+                WHERE TRUE
+                ON CONFLICT(phone_number) DO UPDATE SET
+                    is_archived=FALSE,
+                    change_version=nextval('conversation_summary_change_seq'),
+                    updated_at=NOW()
+                RETURNING phone_number,change_version
+            )
+            SELECT patient.phone_number,patient.name,summary.change_version
+            FROM patient JOIN summary USING(phone_number)
+            """,
+            (phone, name),
+            fetchone=True,
+        )
+        audit(admin, "create_conversation", phone, name)
+        return success("conversation_created", dict(row) if row else {"phone_number": phone, "name": name})
+    except Exception:
+        return failure("database_unavailable", "Could not create the conversation.", retryable=True)
+
+@app.post("/admin/api/patient/{phone_number}/conversation-state")
+def api_conversation_state(
+    phone_number: str,
+    req: ConversationStateReq,
+    admin: str = Depends(verify_admin),
+):
+    phone = normalize_phone(phone_number)
+    if req.is_pinned is None and req.is_archived is None:
+        return failure("invalid_state", "No conversation state change was supplied.", state="degraded")
+    try:
+        row = db_execute(
+            """
+            /* admin_conversation_state */
+            INSERT INTO conversation_summaries(phone_number,is_pinned,is_archived,updated_at)
+            VALUES (%s,COALESCE(%s,FALSE),COALESCE(%s,FALSE),NOW())
+            ON CONFLICT(phone_number) DO UPDATE SET
+                is_pinned=COALESCE(%s,conversation_summaries.is_pinned),
+                is_archived=COALESCE(%s,conversation_summaries.is_archived),
+                change_version=nextval('conversation_summary_change_seq'),
+                updated_at=NOW()
+            RETURNING phone_number,is_pinned,is_archived,change_version
+            """,
+            (
+                phone,req.is_pinned,req.is_archived,
+                req.is_pinned,req.is_archived,
+            ),
+            fetchone=True,
+        )
+        action = "archive_conversation" if req.is_archived else "reopen_conversation" if req.is_archived is False else "pin_conversation" if req.is_pinned else "unpin_conversation"
+        audit(admin, action, phone)
+        return success("conversation_state_updated", dict(row))
+    except Exception:
+        return failure("database_unavailable", "Could not update conversation state.", retryable=True)
 
 @app.post("/admin/api/patient/{phone_number}/read")
 def api_mark_patient_read(
