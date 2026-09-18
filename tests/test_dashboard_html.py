@@ -55,6 +55,78 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertIn("@media(max-width:760px)", self.html)
         self.assertIn('id="backChat"', self.html)
 
+    def test_language_defaults_to_arabic_and_uses_one_dictionary(self):
+        self.assertIn('var I18N={', self.html)
+        self.assertNotIn('var AR={', self.html)
+        self.assertNotIn('var EN={', self.html)
+        self.assertIn(
+            'lang:normalizeLanguage(localStorage.getItem("jothen-lang"))',
+            self.html,
+        )
+        self.assertIn('function normalizeLanguage(value){return value==="en"?"en":"ar"}', self.html)
+        self.assertIn('<html lang="ar" dir="rtl">', self.html)
+
+    def test_language_switches_both_ways_and_persists(self):
+        self.assertIn('setLanguage(state.lang==="ar"?"en":"ar")', self.html)
+        self.assertIn('localStorage.setItem("jothen-lang",state.lang)', self.html)
+        self.assertIn('document.documentElement.lang=state.lang', self.html)
+        self.assertIn('document.documentElement.dir=state.lang==="ar"?"rtl":"ltr"', self.html)
+        self.assertIn('switchLanguage:"English"', self.html)
+        self.assertIn('switchLanguage:"العربية"', self.html)
+
+    def test_language_switch_preserves_receptionist_work_state(self):
+        switcher = re.search(
+            r"function setLanguage\(lang\)(.*?)function changeView",
+            self.html,
+            re.S,
+        )
+        self.assertIsNotNone(switcher)
+        code = switcher.group(1)
+        for expected in (
+            'inboxTop=patientList.scrollTop',
+            'chatTop=messages.scrollTop',
+            'reply=q("replyText").value',
+            'search=q("inboxSearch").value',
+            'q("replyText").value=reply',
+            'q("inboxSearch").value=search',
+            'patientList.scrollTop=inboxTop',
+            'messages.scrollTop=chatTop',
+        ):
+            self.assertIn(expected, code)
+        self.assertNotIn('.click()', code)
+
+    def test_mobile_language_control_is_visible_compact_and_translated(self):
+        self.assertIn('id="mobileLang"', self.html)
+        self.assertIn('class="btn small language-toggle"', self.html)
+        self.assertIn('.topbar-actions .language-toggle{display:inline-flex', self.html)
+        self.assertIn('max-width:82px', self.html)
+        self.assertIn('.topbar-actions .btn:not(.language-toggle){display:none}', self.html)
+        for english_label in (
+            'needs_reply:"Needs Reply"',
+            'waiting_for_patient:"Waiting for Patient"',
+            'human:"Human takeover"',
+            'patientStarted:"Patient started"',
+            'newConversation:"+ New conversation"',
+            'patientActions:"Patient actions"',
+        ):
+            self.assertIn(english_label, self.html)
+
+    def test_language_switch_retranslates_dynamic_controls_and_dialogs(self):
+        self.assertIn('if(state.selected)renderChatHeader()', self.html)
+        self.assertIn('if(state.scheduleState)renderSchedulePanel()', self.html)
+        self.assertIn('data-field-label=', self.html)
+        self.assertIn('dlg.dataset.titleKey=titleKey', self.html)
+        self.assertIn('if(q("mobileActionsDialog").open)renderMobileActionsMenu()', self.html)
+        self.assertIn('data-metric-key=', self.html)
+        self.assertIn('data-status-key=', self.html)
+
+    def test_patient_content_is_rendered_verbatim_not_translated(self):
+        self.assertIn('esc(m.content)', self.html)
+        self.assertIn('esc(p.preferences||"—")', self.html)
+        self.assertIn("(p.tags||[]).map(function(x){return '<span class=\"tag\">'+esc(x)", self.html)
+        self.assertNotIn('tr(m.content)', self.html)
+        self.assertNotIn('tr(p.preferences)', self.html)
+
     def test_read_cursor_comes_from_displayed_messages(self):
         self.assertIn("displayed_message_id:cursor", self.html)
         self.assertIn("markDisplayedRead(state.messageCursor)", self.html)
