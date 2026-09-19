@@ -6,6 +6,7 @@ import secrets
 import logging
 import datetime as dt
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from collections import defaultdict
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -29,6 +30,7 @@ from receptionist.conversation import (
     should_extract_memory,
 )
 from receptionist.database import DatabasePool
+from receptionist.management import SCHEMA as MANAGEMENT_SCHEMA, create_management_router
 from receptionist.dates import parse_date_expression
 
 # ============================================================
@@ -55,6 +57,7 @@ from receptionist.dates import parse_date_expression
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("jothen")
+booking_audit_actor = ContextVar("booking_audit_actor", default="bot")
 
 CAIRO = CLINIC.timezone
 HTTP_TIMEOUT = httpx.Timeout(30.0, connect=15.0)
@@ -570,7 +573,7 @@ def init_db():
     ]
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            for sql in statements:
+            for sql in [*statements, *MANAGEMENT_SCHEMA]:
                 cur.execute(sql)
             cur.execute(
                 """
@@ -637,12 +640,12 @@ def set_setting(key: str, content: str):
 def get_live_instructions() -> str:
     return get_setting("system_instruction", DEFAULT_SYSTEM_INSTRUCTION)
 
-def save_live_instructions(content: str) -> bool:
+def save_live_instructions(content: str, actor: str = "admin") -> bool:
     try:
         if not content.strip():
             return False
         set_setting("system_instruction", content.strip())
-        audit("admin", "update_system_instruction")
+        audit(actor, "update_system_instruction")
         return True
     except Exception:
         log.exception("save_live_instructions failed")
@@ -651,9 +654,9 @@ def save_live_instructions(content: str) -> bool:
 def is_bot_globally_active() -> bool:
     return get_setting("bot_globally_active", "true").lower() == "true"
 
-def set_bot_globally_active(active: bool):
+def set_bot_globally_active(active: bool, actor: str = "admin"):
     set_setting("bot_globally_active", "true" if active else "false")
-    audit("admin", "global_bot_on" if active else "global_bot_off")
+    audit(actor, "global_bot_on" if active else "global_bot_off")
 
 # ------------------------------------------------------------
 # Patient / chat helpers
@@ -1444,7 +1447,7 @@ booking_service = BookingService(
     on_booked=lambda phone, name, preference: update_patient_file(
         phone, name=name, preferences=preference
     ),
-    on_audit=lambda action, phone, details: audit("bot", action, phone, details),
+    on_audit=lambda action, phone, details: audit(booking_audit_actor.get(), action, phone, details),
 )
 
 
@@ -2309,6 +2312,12 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
+app.include_router(create_management_router(
+    lambda: get_db_connection(),
+    lambda *args, **kwargs: db_execute(*args, **kwargs),
+    verify_admin,
+))
+
 class PauseRequest(BaseModel):
     phone_number: str = Field(min_length=5, max_length=30)
     is_paused: bool
@@ -2417,11 +2426,15 @@ def api_patient_preferences(req: PatientPreferencesReq, admin: str = Depends(ver
 
 @app.get("/admin/api/settings")
 def get_settings(admin: str = Depends(verify_admin)):
-    return success("settings_loaded", {"instruction": get_live_instructions()})
+    try:
+        row = db_execute("SELECT content FROM clinic_settings WHERE key='system_instruction'", fetchone=True)
+        return success("settings_loaded", {"instruction": row["content"] if row else DEFAULT_SYSTEM_INSTRUCTION})
+    except Exception:
+        return failure("database_unavailable", "Could not load live instructions.", retryable=True)
 
 @app.post("/admin/api/settings")
 def update_settings(data: SettingsUpdate, admin: str = Depends(verify_admin)):
-    if not save_live_instructions(data.instruction):
+    if not save_live_instructions(data.instruction, actor=admin):
         return failure("settings_update_failed", "Failed to save settings.", retryable=True)
     return success("settings_updated", status="success")
 
@@ -2432,7 +2445,7 @@ def api_get_bot_status(admin: str = Depends(verify_admin)):
 @app.post("/admin/api/toggle_global_bot")
 def api_toggle_global_bot(req: GlobalBotReq, admin: str = Depends(verify_admin)):
     try:
-        set_bot_globally_active(req.is_active)
+        set_bot_globally_active(req.is_active, actor=admin)
         return success("global_bot_updated", {"is_active": req.is_active}, status="success")
     except Exception:
         return failure("database_unavailable", "Could not update global bot state.", retryable=True)
@@ -2584,9 +2597,18 @@ def api_patient_appointments(phone_number: str, admin: str = Depends(verify_admi
 def api_get_schedule(date: str, admin: str = Depends(verify_admin)):
     return admin_operations.schedule(date)
 
+def run_admin_booking(actor, action, *args):
+    """Attribute the existing booking audit event without duplicating it."""
+    token = booking_audit_actor.set(actor)
+    try:
+        return action(*args)
+    finally:
+        booking_audit_actor.reset(token)
+
+
 @app.post("/admin/api/book")
 def api_admin_book(req: BookReq, admin: str = Depends(verify_admin)):
-    result = book_appointment(
+    result = run_admin_booking(admin, book_appointment,
         req.patient_name, req.phone_number, req.date, req.time, req.area
     )
     if result.get("ok") is not True:
@@ -2601,7 +2623,7 @@ def api_admin_book(req: BookReq, admin: str = Depends(verify_admin)):
 
 @app.post("/admin/api/cancel")
 def api_admin_cancel(req: CancelReq, admin: str = Depends(verify_admin)):
-    result = cancel_appointment(
+    result = run_admin_booking(admin, cancel_appointment,
         req.phone_number,
         req.date,
         req.time,
@@ -2624,7 +2646,7 @@ def api_admin_cancel(req: CancelReq, admin: str = Depends(verify_admin)):
 
 @app.post("/admin/api/reschedule")
 def api_admin_reschedule(req: RescheduleReq, admin: str = Depends(verify_admin)):
-    result = reschedule_appointment(
+    result = run_admin_booking(admin, reschedule_appointment,
         req.phone_number,
         req.old_date,
         req.new_date,
