@@ -14,6 +14,17 @@ with mock.patch("google.genai.Client"):
 
 
 class AdminControlEndpointTests(unittest.TestCase):
+    def test_operating_mode_endpoint_requires_known_explicit_mode(self):
+        with mock.patch.object(main, "set_operating_mode", return_value="HUMAN") as setter:
+            result = main.api_set_operating_mode(main.OperatingModeReq(mode="HUMAN"), admin="owner")
+        self.assertTrue(result["ok"])
+        setter.assert_called_once_with("HUMAN", "owner")
+
+        with mock.patch.object(main, "set_operating_mode", side_effect=ValueError("invalid")):
+            rejected = main.api_set_operating_mode(main.OperatingModeReq(mode="AUTOMATIC"), admin="owner")
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["code"], "invalid_operating_mode")
+
     def test_rename_endpoint_reuses_patient_update_and_returns_clean_name(self):
         with mock.patch.object(main, "update_patient_file") as update, mock.patch.object(
             main, "audit"

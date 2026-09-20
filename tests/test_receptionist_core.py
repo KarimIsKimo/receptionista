@@ -604,6 +604,8 @@ class ConversationBehaviorTests(unittest.IsolatedAsyncioTestCase):
             main, "update_patient_memory", new=mock.AsyncMock(return_value=profile)
         ), mock.patch.object(
             main, "is_bot_globally_active", return_value=True
+        ), mock.patch.object(
+            main, "get_operating_mode", return_value="AI_ACTIVE"
         ), mock.patch.object(main, "generate_ai_reply", generate), mock.patch.object(
             main, "send_whatsapp_message", send
         ), mock.patch.object(main, "save_chat_turn"):
@@ -740,6 +742,8 @@ class ConversationBehaviorTests(unittest.IsolatedAsyncioTestCase):
             main, "update_booking_draft_from_message", return_value=None
         ), mock.patch.object(main, "update_patient_memory", memory), mock.patch.object(
             main, "is_bot_globally_active", return_value=True
+        ), mock.patch.object(
+            main, "get_operating_mode", return_value="AI_ACTIVE"
         ), mock.patch.object(main, "generate_ai_reply", generate), mock.patch.object(
             main, "send_whatsapp_message", send
         ):
@@ -766,6 +770,8 @@ class ConversationBehaviorTests(unittest.IsolatedAsyncioTestCase):
             main, "update_patient_memory", new=mock.AsyncMock(side_effect=lambda _, p: p)
         ), mock.patch.object(
             main, "is_bot_globally_active", return_value=True
+        ), mock.patch.object(
+            main, "get_operating_mode", return_value="AI_ACTIVE"
         ), mock.patch.object(main, "generate_ai_reply", generate), mock.patch.object(
             main, "send_whatsapp_message", send
         ), mock.patch.object(main, "save_chat_turn"):

@@ -144,6 +144,34 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertIn("/admin/api/management/activity?limit=50", management)
         self.assertIn('id="systemInstruction"', self.html)
 
+    def test_human_first_supervisor_workspace_and_attention_queue_exist(self):
+        management = pathlib.Path("static/management.js").read_text(encoding="utf-8")
+        css = pathlib.Path("static/management.css").read_text(encoding="utf-8")
+        for marker in (
+            'id="supervisorStrip"', 'data-management="supervisor"',
+            'id="operatingModes"', 'data-mode="HUMAN"',
+            'data-mode="AI_BACKUP"', 'data-mode="AI_ACTIVE"',
+            'id="attentionList"', 'id="refreshSupervisor"',
+        ):
+            self.assertIn(marker, self.html)
+        self.assertIn('/admin/api/supervisor/summary', management)
+        self.assertIn('/admin/api/supervisor/attention', management)
+        self.assertIn('/admin/api/management/operating-mode', management)
+        self.assertIn('openAction("activateMode"', management)
+        self.assertIn('@media(max-width:760px)', css)
+        self.assertIn('.mode-grid{grid-template-columns:1fr}', css)
+
+    def test_supervisor_dynamic_text_is_bilingual(self):
+        management = pathlib.Path("static/management.js").read_text(encoding="utf-8")
+        for marker in (
+            'supervisor:"Supervisor"', 'supervisor:"الإشراف"',
+            'needsReply:"Needs reply"', 'needsReply:"تحتاج رد"',
+            'appointmentSyncStatus:"Appointment sync"',
+            'appointmentSyncStatus:"مزامنة المواعيد"',
+            'resolveAttention:"Resolve"', 'resolveAttention:"تم الحل"',
+        ):
+            self.assertIn(marker, management)
+
     def test_schedule_actions_include_exact_slot_target(self):
         self.assertIn("time:slot.time", self.html)
         self.assertIn("appointment_id:appointmentId(a)", self.html)

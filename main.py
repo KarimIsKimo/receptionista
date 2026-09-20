@@ -31,6 +31,16 @@ from receptionist.conversation import (
 )
 from receptionist.database import DatabasePool
 from receptionist.management import SCHEMA as MANAGEMENT_SCHEMA, create_management_router
+from receptionist.supervisor import (
+    INFERENCE_INSTRUCTION as PASSIVE_SYNC_INSTRUCTION,
+    OPERATING_MODES,
+    SCHEMA as SUPERVISOR_SCHEMA,
+    PassiveAppointmentSupervisor,
+    list_attention,
+    normalize_mode,
+    patient_facing_ai_allowed,
+    supervisor_summary,
+)
 from receptionist.dates import parse_date_expression
 
 # ============================================================
@@ -244,14 +254,16 @@ async def lifespan(app: FastAPI):
         init_db()
         cleanup_task = asyncio.create_task(cleanup_locks())
         queue_task = asyncio.create_task(pending_queue_worker())
+        passive_task = asyncio.create_task(passive_sync_worker())
         log.info("Jothen receptionist started")
         try:
             yield
         finally:
             cleanup_task.cancel()
             queue_task.cancel()
+            passive_task.cancel()
             try:
-                await asyncio.gather(cleanup_task, queue_task)
+                await asyncio.gather(cleanup_task, queue_task, passive_task)
             except asyncio.CancelledError:
                 pass
             log.info("Jothen receptionist stopped")
@@ -573,7 +585,7 @@ def init_db():
     ]
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            for sql in [*statements, *MANAGEMENT_SCHEMA]:
+            for sql in [*statements, *MANAGEMENT_SCHEMA, *SUPERVISOR_SCHEMA]:
                 cur.execute(sql)
             cur.execute(
                 """
@@ -657,6 +669,23 @@ def is_bot_globally_active() -> bool:
 def set_bot_globally_active(active: bool, actor: str = "admin"):
     set_setting("bot_globally_active", "true" if active else "false")
     audit(actor, "global_bot_on" if active else "global_bot_off")
+
+def get_operating_mode() -> str:
+    """Fail safely to HUMAN so a settings failure cannot activate replies."""
+    return normalize_mode(get_setting("operating_mode", "HUMAN"))
+
+def set_operating_mode(mode: str, actor: str = "admin") -> str:
+    normalized = normalize_mode(mode)
+    if str(mode or "").strip().upper() not in OPERATING_MODES:
+        raise ValueError("invalid_operating_mode")
+    set_setting("operating_mode", normalized)
+    audit(actor, "operating_mode_changed", details=normalized)
+    return normalized
+
+def patient_facing_ai_is_enabled() -> bool:
+    return ENABLE_REAL_CLINIC and patient_facing_ai_allowed(
+        get_operating_mode(), is_bot_globally_active()
+    )
 
 # ------------------------------------------------------------
 # Patient / chat helpers
@@ -929,6 +958,8 @@ def save_chat_turn(
     role: str,
     content: str,
     whatsapp_message_id: str | None = None,
+    *,
+    enqueue_passive_sync: bool = False,
 ):
     if not content:
         return
@@ -946,6 +977,12 @@ def save_chat_turn(
             saved = dict(cur.fetchone())
             saved["phone_number"] = phone
             update_conversation_summary_for_message(cur, phone, saved)
+            if enqueue_passive_sync and role == "staff":
+                cur.execute(
+                    """INSERT INTO passive_sync_queue(message_id,phone_number)
+                       VALUES (%s,%s) ON CONFLICT(message_id) DO NOTHING""",
+                    (saved["id"], phone),
+                )
         conn.commit()
     return saved
 
@@ -1620,6 +1657,73 @@ except Exception:
 
 admin_operations = AdminOperations(db_execute, booking_service, config=CLINIC)
 
+def infer_passive_appointment_sync(phone: str, conversation: list[dict]) -> dict:
+    """Structured internal analysis only; this function has no delivery tools."""
+    if gemini_client is None:
+        raise RuntimeError("Gemini is unavailable")
+    payload = {
+        "clinic_local_date": CLINIC.now().date().isoformat(),
+        "timezone": CLINIC.timezone_name,
+        "phone_number": phone,
+        "conversation": [
+            {
+                "id": int(row["id"]),
+                "role": row["role"],
+                "content": row["content"],
+                "created_at": str(row.get("created_at") or ""),
+            }
+            for row in conversation
+        ],
+    }
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=json.dumps(payload, ensure_ascii=False),
+        config=types.GenerateContentConfig(
+            system_instruction=PASSIVE_SYNC_INSTRUCTION,
+            temperature=0,
+            response_mime_type="application/json",
+            response_schema={
+                "type": "OBJECT",
+                "properties": {
+                    "action": {"type": "STRING", "enum": ["book", "reschedule", "cancel", "none"]},
+                    "confidence": {"type": "STRING", "enum": ["high", "uncertain"]},
+                    "patient_name": {"type": "STRING"},
+                    "date": {"type": "STRING"},
+                    "time": {"type": "STRING"},
+                    "area": {"type": "STRING"},
+                    "old_date": {"type": "STRING"},
+                    "old_time": {"type": "STRING"},
+                    "appointment_id": {"type": "STRING"},
+                    "evidence_message_ids": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+                },
+                "required": ["action", "confidence", "patient_name", "date", "time", "area",
+                             "old_date", "old_time", "appointment_id", "evidence_message_ids"],
+            },
+        ),
+    )
+    parsed = json.loads((response.text or "").strip())
+    if not isinstance(parsed, dict):
+        raise ValueError("Passive sync response is not an object")
+    return parsed
+
+passive_supervisor = PassiveAppointmentSupervisor(
+    lambda: get_db_connection(),
+    lambda *args, **kwargs: db_execute(*args, **kwargs),
+    booking_service,
+    infer_passive_appointment_sync,
+    admin_operations.patient_appointments,
+    update_conversation_summary_for_message,
+    get_operating_mode,
+    lease_seconds=int(MESSAGE_PROCESSING_LEASE_SECONDS),
+)
+
+def process_one_passive_sync() -> bool:
+    token = booking_audit_actor.set("passive_ai")
+    try:
+        return passive_supervisor.process_one()
+    finally:
+        booking_audit_actor.reset(token)
+
 def build_system_instruction(
     profile: dict,
     phone: str,
@@ -1964,6 +2068,9 @@ async def process_conversation_batch(
         if message.get("chat_history_id") is not None
     ]
     history_before_id = min(history_ids) if history_ids else None
+    # Remain fail-safe until mode permissions are resolved after internal work.
+    # Memory and draft updates intentionally run even while replies are disabled.
+    reply_allowed = False
 
     try:
         profile = load_patient_profile(sender_phone)
@@ -1982,16 +2089,18 @@ async def process_conversation_batch(
         # pause checks so human-takeover conversations can still teach the CRM.
         if should_extract_memory(user_text):
             profile = await update_patient_memory(sender_phone, profile)
-        if not ENABLE_REAL_CLINIC or not is_bot_globally_active():
-            log.info("Bot replies disabled; stored message from %s", sender_phone)
+        reply_allowed = patient_facing_ai_is_enabled()
+        if not reply_allowed:
+            log.info("Patient-facing AI is not active; stored message from %s", sender_phone)
             return
     except Exception:
         log.exception("Postgres unavailable while starting conversation")
-        await send_whatsapp_message(
-            sender_phone,
-            "حصل عطل مؤقت في النظام ومفيش أي حجز اتأكد. حاولي مرة تانية بعد شوية.",
-            phone_number_id,
-        )
+        if reply_allowed:
+            await send_whatsapp_message(
+                sender_phone,
+                "حصل عطل مؤقت في النظام ومفيش أي حجز اتأكد. حاولي مرة تانية بعد شوية.",
+                phone_number_id,
+            )
         return
 
     if profile.get("is_paused"):
@@ -2099,6 +2208,20 @@ async def pending_queue_worker() -> None:
             raise
         except Exception:
             log.exception("Pending inbound queue scan failed")
+        await asyncio.sleep(1.0)
+
+async def passive_sync_worker() -> None:
+    """Process durable staff-confirmation triggers without any WhatsApp capability."""
+    while True:
+        try:
+            for _ in range(20):
+                if not await asyncio.to_thread(process_one_passive_sync):
+                    break
+            await asyncio.to_thread(passive_supervisor.recover_uncertain_events)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Passive appointment sync worker failed")
         await asyncio.sleep(1.0)
 
 
@@ -2282,7 +2405,10 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                         continue
 
                     text = extract_echo_text(echo)
-                    save_chat_turn(customer_phone, "staff", text, echo_id)
+                    saved_staff = save_chat_turn(
+                        customer_phone, "staff", text, echo_id,
+                        enqueue_passive_sync=True,
+                    )
                     set_patient_pause(customer_phone, True)
                     audit(
                         "staff",
@@ -2290,6 +2416,9 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                         customer_phone,
                         text[:1000],
                     )
+                    if saved_staff:
+                        background_tasks.add_task(process_one_passive_sync)
+                        scheduled += 1
 
     except Exception:
         log.exception("Webhook processing error")
@@ -2355,6 +2484,9 @@ class RenamePatientReq(BaseModel):
 
 class GlobalBotReq(BaseModel):
     is_active: bool
+
+class OperatingModeReq(BaseModel):
+    mode: str = Field(min_length=2, max_length=20)
 
 class StaffMessageReq(BaseModel):
     phone_number: str = Field(min_length=5, max_length=30)
@@ -2449,6 +2581,69 @@ def api_toggle_global_bot(req: GlobalBotReq, admin: str = Depends(verify_admin))
         return success("global_bot_updated", {"is_active": req.is_active}, status="success")
     except Exception:
         return failure("database_unavailable", "Could not update global bot state.", retryable=True)
+
+@app.get("/admin/api/management/operating-mode")
+def api_operating_mode(admin: str = Depends(verify_admin)):
+    return success("operating_mode_loaded", {
+        "mode": get_operating_mode(),
+        "master_enabled": is_bot_globally_active(),
+    })
+
+@app.post("/admin/api/management/operating-mode")
+def api_set_operating_mode(req: OperatingModeReq, admin: str = Depends(verify_admin)):
+    try:
+        mode = set_operating_mode(req.mode, admin)
+        return success("operating_mode_updated", {"mode": mode}, status="success")
+    except ValueError:
+        return failure("invalid_operating_mode", "Choose HUMAN, AI_BACKUP, or AI_ACTIVE.", state="degraded")
+    except Exception:
+        return failure("database_unavailable", "Could not update operating mode.", retryable=True)
+
+@app.get("/admin/api/supervisor/summary")
+def api_supervisor_summary(admin: str = Depends(verify_admin)):
+    try:
+        data = supervisor_summary(
+            db_execute, get_operating_mode(), is_bot_globally_active(),
+            gemini_client is not None, bool(GOOGLE_SHEET_URL),
+        )
+        return success("supervisor_summary_loaded", data)
+    except Exception:
+        return failure("database_unavailable", "Could not load supervisor summary.", retryable=True)
+
+@app.get("/admin/api/supervisor/attention")
+def api_supervisor_attention(
+    limit: int = Query(100, ge=1, le=200),
+    admin: str = Depends(verify_admin),
+):
+    try:
+        return success("attention_loaded", {"items": list_attention(db_execute, limit)})
+    except Exception:
+        return failure("database_unavailable", "Could not load attention queue.", retryable=True)
+
+@app.post("/admin/api/supervisor/attention/{item_id}/resolve")
+def api_resolve_attention(item_id: int, admin: str = Depends(verify_admin)):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""UPDATE supervisor_attention SET status='resolved',
+                    resolved_at=NOW(),resolved_by=%s
+                    WHERE id=%s AND status='open' RETURNING phone_number,kind""",
+                    (admin, item_id))
+                row = cur.fetchone()
+                if not row:
+                    conn.rollback()
+                    return failure("attention_not_found", "Attention item is already resolved or unavailable.", state="degraded")
+                cur.execute("""INSERT INTO conversation_summaries(phone_number,updated_at)
+                    VALUES (%s,NOW()) ON CONFLICT(phone_number) DO UPDATE SET
+                    change_version=EXCLUDED.change_version,updated_at=NOW()""",
+                    (row["phone_number"],))
+                cur.execute("""INSERT INTO audit_log(actor,action,phone_number,details)
+                    VALUES (%s,'attention_resolved',%s,%s)""",
+                    (admin, row["phone_number"], row["kind"]))
+            conn.commit()
+        return success("attention_resolved", {"id": item_id, "phone_number": row["phone_number"]})
+    except Exception:
+        return failure("database_unavailable", "Could not resolve attention item.", retryable=True)
 
 @app.get("/admin/api/inbox")
 def api_inbox(
@@ -2672,7 +2867,11 @@ def api_admin_reschedule(req: RescheduleReq, admin: str = Depends(verify_admin))
     )
 
 @app.post("/admin/api/send_message")
-async def api_send_message(req: StaffMessageReq, admin: str = Depends(verify_admin)):
+async def api_send_message(
+    req: StaffMessageReq,
+    background_tasks: BackgroundTasks,
+    admin: str = Depends(verify_admin),
+):
     phone = normalize_phone(req.phone_number)
     delivery = await send_whatsapp_message(phone, req.message)
     if delivery.get("ok") is not True:
@@ -2687,11 +2886,13 @@ async def api_send_message(req: StaffMessageReq, admin: str = Depends(verify_adm
         )
     try:
         row = save_chat_turn(
-            phone, "staff", req.message, delivery.get("message_id")
+            phone, "staff", req.message, delivery.get("message_id"),
+            enqueue_passive_sync=True,
         )
         if req.pause_after_send:
             set_patient_pause(phone, True)
         audit(admin, "staff_manual_message", phone, req.message[:1000])
+        background_tasks.add_task(process_one_passive_sync)
         return success(
             "staff_message_sent",
             {

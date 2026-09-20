@@ -135,6 +135,8 @@ class PatientMemoryWebhookTests(unittest.IsolatedAsyncioTestCase):
         ) as memory, mock.patch.object(
             main, "is_bot_globally_active", side_effect=bot_active
         ), mock.patch.object(
+            main, "get_operating_mode", return_value="AI_ACTIVE"
+        ), mock.patch.object(
             main, "generate_ai_reply", side_effect=generate
         ), mock.patch.object(
             main,
@@ -171,6 +173,8 @@ class PatientMemoryWebhookTests(unittest.IsolatedAsyncioTestCase):
             main, "update_patient_memory", side_effect=update_memory
         ) as memory, mock.patch.object(
             main, "is_bot_globally_active", return_value=True
+        ), mock.patch.object(
+            main, "get_operating_mode", return_value="AI_ACTIVE"
         ), mock.patch.object(main, "generate_ai_reply", generate), mock.patch.object(
             main, "send_whatsapp_message", send
         ):
@@ -202,6 +206,8 @@ class PatientMemoryWebhookTests(unittest.IsolatedAsyncioTestCase):
             side_effect=RuntimeError("temporary Gemini failure"),
         ), mock.patch.object(
             main, "is_bot_globally_active", return_value=True
+        ), mock.patch.object(
+            main, "get_operating_mode", return_value="AI_ACTIVE"
         ), mock.patch.object(
             main, "generate_ai_reply", new=mock.AsyncMock(return_value=("AI reply", []))
         ) as generate, mock.patch.object(main, "send_whatsapp_message", send):

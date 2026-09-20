@@ -115,6 +115,14 @@ class ManagementBrowserTests(unittest.TestCase):
             data = dict(self.patients[0])
         elif path.endswith("/management/ai"):
             data = {"human_handled": 30, "ai_assigned": 20, "needs_staff_reply": 10, "global_active": True}
+        elif path.endswith("/supervisor/summary"):
+            data = {"needs_reply":10,"waiting_over_15":4,"human_handled_today":18,"todays_bookings":7,"attention_count":1,"operating_mode":"HUMAN","receptionist_status":"active","ai_receptionist_status":"standby","appointment_sync_status":"active"}
+        elif path.endswith("/supervisor/attention"):
+            data = {"items":[{"id":9,"phone_number":self.patients[0]["phone_number"],"kind":"appointment_sync_conflict","title":"Review appointment conflict","created_at":"2026-09-19T08:00:00+03:00"}]}
+        elif path.endswith("/management/operating-mode"):
+            data = {"mode":"AI_ACTIVE"}
+        elif "/supervisor/attention/" in path and path.endswith("/resolve"):
+            data = {"id":9,"phone_number":self.patients[0]["phone_number"]}
         elif path.endswith("/settings"):
             data = {"instruction": "Existing live instructions must remain unchanged."}
         elif path.endswith("/management/tags"):
@@ -191,7 +199,7 @@ class ManagementBrowserTests(unittest.TestCase):
         p.set_viewport_size({"width":320,"height":740})
         for language in ("ar","en"):
             if p.get_attribute("html","lang")!=language:p.click("#mobileLang")
-            for section in ("ai","clinic","tags","activity","system","data","accessibility"):
+            for section in ("supervisor","ai","clinic","tags","activity","system","data","accessibility"):
                 self.management(section)
                 self.assertFalse(p.evaluate('document.documentElement.scrollWidth>innerWidth'), section)
         self.management("system")
@@ -242,6 +250,23 @@ class ManagementBrowserTests(unittest.TestCase):
         self.assertEqual(p.input_value('[name="tags"]'),"historical free tag, VIP")
         self.assertEqual(p.locator('[data-pick-tag="2"]').count(),0)
         p.keyboard.press("Escape")
+
+    def test_supervisor_mode_requires_confirmation_and_attention_opens_chat(self):
+        p=self.page
+        self.management("supervisor")
+        p.wait_for_selector('#operatingModes [data-mode="HUMAN"].active')
+        self.assertIn("10",p.text_content("#supervisorSummary"))
+        p.click('#operatingModes [data-mode="AI_ACTIVE"]')
+        self.assertTrue(p.eval_on_selector("#actionDialog","e=>e.open"))
+        self.assertFalse(any("/management/operating-mode" in c[1] and c[0]=="POST" for c in self.calls))
+        p.click("#dialogConfirm")
+        p.wait_for_function('!document.getElementById("actionDialog").open')
+        mode_calls=[c for c in self.calls if "/management/operating-mode" in c[1] and c[0]=="POST"]
+        self.assertEqual(len(mode_calls),1)
+        self.assertEqual(json.loads(mode_calls[0][2])["mode"],"AI_ACTIVE")
+        p.click('[data-attention-open]')
+        p.wait_for_selector("#chatActive:not(.hidden)")
+        self.assertEqual(p.get_attribute('.nav [data-view="inbox"]',"class"),"active")
 
 
 if __name__ == "__main__":

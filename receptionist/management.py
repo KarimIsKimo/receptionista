@@ -46,6 +46,10 @@ AUDIT_ACTIONS = (
     "update_system_instruction", "create_conversation", "tag_created",
     "tag_renamed", "tag_archived", "tag_restored", "export_patients",
     "export_conversations",
+    "operating_mode_changed", "attention_resolved",
+    "passive_booking_created", "passive_booking_rescheduled",
+    "passive_booking_cancelled", "passive_booking_failed",
+    "passive_booking_ambiguous",
 )
 ACTION_AUDIT = {
     "archive": "archive_conversation", "reopen": "reopen_conversation",
@@ -123,18 +127,31 @@ class ManagementOperations:
     def ai_state(self):
         try:
             row = self.db("""
-                SELECT COUNT(*) FILTER (WHERE COALESCE(p.is_paused,FALSE)) AS human_handled,
-                       COUNT(*) FILTER (WHERE NOT COALESCE(p.is_paused,FALSE)) AS ai_assigned,
+                WITH settings AS (
+                    SELECT
+                      COALESCE((SELECT content FROM clinic_settings
+                                WHERE key='bot_globally_active'),'true')='true' AS master_active,
+                      COALESCE((SELECT content FROM clinic_settings
+                                WHERE key='operating_mode'),'HUMAN') AS operating_mode
+                )
+                SELECT COUNT(*) FILTER (WHERE s.phone_number IS NOT NULL AND
+                         (settings.operating_mode<>'AI_ACTIVE' OR NOT settings.master_active
+                          OR COALESCE(p.is_paused,FALSE))) AS human_handled,
+                       COUNT(*) FILTER (WHERE s.phone_number IS NOT NULL AND
+                         settings.operating_mode='AI_ACTIVE'
+                         AND settings.master_active AND NOT COALESCE(p.is_paused,FALSE)) AS ai_assigned,
                        COUNT(*) FILTER (WHERE s.latest_patient_message_id>s.latest_response_message_id)
                          AS needs_reply,
                        COUNT(*) FILTER (WHERE s.latest_patient_message_id>s.latest_response_message_id
-                         AND (COALESCE(p.is_paused,FALSE) OR
-                           COALESCE((SELECT content FROM clinic_settings WHERE key='bot_globally_active'),'true')<>'true'))
+                         AND (settings.operating_mode<>'AI_ACTIVE' OR NOT settings.master_active
+                              OR COALESCE(p.is_paused,FALSE)))
                          AS needs_staff_reply,
-                       COALESCE((SELECT content FROM clinic_settings WHERE key='bot_globally_active'),'true')='true'
-                         AS global_active
-                FROM conversation_summaries s LEFT JOIN patients p USING(phone_number)
-                WHERE NOT s.is_archived
+                       settings.master_active AS global_active,
+                       settings.operating_mode
+                FROM settings
+                LEFT JOIN conversation_summaries s ON NOT s.is_archived
+                LEFT JOIN patients p ON p.phone_number=s.phone_number
+                GROUP BY settings.master_active,settings.operating_mode
             """, fetchone=True)
             return success("management_ai_loaded", dict(row))
         except Exception:
