@@ -8,6 +8,7 @@ from unittest import mock
 
 from receptionist.supervisor import (
     PassiveAppointmentSupervisor,
+    eligible_confirmation_actions,
     normalize_mode,
     patient_facing_ai_allowed,
     validate_inference,
@@ -76,11 +77,13 @@ class MemorySupervisor(PassiveAppointmentSupervisor):
         self.lock = threading.Lock()
         self.finalize_failure = finalize_failure
         self.barrier = barrier
+        self.infer_calls = 0
         self.get_mode = lambda: "HUMAN"
 
     def _context(self, phone, trigger_id): return self.rows
 
     def infer(self, phone, rows):
+        self.infer_calls += 1
         if self.barrier:
             self.barrier.wait(timeout=2)
         return dict(self.model_result)
@@ -133,6 +136,29 @@ class MemorySupervisor(PassiveAppointmentSupervisor):
 
 
 class InferenceSafetyTests(unittest.TestCase):
+    def test_irrelevant_staff_messages_are_not_eligible_for_inference(self):
+        for text in (
+            "شكراً",
+            "تمام",
+            "لحظة واحدة",
+            "هسأل الدكتورة",
+            "سعر الجلسة 500 جنيه ومتاح باكدج كمان",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(eligible_confirmation_actions(text), set())
+
+    def test_explicit_completion_messages_remain_eligible(self):
+        cases = {
+            "حجزتلك الخميس الساعة ٨": "book",
+            "تم إلغاء الموعد": "cancel",
+            "غيرتلك الموعد للسبت الساعة ٧": "reschedule",
+            "You're booked Thursday at 8": "book",
+            "I've rescheduled your appointment": "reschedule",
+        }
+        for text, action in cases.items():
+            with self.subTest(text=text):
+                self.assertIn(action, eligible_confirmation_actions(text))
+
     def test_modes_are_fail_safe_and_separate_patient_reply_permission(self):
         self.assertEqual(normalize_mode(None), "HUMAN")
         self.assertFalse(patient_facing_ai_allowed("HUMAN", True))
@@ -157,6 +183,15 @@ class InferenceSafetyTests(unittest.TestCase):
             _, state = validate_inference(inferred(), rows, 2)
             self.assertEqual(state, "ready", text)
 
+    def test_post_inference_validation_still_requires_matching_action_language(self):
+        rows = [row(1, "user", "Thursday 8"), row(2, "staff", "You're booked Thursday at 8")]
+        raw = inferred(
+            "cancel", date="2026-09-24", time="8:00 PM", area="",
+            evidence_message_ids=[1, 2],
+        )
+        _, state = validate_inference(raw, rows, 2)
+        self.assertEqual(state, "uncertain")
+
     def test_uncertain_or_ambiguous_exact_target_never_mutates(self):
         rows = [row(1, "user", "Cancel tomorrow"), row(2, "staff", "Okay, cancelled.")]
         raw = inferred("cancel", date="2026-09-21", time="", area="", evidence_message_ids=[1, 2])
@@ -169,6 +204,23 @@ class InferenceSafetyTests(unittest.TestCase):
 
 
 class PassiveOrchestrationTests(unittest.TestCase):
+    def test_irrelevant_staff_turn_completes_without_inference(self):
+        for text in ("شكراً", "تمام", "لحظة واحدة", "هسأل الدكتورة", "الباكدج تشمل 3 مناطق"):
+            with self.subTest(text=text):
+                rows = [row(1, "user", "عايزة أعرف السعر"), row(2, "staff", text)]
+                supervisor = MemorySupervisor(rows, inferred())
+                supervisor.process_trigger({"message_id": 2, "phone_number": PHONE})
+                self.assertEqual(supervisor.infer_calls, 0)
+                self.assertFalse(supervisor.booking.calls)
+                self.assertEqual(supervisor.completed, [(2, "irrelevant_staff_message")])
+
+    def test_eligible_staff_completion_still_runs_structured_inference(self):
+        rows = [row(1, "user", "Thursday 8"), row(2, "staff", "You're booked Thursday at 8")]
+        supervisor = MemorySupervisor(rows, inferred())
+        supervisor.process_trigger({"message_id": 2, "phone_number": PHONE})
+        self.assertEqual(supervisor.infer_calls, 1)
+        self.assertEqual(supervisor.booking.calls[0][0], "book")
+
     def test_confirmed_book_reschedule_and_cancel_use_authoritative_service(self):
         scenarios = [
             ("book", "Confirmed for Thursday at 8.", {}, "book"),

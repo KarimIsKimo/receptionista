@@ -129,6 +129,20 @@ def patient_facing_ai_allowed(mode: Any, master_enabled: bool) -> bool:
     return normalize_mode(mode) == "AI_ACTIVE" and bool(master_enabled)
 
 
+def eligible_confirmation_actions(content: Any) -> set[str]:
+    """Return actions whose explicit completion language matches this staff turn.
+
+    This is only a cost/latency gate. ``validate_inference`` repeats the
+    action-specific check after Gemini and remains the mutation safety boundary.
+    """
+    text = str(content or "")
+    return {
+        action
+        for action, pattern in _CONFIRMATION_PATTERNS.items()
+        if pattern.search(text)
+    }
+
+
 def validate_inference(raw: Any, rows: list[dict], trigger_id: int) -> tuple[dict | None, str]:
     """Validate model output and require explicit staff-completion evidence."""
     if not isinstance(raw, dict):
@@ -159,13 +173,12 @@ def validate_inference(raw: Any, rows: list[dict], trigger_id: int) -> tuple[dic
     if action == "none":
         return cleaned, "none"
     trigger_row = by_id.get(trigger_id)
-    pattern = _CONFIRMATION_PATTERNS[action]
     if (
         confidence != "high"
         or trigger_id not in cleaned["evidence_message_ids"]
         or not trigger_row
         or trigger_row.get("role") != "staff"
-        or not pattern.search(str(trigger_row.get("content") or ""))
+        or action not in eligible_confirmation_actions(trigger_row.get("content"))
     ):
         return cleaned, "uncertain"
     required = ["date", "time", "area"] if action == "book" else ["date"] if action == "cancel" else ["date", "time", "old_date"]
@@ -419,6 +432,17 @@ class PassiveAppointmentSupervisor:
             self._complete_trigger(message_id, "patient_facing_ai_active")
             return
         rows = self._context(phone, message_id)
+        trigger_row = next(
+            (row for row in rows if int(row.get("id") or 0) == message_id),
+            None,
+        )
+        if (
+            not trigger_row
+            or trigger_row.get("role") != "staff"
+            or not eligible_confirmation_actions(trigger_row.get("content"))
+        ):
+            self._complete_trigger(message_id, "irrelevant_staff_message")
+            return
         try:
             raw = self.infer(phone, rows)
         except Exception:
