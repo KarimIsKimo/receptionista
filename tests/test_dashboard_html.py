@@ -60,7 +60,7 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertNotIn('var AR={', self.html)
         self.assertNotIn('var EN={', self.html)
         self.assertIn(
-            'lang:normalizeLanguage(localStorage.getItem("jothen-lang"))',
+            'lang:normalizeLanguage(JothenManagement.readStorage("jothen-lang"))',
             self.html,
         )
         self.assertIn('function normalizeLanguage(value){return value==="en"?"en":"ar"}', self.html)
@@ -68,7 +68,7 @@ class DashboardHtmlTests(unittest.TestCase):
 
     def test_language_switches_both_ways_and_persists(self):
         self.assertIn('setLanguage(state.lang==="ar"?"en":"ar")', self.html)
-        self.assertIn('localStorage.setItem("jothen-lang",state.lang)', self.html)
+        self.assertIn('JothenManagement.writeStorage("jothen-lang",state.lang)', self.html)
         self.assertIn('document.documentElement.lang=state.lang', self.html)
         self.assertIn('document.documentElement.dir=state.lang==="ar"?"rtl":"ltr"', self.html)
         self.assertIn('switchLanguage:"English"', self.html)
@@ -140,7 +140,8 @@ class DashboardHtmlTests(unittest.TestCase):
 
     def test_settings_and_audit_are_restored(self):
         self.assertIn("/admin/api/settings", self.html)
-        self.assertIn("/admin/api/audit?limit=50", self.html)
+        management = pathlib.Path("static/management.js").read_text(encoding="utf-8")
+        self.assertIn("/admin/api/management/activity?limit=50", management)
         self.assertIn('id="systemInstruction"', self.html)
 
     def test_schedule_actions_include_exact_slot_target(self):
