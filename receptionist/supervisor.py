@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 OPERATING_MODES = {"HUMAN", "AI_BACKUP", "AI_ACTIVE"}
 
 SCHEMA = (
+    "ALTER TABLE patients ADD COLUMN IF NOT EXISTS pause_source VARCHAR(30) NOT NULL DEFAULT 'legacy'",
     "ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS passive_event_key TEXT",
     """CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_passive_event_key
        ON chat_history(passive_event_key) WHERE passive_event_key IS NOT NULL""",
@@ -576,10 +577,19 @@ def supervisor_summary(db: Callable, mode: str, master_enabled: bool,
     now = dt.datetime.now(dt.timezone.utc)
     if isinstance(last, dt.datetime) and last.tzinfo is None:
         last = last.replace(tzinfo=dt.timezone.utc)
+    configured_mode = normalize_mode(mode)
+    effective_ai = patient_facing_ai_allowed(configured_mode, master_enabled)
+    # Never present an impossible "AI ACTIVE" state to the owner. Older
+    # deployments could contain AI_ACTIVE while the legacy master switch was
+    # off; expose that conservatively as standby until activation repairs both.
+    effective_mode = configured_mode if configured_mode != "AI_ACTIVE" or effective_ai else "AI_BACKUP"
     data.update({
-        "operating_mode": normalize_mode(mode),
+        "operating_mode": effective_mode,
+        "configured_operating_mode": configured_mode,
+        "master_enabled": bool(master_enabled),
+        "effective_patient_facing_ai": effective_ai,
         "receptionist_status": "active" if last and now-last.astimezone(dt.timezone.utc) <= dt.timedelta(minutes=15) else "no_recent_activity",
-        "ai_receptionist_status": "active" if patient_facing_ai_allowed(mode, master_enabled) else "standby",
+        "ai_receptionist_status": "active" if effective_ai else "standby",
         "appointment_sync_status": "active" if gemini_ready and scheduling_ready and not data.get("sync_failures") else "degraded",
     })
     return data

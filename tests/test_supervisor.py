@@ -11,6 +11,7 @@ from receptionist.supervisor import (
     eligible_confirmation_actions,
     normalize_mode,
     patient_facing_ai_allowed,
+    supervisor_summary,
     validate_inference,
 )
 
@@ -297,6 +298,54 @@ class PassiveOrchestrationTests(unittest.TestCase):
 
 
 class HumanModePipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dashboard_staff_send_in_human_does_not_pause_patient(self):
+        row = {"id": 81, "role": "staff", "content": "One moment", "created_at": "now"}
+        with mock.patch.object(main, "send_whatsapp_message", new=mock.AsyncMock(
+            return_value={"ok": True, "message_id": "out-81"}
+        )), mock.patch.object(main, "save_chat_turn", return_value=row), mock.patch.object(
+            main, "get_operating_mode", return_value="HUMAN"
+        ), mock.patch.object(main, "set_patient_pause") as pause, mock.patch.object(main, "audit"):
+            result = await main.api_send_message(
+                main.StaffMessageReq(phone_number=PHONE, message="One moment", pause_after_send=True),
+                main.BackgroundTasks(), admin="owner",
+            )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["data"]["pause_applied"])
+        pause.assert_not_called()
+
+    async def test_staff_send_in_ai_active_preserves_patient_takeover(self):
+        row = {"id": 82, "role": "staff", "content": "I will handle this", "created_at": "now"}
+        with mock.patch.object(main, "send_whatsapp_message", new=mock.AsyncMock(
+            return_value={"ok": True, "message_id": "out-82"}
+        )), mock.patch.object(main, "save_chat_turn", return_value=row), mock.patch.object(
+            main, "get_operating_mode", return_value="AI_ACTIVE"
+        ), mock.patch.object(main, "set_patient_pause") as pause, mock.patch.object(main, "audit"):
+            result = await main.api_send_message(
+                main.StaffMessageReq(phone_number=PHONE, message="I will handle this"),
+                main.BackgroundTasks(), admin="owner",
+            )
+        self.assertTrue(result["data"]["pause_applied"])
+        pause.assert_called_once_with(PHONE, True, source="staff_message")
+
+    async def test_meta_staff_echo_in_human_does_not_pause_patient(self):
+        body = {"entry": [{"changes": [{"field": "smb_message_echoes", "value": {
+            "recipient_id": PHONE,
+            "messages": [{"id": "echo-1", "type": "text", "text": {"body": "شكراً"}}],
+        }}]}]}
+
+        class Request:
+            async def json(self): return body
+
+        with mock.patch.object(main, "claim_message", return_value=True), mock.patch.object(
+            main, "save_chat_turn", return_value={"id": 83}
+        ), mock.patch.object(main, "get_operating_mode", return_value="HUMAN"), mock.patch.object(
+            main, "set_patient_pause"
+        ) as pause, mock.patch.object(main, "audit"):
+            result = await main.receive_message(Request(), main.BackgroundTasks())
+        self.assertEqual(result["status"], "EVENT_RECEIVED")
+        self.assertEqual(result["scheduled"], 1)
+        pause.assert_not_called()
+
     async def test_staff_confirmation_is_queued_in_same_database_transaction(self):
         executed = []
 
@@ -360,6 +409,86 @@ class HumanModePipelineTests(unittest.IsolatedAsyncioTestCase):
             await main.process_conversation_batch(PHONE, [{"chat_history_id": 3, "content": "Hello"}], "pid")
         generate.assert_awaited_once()
         send.assert_awaited_once()
+
+    async def test_returning_to_human_immediately_blocks_replies(self):
+        profile = {"name": "Mona", "preferences": "", "tags": [], "is_paused": False}
+        with mock.patch.object(main, "load_patient_profile", return_value=profile), mock.patch.object(
+            main, "update_booking_draft_from_message", return_value=None
+        ), mock.patch.object(main, "patient_facing_ai_is_enabled", return_value=False), mock.patch.object(
+            main, "generate_ai_reply", new=mock.AsyncMock()
+        ) as generate, mock.patch.object(main, "send_whatsapp_message", new=mock.AsyncMock()) as send:
+            await main.process_conversation_batch(
+                PHONE, [{"chat_history_id": 84, "content": "Hello"}], "pid"
+            )
+        generate.assert_not_awaited()
+        send.assert_not_awaited()
+
+
+class EmergencyActivationTests(unittest.TestCase):
+    def test_activation_atomically_repairs_master_mode_and_legacy_pauses(self):
+        executed = []
+
+        class Cursor:
+            row = None
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def execute(self, sql, params=()):
+                compact = " ".join(sql.split())
+                executed.append((compact, params))
+                if "SELECT COUNT(*) AS resumed_count FROM summaries" in compact:
+                    self.row = {"resumed_count": 7}
+                elif "SELECT COUNT(*) AS paused_count" in compact:
+                    self.row = {"paused_count": 2}
+                else:
+                    self.row = None
+            def fetchone(self): return self.row
+
+        class Connection:
+            commits = 0
+            def cursor(self, **_): return Cursor()
+            def commit(self): self.commits += 1
+
+        connection = Connection()
+        @contextlib.contextmanager
+        def borrow(): yield connection
+
+        with mock.patch.object(main, "get_db_connection", side_effect=borrow), mock.patch.object(
+            main, "ENABLE_REAL_CLINIC", True
+        ):
+            result = main.activate_ai_receptionist("owner")
+
+        sql = "\n".join(item[0] for item in executed)
+        self.assertEqual(connection.commits, 1)
+        self.assertTrue(result["effective_patient_facing_ai"])
+        self.assertEqual(result["resumed_conversations"], 7)
+        self.assertEqual(result["explicit_paused_conversations"], 2)
+        self.assertIn("'bot_globally_active','true'", sql)
+        self.assertIn("'operating_mode','AI_ACTIVE'", sql)
+        self.assertIn("IN ('legacy','staff_message')", sql)
+        self.assertNotIn("IN ('legacy','staff_message','manual')", sql)
+        self.assertIn("next_conversation_summary_version()", sql)
+        self.assertIn("ai_receptionist_activated", sql)
+
+    def test_supervisor_activation_endpoint_works_when_legacy_master_was_off(self):
+        activated = {"mode": "AI_ACTIVE", "master_enabled": True,
+                     "effective_patient_facing_ai": True,
+                     "resumed_conversations": 12, "explicit_paused_conversations": 1}
+        with mock.patch.object(main, "activate_ai_receptionist", return_value=activated) as activate:
+            result = main.api_activate_ai_receptionist(admin="owner")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["data"]["master_enabled"])
+        self.assertTrue(result["data"]["effective_patient_facing_ai"])
+        activate.assert_called_once_with("owner")
+
+    def test_supervisor_never_claims_active_when_master_is_off(self):
+        summary_row = {"needs_reply": 0, "waiting_over_15": 0,
+                       "human_handled_today": 0, "todays_bookings": 0,
+                       "last_staff_activity": None, "attention_count": 0,
+                       "sync_failures": 0}
+        data = supervisor_summary(lambda *a, **k: summary_row, "AI_ACTIVE", False, True, True)
+        self.assertEqual(data["operating_mode"], "AI_BACKUP")
+        self.assertEqual(data["ai_receptionist_status"], "standby")
+        self.assertFalse(data["effective_patient_facing_ai"])
 
 
 if __name__ == "__main__":

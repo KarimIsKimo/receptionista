@@ -157,6 +157,8 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertIn('/admin/api/supervisor/summary', management)
         self.assertIn('/admin/api/supervisor/attention', management)
         self.assertIn('/admin/api/management/operating-mode', management)
+        self.assertIn('/admin/api/management/activate-ai', management)
+        self.assertIn('activateAiReceptionist', self.html)
         self.assertIn('openAction("activateMode"', management)
         self.assertIn('@media(max-width:760px)', css)
         self.assertIn('.mode-grid{grid-template-columns:1fr}', css)

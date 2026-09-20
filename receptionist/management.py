@@ -50,6 +50,7 @@ AUDIT_ACTIONS = (
     "passive_booking_created", "passive_booking_rescheduled",
     "passive_booking_cancelled", "passive_booking_failed",
     "passive_booking_ambiguous",
+    "ai_receptionist_activated",
 )
 ACTION_AUDIT = {
     "archive": "archive_conversation", "reopen": "reopen_conversation",
@@ -120,9 +121,10 @@ def csv_cell(value) -> str:
 
 
 class ManagementOperations:
-    def __init__(self, connection, db):
+    def __init__(self, connection, db, patient_ai_available=lambda: True):
         self.connection = connection
         self.db = db
+        self.patient_ai_available = patient_ai_available
 
     def ai_state(self):
         try:
@@ -147,13 +149,24 @@ class ManagementOperations:
                               OR COALESCE(p.is_paused,FALSE)))
                          AS needs_staff_reply,
                        settings.master_active AS global_active,
-                       settings.operating_mode
+                       CASE WHEN settings.operating_mode='AI_ACTIVE' AND NOT settings.master_active
+                            THEN 'AI_BACKUP' ELSE settings.operating_mode END AS operating_mode,
+                       (settings.operating_mode='AI_ACTIVE' AND settings.master_active)
+                         AS effective_patient_facing_ai
                 FROM settings
                 LEFT JOIN conversation_summaries s ON NOT s.is_archived
                 LEFT JOIN patients p ON p.phone_number=s.phone_number
                 GROUP BY settings.master_active,settings.operating_mode
             """, fetchone=True)
-            return success("management_ai_loaded", dict(row))
+            data = dict(row)
+            if not self.patient_ai_available():
+                data["human_handled"] = int(data.get("human_handled") or 0) + int(data.get("ai_assigned") or 0)
+                data["ai_assigned"] = 0
+                data["needs_staff_reply"] = data.get("needs_reply") or 0
+                if data.get("operating_mode") == "AI_ACTIVE":
+                    data["operating_mode"] = "AI_BACKUP"
+                data["effective_patient_facing_ai"] = False
+            return success("management_ai_loaded", data)
         except Exception:
             return failure("database_unavailable", "Could not load AI state.", retryable=True)
 
@@ -238,7 +251,9 @@ class ManagementOperations:
                             results.append({"phone_number": phone, "ok": False, "code": "tag_limit"})
                             continue
                         if req.action in {"pause", "resume"}:
-                            cur.execute("UPDATE patients SET is_paused=%s,updated_at=NOW() WHERE phone_number=%s", (req.action=="pause",phone))
+                            cur.execute("""UPDATE patients SET is_paused=%s,pause_source=%s,
+                                updated_at=NOW() WHERE phone_number=%s""",
+                                (req.action=="pause", "manual" if req.action=="pause" else "none", phone))
                         elif req.action == "add_tag":
                             cur.execute("""UPDATE patients SET tags=CASE WHEN %s=ANY(tags)
                                 THEN tags ELSE array_append(tags,%s) END,updated_at=NOW()
@@ -344,9 +359,9 @@ class ManagementOperations:
         return StreamingResponse(chunks(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="jothen-{kind}.csv"', "Cache-Control": "no-store"}, background=BackgroundTask(file.close))
 
 
-def create_management_router(connection, db, verify_admin):
+def create_management_router(connection, db, verify_admin, patient_ai_available=lambda: True):
     router = APIRouter(prefix="/admin/api/management")
-    ops = ManagementOperations(connection, db)
+    ops = ManagementOperations(connection, db, patient_ai_available)
 
     @router.get("/ai")
     def ai(admin: str = Depends(verify_admin)):

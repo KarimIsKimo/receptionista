@@ -116,11 +116,13 @@ class ManagementBrowserTests(unittest.TestCase):
         elif path.endswith("/management/ai"):
             data = {"human_handled": 30, "ai_assigned": 20, "needs_staff_reply": 10, "global_active": True}
         elif path.endswith("/supervisor/summary"):
-            data = {"needs_reply":10,"waiting_over_15":4,"human_handled_today":18,"todays_bookings":7,"attention_count":1,"operating_mode":"HUMAN","receptionist_status":"active","ai_receptionist_status":"standby","appointment_sync_status":"active"}
+            data = {"needs_reply":10,"waiting_over_15":4,"human_handled_today":18,"todays_bookings":7,"attention_count":1,"operating_mode":"HUMAN","effective_patient_facing_ai":False,"receptionist_status":"active","ai_receptionist_status":"standby","appointment_sync_status":"active"}
         elif path.endswith("/supervisor/attention"):
             data = {"items":[{"id":9,"phone_number":self.patients[0]["phone_number"],"kind":"appointment_sync_conflict","title":"Review appointment conflict","created_at":"2026-09-19T08:00:00+03:00"}]}
+        elif path.endswith("/management/activate-ai"):
+            data = {"mode":"AI_ACTIVE","master_enabled":True,"effective_patient_facing_ai":True,"resumed_conversations":4,"explicit_paused_conversations":1}
         elif path.endswith("/management/operating-mode"):
-            data = {"mode":"AI_ACTIVE"}
+            data = {"mode":"HUMAN","effective_patient_facing_ai":False}
         elif "/supervisor/attention/" in path and path.endswith("/resolve"):
             data = {"id":9,"phone_number":self.patients[0]["phone_number"]}
         elif path.endswith("/settings"):
@@ -258,12 +260,12 @@ class ManagementBrowserTests(unittest.TestCase):
         self.assertIn("10",p.text_content("#supervisorSummary"))
         p.click('#operatingModes [data-mode="AI_ACTIVE"]')
         self.assertTrue(p.eval_on_selector("#actionDialog","e=>e.open"))
-        self.assertFalse(any("/management/operating-mode" in c[1] and c[0]=="POST" for c in self.calls))
+        self.assertFalse(any("/management/activate-ai" in c[1] and c[0]=="POST" for c in self.calls))
         p.click("#dialogConfirm")
         p.wait_for_function('!document.getElementById("actionDialog").open')
-        mode_calls=[c for c in self.calls if "/management/operating-mode" in c[1] and c[0]=="POST"]
+        mode_calls=[c for c in self.calls if "/management/activate-ai" in c[1] and c[0]=="POST"]
         self.assertEqual(len(mode_calls),1)
-        self.assertEqual(json.loads(mode_calls[0][2])["mode"],"AI_ACTIVE")
+        self.assertEqual(json.loads(mode_calls[0][2]),{})
         p.click('[data-attention-open]')
         p.wait_for_selector("#chatActive:not(.hidden)")
         self.assertEqual(p.get_attribute('.nav [data-view="inbox"]',"class"),"active")

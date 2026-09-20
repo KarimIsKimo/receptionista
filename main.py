@@ -667,8 +667,29 @@ def is_bot_globally_active() -> bool:
     return get_setting("bot_globally_active", "true").lower() == "true"
 
 def set_bot_globally_active(active: bool, actor: str = "admin"):
-    set_setting("bot_globally_active", "true" if active else "false")
-    audit(actor, "global_bot_on" if active else "global_bot_off")
+    # Turning the legacy master off while AI_ACTIVE used to leave the dashboard
+    # claiming an impossible active state. Demote to standby in the same commit.
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            if active:
+                # Repair only the legacy impossible state. The dedicated
+                # activation action is the sole path that turns standby into
+                # effective patient-facing AI and performs pause migration.
+                cur.execute("""UPDATE clinic_settings SET content='AI_BACKUP',updated_at=NOW()
+                    WHERE key='operating_mode' AND content='AI_ACTIVE'
+                      AND COALESCE((SELECT content FROM clinic_settings
+                                    WHERE key='bot_globally_active'),'true')<>'true'""")
+            cur.execute("""
+                INSERT INTO clinic_settings(key,content,updated_at)
+                VALUES ('bot_globally_active',%s,NOW())
+                ON CONFLICT(key) DO UPDATE SET content=EXCLUDED.content,updated_at=NOW()
+            """, ("true" if active else "false",))
+            if not active:
+                cur.execute("""UPDATE clinic_settings SET content='AI_BACKUP',updated_at=NOW()
+                    WHERE key='operating_mode' AND content='AI_ACTIVE'""")
+            cur.execute("INSERT INTO audit_log(actor,action) VALUES (%s,%s)",
+                        (actor, "global_bot_on" if active else "global_bot_off"))
+        conn.commit()
 
 def get_operating_mode() -> str:
     """Fail safely to HUMAN so a settings failure cannot activate replies."""
@@ -678,9 +699,67 @@ def set_operating_mode(mode: str, actor: str = "admin") -> str:
     normalized = normalize_mode(mode)
     if str(mode or "").strip().upper() not in OPERATING_MODES:
         raise ValueError("invalid_operating_mode")
-    set_setting("operating_mode", normalized)
-    audit(actor, "operating_mode_changed", details=normalized)
+    if normalized == "AI_ACTIVE":
+        activate_ai_receptionist(actor)
+        return normalized
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO clinic_settings(key,content,updated_at)
+                VALUES ('operating_mode',%s,NOW()) ON CONFLICT(key) DO UPDATE SET
+                content=EXCLUDED.content,updated_at=NOW()""", (normalized,))
+            cur.execute("""INSERT INTO audit_log(actor,action,details)
+                VALUES (%s,'operating_mode_changed',%s)""", (actor, normalized))
+        conn.commit()
     return normalized
+
+def activate_ai_receptionist(actor: str = "admin") -> dict:
+    """Atomically enable emergency takeover and repair historical pauses.
+
+    Pauses created before pause provenance existed, and automatic pauses caused
+    by staff messages in AI mode, are resumed. Explicit administrative/manual
+    takeovers remain paused. Each resumed summary receives its own transactional
+    inbox version through the existing clock function.
+    """
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""INSERT INTO clinic_settings(key,content,updated_at)
+                VALUES ('bot_globally_active','true',NOW()) ON CONFLICT(key) DO UPDATE SET
+                content='true',updated_at=NOW()""")
+            cur.execute("""INSERT INTO clinic_settings(key,content,updated_at)
+                VALUES ('operating_mode','AI_ACTIVE',NOW()) ON CONFLICT(key) DO UPDATE SET
+                content='AI_ACTIVE',updated_at=NOW()""")
+            cur.execute("""
+                WITH targets AS MATERIALIZED (
+                    SELECT phone_number FROM patients
+                    WHERE is_paused=TRUE
+                      AND COALESCE(pause_source,'legacy') IN ('legacy','staff_message')
+                    ORDER BY phone_number FOR UPDATE
+                ), resumed AS (
+                    UPDATE patients p SET is_paused=FALSE,pause_source='none',updated_at=NOW()
+                    FROM targets t WHERE p.phone_number=t.phone_number
+                    RETURNING p.phone_number
+                ), summaries AS (
+                    INSERT INTO conversation_summaries(phone_number,change_version,updated_at)
+                    SELECT phone_number,next_conversation_summary_version(),NOW() FROM resumed
+                    ON CONFLICT(phone_number) DO UPDATE SET
+                      change_version=EXCLUDED.change_version,updated_at=NOW()
+                    RETURNING phone_number
+                )
+                SELECT COUNT(*) AS resumed_count FROM summaries
+            """)
+            resumed = int((cur.fetchone() or {}).get("resumed_count") or 0)
+            cur.execute("SELECT COUNT(*) AS paused_count FROM patients WHERE is_paused=TRUE")
+            explicit_paused = int((cur.fetchone() or {}).get("paused_count") or 0)
+            details = json.dumps({"resumed_legacy_or_automatic": resumed,
+                                  "explicit_paused_preserved": explicit_paused})
+            cur.execute("""INSERT INTO audit_log(actor,action,details)
+                VALUES (%s,'ai_receptionist_activated',%s)""", (actor, details))
+        conn.commit()
+    return {"mode": "AI_ACTIVE" if ENABLE_REAL_CLINIC else "AI_BACKUP",
+            "configured_mode": "AI_ACTIVE", "master_enabled": True,
+            "effective_patient_facing_ai": bool(ENABLE_REAL_CLINIC),
+            "resumed_conversations": resumed,
+            "explicit_paused_conversations": explicit_paused}
 
 def patient_facing_ai_is_enabled() -> bool:
     return ENABLE_REAL_CLINIC and patient_facing_ai_allowed(
@@ -822,15 +901,19 @@ def set_extracted_patient_memory(
         "preferences": clean_preferences,
     }
 
-def set_patient_pause(phone_number: str, paused: bool):
+def set_patient_pause(phone_number: str, paused: bool, source: str = "manual"):
     phone_number = normalize_phone(phone_number)
+    if source not in {"manual", "staff_message", "legacy"}:
+        raise ValueError("invalid_pause_source")
+    pause_source = source if paused else "none"
     db_execute(
         """
         WITH patient AS (
-            INSERT INTO patients(phone_number, is_paused)
-            VALUES (%s,%s)
+            INSERT INTO patients(phone_number, is_paused, pause_source)
+            VALUES (%s,%s,%s)
             ON CONFLICT(phone_number)
-            DO UPDATE SET is_paused=EXCLUDED.is_paused, updated_at=NOW()
+            DO UPDATE SET is_paused=EXCLUDED.is_paused,
+                          pause_source=EXCLUDED.pause_source, updated_at=NOW()
             RETURNING phone_number
         )
         INSERT INTO conversation_summaries(phone_number,updated_at)
@@ -840,7 +923,7 @@ def set_patient_pause(phone_number: str, paused: bool):
             change_version=EXCLUDED.change_version,
             updated_at=NOW()
         """,
-        (phone_number, paused),
+        (phone_number, paused, pause_source),
     )
 
 def set_patient_tags(phone_number: str, tags: list[str]):
@@ -2409,7 +2492,8 @@ async def receive_message(request: Request, background_tasks: BackgroundTasks):
                         customer_phone, "staff", text, echo_id,
                         enqueue_passive_sync=True,
                     )
-                    set_patient_pause(customer_phone, True)
+                    if get_operating_mode() == "AI_ACTIVE":
+                        set_patient_pause(customer_phone, True, source="staff_message")
                     audit(
                         "staff",
                         "manual_message_echo",
@@ -2445,6 +2529,7 @@ app.include_router(create_management_router(
     lambda: get_db_connection(),
     lambda *args, **kwargs: db_execute(*args, **kwargs),
     verify_admin,
+    lambda: ENABLE_REAL_CLINIC,
 ))
 
 class PauseRequest(BaseModel):
@@ -2584,26 +2669,44 @@ def api_toggle_global_bot(req: GlobalBotReq, admin: str = Depends(verify_admin))
 
 @app.get("/admin/api/management/operating-mode")
 def api_operating_mode(admin: str = Depends(verify_admin)):
+    configured = get_operating_mode()
+    master = is_bot_globally_active()
+    effective = ENABLE_REAL_CLINIC and patient_facing_ai_allowed(configured, master)
     return success("operating_mode_loaded", {
-        "mode": get_operating_mode(),
-        "master_enabled": is_bot_globally_active(),
+        "mode": configured if configured != "AI_ACTIVE" or effective else "AI_BACKUP",
+        "configured_mode": configured,
+        "master_enabled": master,
+        "effective_patient_facing_ai": effective,
     })
 
 @app.post("/admin/api/management/operating-mode")
 def api_set_operating_mode(req: OperatingModeReq, admin: str = Depends(verify_admin)):
     try:
         mode = set_operating_mode(req.mode, admin)
-        return success("operating_mode_updated", {"mode": mode}, status="success")
+        return success("operating_mode_updated", {
+            "mode": mode,
+            "master_enabled": is_bot_globally_active(),
+            "effective_patient_facing_ai": patient_facing_ai_is_enabled(),
+        }, status="success")
     except ValueError:
         return failure("invalid_operating_mode", "Choose HUMAN, AI_BACKUP, or AI_ACTIVE.", state="degraded")
     except Exception:
         return failure("database_unavailable", "Could not update operating mode.", retryable=True)
 
+@app.post("/admin/api/management/activate-ai")
+def api_activate_ai_receptionist(admin: str = Depends(verify_admin)):
+    try:
+        return success("ai_receptionist_activated", activate_ai_receptionist(admin), status="success")
+    except Exception:
+        log.exception("Emergency AI activation failed")
+        return failure("database_unavailable", "Could not activate AI receptionist.", retryable=True)
+
 @app.get("/admin/api/supervisor/summary")
 def api_supervisor_summary(admin: str = Depends(verify_admin)):
     try:
         data = supervisor_summary(
-            db_execute, get_operating_mode(), is_bot_globally_active(),
+            db_execute, get_operating_mode(),
+            is_bot_globally_active() and ENABLE_REAL_CLINIC,
             gemini_client is not None, bool(GOOGLE_SHEET_URL),
         )
         return success("supervisor_summary_loaded", data)
@@ -2889,8 +2992,9 @@ async def api_send_message(
             phone, "staff", req.message, delivery.get("message_id"),
             enqueue_passive_sync=True,
         )
-        if req.pause_after_send:
-            set_patient_pause(phone, True)
+        pause_applied = bool(req.pause_after_send and get_operating_mode() == "AI_ACTIVE")
+        if pause_applied:
+            set_patient_pause(phone, True, source="staff_message")
         audit(admin, "staff_manual_message", phone, req.message[:1000])
         background_tasks.add_task(process_one_passive_sync)
         return success(
@@ -2901,7 +3005,8 @@ async def api_send_message(
                     "content": req.message,
                     "whatsapp_message_id": delivery.get("message_id"),
                 },
-                "paused": req.pause_after_send,
+                "paused": pause_applied,
+                "pause_applied": pause_applied,
             },
             status="success",
         )
