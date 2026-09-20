@@ -31,11 +31,11 @@ class FakeCursor:
             self.row = {"name": tag} if tag else None
         elif "FROM patients" in sql and "FOR UPDATE" in sql:
             self.rows = [dict(phone_number=p, tags=list(v.get("tags", []))) for p, v in self.state["patients"].items() if p in params[0]]
-        elif "next_conversation_summary_version() AS version" in sql:
-            self.state["version"] += 1
+        elif "FROM conversation_summary_clock" in sql and "FOR UPDATE" in sql:
             self.row = {"version": self.state["version"]}
         elif "RETURNING latest_patient_message_id" in sql:
             self.state["version"] += 1
+            self.state["summary_versions"].append(self.state["version"])
             self.row = {"latest_patient_message_id": 12, "unread_count": 0}
         elif "UPDATE patients SET is_paused" in sql:
             paused, phone = params
@@ -62,7 +62,8 @@ class FakeConnection:
 
 class ManagementTests(unittest.TestCase):
     def make_ops(self, patients=None, tag="VIP"):
-        state = {"patients": patients or {}, "tag": tag, "version": 0, "sql": [], "audit": []}
+        state = {"patients": patients or {}, "tag": tag, "version": 40,
+                 "summary_versions": [], "sql": [], "audit": []}
         conn = FakeConnection(state)
         @contextlib.contextmanager
         def borrow():
@@ -79,7 +80,15 @@ class ManagementTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["updated"], 2)
         self.assertEqual(conn.commits, 1)
-        self.assertEqual(state["version"], 3)  # lock clock once, then a unique version per row
+        self.assertEqual(state["version"], 42)
+        self.assertEqual(state["summary_versions"], [41, 42])
+        compact_sql = [sql for sql, _ in state["sql"]]
+        patient_lock = next(i for i, sql in enumerate(compact_sql) if "FROM patients" in sql and "FOR UPDATE" in sql)
+        clock_lock = next(i for i, sql in enumerate(compact_sql) if "FROM conversation_summary_clock" in sql and "FOR UPDATE" in sql)
+        first_summary = next(i for i, sql in enumerate(compact_sql) if "INSERT INTO conversation_summaries" in sql)
+        self.assertLess(patient_lock, clock_lock)
+        self.assertLess(clock_lock, first_summary)
+        self.assertFalse(any("next_conversation_summary_version() AS version" in sql for sql in compact_sql))
         self.assertTrue(all(p["is_paused"] for p in state["patients"].values()))
         self.assertEqual(len(state["audit"]), 2)
 

@@ -195,8 +195,8 @@ class ManagementOperations:
                             conn.rollback()
                             return failure("tag_not_found", "Choose an active reusable tag.", state="degraded")
                         tag = tag_row["name"]
-                    # Lock all patient rows in a stable order BEFORE allocating a
-                    # clock version, avoiding lock inversion with profile writers.
+                    # Lock all patient rows in a stable order before the clock,
+                    # avoiding lock inversion with profile writers.
                     cur.execute("SELECT phone_number,tags FROM patients WHERE phone_number=ANY(%s) ORDER BY phone_number FOR UPDATE", (phones,))
                     patients = {r["phone_number"]: r for r in cur.fetchall()}
                     if req.action == "unread":
@@ -204,8 +204,14 @@ class ManagementOperations:
                         for phone in patients:
                             cur.execute("""INSERT INTO admin_inbox_state(phone_number) VALUES (%s)
                                 ON CONFLICT(phone_number) DO UPDATE SET phone_number=EXCLUDED.phone_number""", (phone,))
-                    cur.execute("SELECT next_conversation_summary_version() AS version")
-                    cur.fetchone()  # Hold the transactional clock lock until commit.
+                    # Serialize version assignment without consuming a version.
+                    # The row lock is held until commit, so no later transaction
+                    # can allocate/commit past this bulk operation. Each call to
+                    # next_conversation_summary_version() below therefore maps to
+                    # one actual conversation_summaries change.
+                    cur.execute("""SELECT version FROM conversation_summary_clock
+                        WHERE id=1 FOR UPDATE""")
+                    cur.fetchone()
                     for phone in phones:
                         patient = patients.get(phone)
                         if not patient:
