@@ -38,8 +38,9 @@ class FakeCursor:
             self.state["summary_versions"].append(self.state["version"])
             self.row = {"latest_patient_message_id": 12, "unread_count": 0}
         elif "UPDATE patients SET is_paused" in sql:
-            paused, phone = params
+            paused, source, phone = params
             self.state["patients"][phone]["is_paused"] = paused
+            self.state["patients"][phone]["pause_source"] = source
         elif "UPDATE patients SET tags" in sql:
             tag, _, phone = params
             if tag not in self.state["patients"][phone]["tags"]:
@@ -90,6 +91,7 @@ class ManagementTests(unittest.TestCase):
         self.assertLess(clock_lock, first_summary)
         self.assertFalse(any("next_conversation_summary_version() AS version" in sql for sql in compact_sql))
         self.assertTrue(all(p["is_paused"] for p in state["patients"].values()))
+        self.assertTrue(all(p["pause_source"] == "manual" for p in state["patients"].values()))
         self.assertEqual(len(state["audit"]), 2)
 
     def test_bulk_add_tag_preserves_historical_free_form_tags(self):
